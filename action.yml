@@ -1,0 +1,80 @@
+name: "Aristotle formal verification"
+description: "Prove the properties in aristotle.toml about your Verilog, C and Rust, or review a change, and report each as a test."
+author: "Harmonic"
+
+branding:
+  icon: "check-circle"
+  color: "blue"
+
+inputs:
+  api-key:
+    description: "Aristotle API key. Store it as a repository secret."
+    required: true
+  command:
+    description: "ci checks the properties in the manifest and gates the build. review has Aristotle work out what should hold of the files in scope and check them, advisory unless fail-on says otherwise."
+    required: false
+    default: "ci"
+  manifest:
+    description: "ci only. Path to the manifest of properties to check, relative to the repository root. Empty means aristotle.toml at the repository root, or in working-directory when that is set."
+    required: false
+  scope:
+    description: "review only. Which files to verify: changed (the files this change touched), paths, or all. Empty means changed."
+    required: false
+  paths:
+    description: "review only. Globs of files to verify, one per line or comma-separated. With scope changed, the default, only the changed files they match are verified; with scope paths, which requires them, every file they match is."
+    required: false
+  base-ref:
+    description: "review only. Branch the change is proposed against, as main or origin/main. Empty means detected: a pull request's base branch, or for a push the commit it started from."
+    required: false
+  instructions:
+    description: "review only. Extra instructions appended to the verification prompt."
+    required: false
+  fail-on:
+    description: "Which results fail the build: failure, no-verdict (also any property without a verdict; unresolved, its old name, still works), or never (exit 0 once a run finishes, even a failed one). Empty means failure for ci and never for review."
+    required: false
+    default: ""
+  timeout:
+    description: "Wall-clock budget in minutes for the whole step, waiting for a free slot included, at most 10080 (a week). Empty means 60 minutes, or for ci the manifest's check.max_wall_time_seconds when it sets one."
+    required: false
+    default: ""
+  on-timeout:
+    description: "cancel or leave the run when the budget runs out or the job is cancelled. Empty means cancel, except for a run ci --project reports on, set with ARISTOTLE_PROJECT, which is left going."
+    required: false
+    default: ""
+  junit:
+    description: "Path for the JUnit report."
+    required: false
+    default: "aristotle-results.xml"
+  working-directory:
+    description: "Directory to verify, if not the workspace: the repository root or a subproject within it."
+    required: false
+  project-name:
+    description: "Name for the Aristotle project the run creates. Empty means the repository and the directory in it, what the run checks, and the branch and commit, as rtl/hw: ci @ main 1a2b3c4."
+    required: false
+
+outputs:
+  # Set by `aristotle ci` or `aristotle review` through $GITHUB_OUTPUT when the report was written.
+  junit:
+    description: "Path to the JUnit report that was written."
+
+runs:
+  # Built on the runner; once published, `image: docker://ghcr.io/harmonic-ai/aristotle:3` skips the build.
+  using: "docker"
+  image: "Dockerfile"
+  # The image has no entrypoint (GitLab and Jenkins start it with their own shell), so it is named here.
+  entrypoint: "aristotle"
+  args:
+    - ${{ inputs.command || 'ci' }}
+  env:
+    ARISTOTLE_API_KEY: ${{ inputs.api-key }}
+    ARISTOTLE_MANIFEST: ${{ inputs.manifest }}
+    ARISTOTLE_SCOPE: ${{ inputs.scope }}
+    ARISTOTLE_PATHS: ${{ inputs.paths }}
+    ARISTOTLE_BASE_REF: ${{ inputs.base-ref }}
+    ARISTOTLE_INSTRUCTIONS: ${{ inputs.instructions }}
+    ARISTOTLE_FAIL_ON: ${{ inputs.fail-on }}
+    ARISTOTLE_TIMEOUT: ${{ inputs.timeout }}
+    ARISTOTLE_ON_TIMEOUT: ${{ inputs.on-timeout }}
+    ARISTOTLE_JUNIT: ${{ inputs.junit }}
+    ARISTOTLE_DIRECTORY: ${{ inputs.working-directory }}
+    ARISTOTLE_NAME: ${{ inputs.project-name }}

@@ -1,0 +1,6 @@
+{
+  "entry_point": ["--top", "top", "-D", "name=\"value with spaces\"", "-f", "sources.f"],
+  "defines": {"name": "\"value with spaces\""},
+  "include_dirs": [],
+  "source_files": ["top.v"]
+}

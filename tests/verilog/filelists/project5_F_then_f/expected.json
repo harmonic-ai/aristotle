@@ -1,0 +1,6 @@
+{
+  "entry_point": ["--top", "top", "-f", "top.f"],
+  "defines": {},
+  "include_dirs": ["sub1/mydir"],
+  "source_files": []
+}

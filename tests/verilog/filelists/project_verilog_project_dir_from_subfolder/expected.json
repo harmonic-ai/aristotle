@@ -1,0 +1,7 @@
+{
+  "work_dir": "sub",
+  "entry_point": ["--top", "top", "-I", "..", "-f", "sources.f"],
+  "defines": {},
+  "include_dirs": ["."],
+  "source_files": ["sub/top.v"]
+}

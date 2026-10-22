@@ -1,0 +1,6 @@
+{
+  "entry_point": ["--top", "top", "-D", "ERROR=errorx", "-f", "sources.f"],
+  "defines": {"ERROR": "errorx"},
+  "include_dirs": [],
+  "source_files": ["top.v"]
+}

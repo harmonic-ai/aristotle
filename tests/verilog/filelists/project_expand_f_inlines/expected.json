@@ -1,0 +1,6 @@
+{
+  "entry_point": ["--top", "top", "-f", "f.txt"],
+  "defines": {},
+  "include_dirs": ["from_file"],
+  "source_files": ["source.v"]
+}

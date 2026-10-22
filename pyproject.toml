@@ -1,0 +1,59 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aristotlelib"
+version = "3.0.0rc12"
+description = "Aristotle SDK - formally verify your code from Python or the command line"
+readme = "README.md"
+license = "LicenseRef-Proprietary AND MIT"
+license-files = ["LICENSE", "src/aristotlelib/_vendor/tomli/LICENSE"]
+requires-python = ">=3.10"
+authors = [{ name = "Harmonic" }]
+maintainers = [{ name = "Harmonic" }]
+dependencies = [
+    "pydantic>=2.0.0",
+    # httpx 1.0 is a rewrite, without AsyncClient, Timeout or the exception classes the client uses.
+    "httpx[socks]>=0.28.0,<1",
+    "certifi>=2023.7.22",
+    "socksio>=1.0,<2",
+    "typing_extensions>=4.0.0",
+    "pathspec>=0.11.0",
+]
+
+[project.urls]
+Homepage = "https://aristotle.harmonic.fun"
+Repository = "https://github.com/harmonic-ai/aristotle"
+
+[project.scripts]
+aristotle = "aristotlelib.cli.controller:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=9.0.3", "pytest-asyncio>=1.0.0", "ruff>=0.15.0", "packaging>=22.0"]
+
+[tool.uv]
+exclude-newer = "15d"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aristotlelib"]
+
+[tool.ruff]
+target-version = "py310"
+src = ["src", "tests"]
+line-length = 120
+# Third-party code, kept as its upstream wrote it, even when a path names it.
+extend-exclude = ["src/aristotlelib/_vendor"]
+force-exclude = true
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+ignore = ["E501"]
+
+[tool.ty.src]
+exclude = ["src/aristotlelib/_vendor"]
+
+[[tool.mypy.overrides]]
+# mypy follows the manifest's import into the vendored code, so this, not an exclude, keeps upstream's errors out.
+module = ["aristotlelib._vendor.*"]
+ignore_errors = true

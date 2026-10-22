@@ -1,0 +1,6 @@
+{
+  "entry_point": ["--top", "top", "-I", "subfolder with spaces", "-f", "sources.f"],
+  "defines": {},
+  "include_dirs": ["subfolder with spaces"],
+  "source_files": ["top.v"]
+}

@@ -1,0 +1,6 @@
+{
+  "entry_point": ["--top", "top", "-f", "main.f"],
+  "defines": {"BEFORE_F": "1", "FROM_SECOND": "1", "AFTER_F": "2"},
+  "include_dirs": [],
+  "source_files": []
+}

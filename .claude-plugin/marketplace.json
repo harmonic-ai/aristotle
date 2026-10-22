@@ -1,0 +1,25 @@
+{
+  "name": "harmonic",
+  "description": "Harmonic's plugins for coding agents.",
+  "owner": {
+    "name": "Harmonic",
+    "url": "https://aristotle.harmonic.fun"
+  },
+  "plugins": [
+    {
+      "name": "aristotle",
+      "version": "3.0.0rc12",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/harmonic-ai/aristotle.git",
+        "ref": "v3.0.0rc12"
+      },
+      "strict": false,
+      "skills": [
+        "./skills/aristotle"
+      ],
+      "description": "Formally verify code with Aristotle through the aristotle CLI.",
+      "homepage": "https://aristotle.harmonic.fun"
+    }
+  ]
+}
