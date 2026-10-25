@@ -16,7 +16,7 @@ from aristotlelib import local_file_utils
 from aristotlelib.agent_task import TaskStatus
 from aristotlelib.ci import results, runner
 from aristotlelib.cli.command.review import ReviewAction
-from aristotlelib.declaration import DeclarationStatus
+from aristotlelib.declaration import DeclarationEvidence, DeclarationStatus
 from aristotlelib.exit_codes import (
     EXIT_INFRASTRUCTURE_ERROR,
     EXIT_RATE_LIMITED,
@@ -26,7 +26,7 @@ from aristotlelib.exit_codes import (
 )
 from aristotlelib.project import Project, ProjectStatus
 from aristotlelib.verilog import filelist
-from tests.ci.conftest import git, latin1_name, make_declaration
+from tests.ci.conftest import commit_bare_shaped, git, latin1_name, make_declaration
 from tests.conftest import NEVER_READ, UNREACHABLE_HOST, WILDCARD_FOLDERS
 
 CI_VARIABLE_PREFIXES = ("GITHUB_", "GITLAB_", "CI_", "BUILDKITE", "CIRCLE", "BUILD_", "SYSTEM_", "JENKINS_")
@@ -174,7 +174,10 @@ async def test_a_clean_run_succeeds(action: ReviewAction, repo: Path, tmp_path: 
 @pytest.mark.parametrize(
     ("declaration", "final_status"),
     [
-        (make_declaration("Spec.A", DeclarationStatus.COUNTEREXAMPLE), TaskStatus.COMPLETE),
+        (
+            make_declaration("Spec.A", DeclarationStatus.REFUTED, evidence=DeclarationEvidence.COUNTEREXAMPLE),
+            TaskStatus.COMPLETE,
+        ),
         (make_declaration("Spec.A", DeclarationStatus.PROVED), TaskStatus.FAILED),
     ],
     ids=["a counterexample", "a failed run"],
@@ -274,7 +277,7 @@ async def test_fail_on_failure_makes_a_counterexample_fail_the_build(
         code, _ = await _run(
             _action(),
             ["--scope", "all", "--directory", str(repo), "--junit", str(tmp_path / "out.xml"), *flags],
-            [make_declaration("Spec.A", DeclarationStatus.COUNTEREXAMPLE)],
+            [make_declaration("Spec.A", DeclarationStatus.REFUTED, evidence=DeclarationEvidence.COUNTEREXAMPLE)],
         )
 
     assert code == EXIT_VERIFICATION_FAILED
@@ -654,6 +657,27 @@ async def test_without_a_root_filelist_an_ignore_rule_still_stops_a_review_of_ev
     assert code == EXIT_USAGE_ERROR
     assert caplog.messages[-1].startswith(error.format(root=repo))
     assert (caplog.messages[-2] == UNTRACKED) is untracked
+
+
+@pytest.mark.parametrize("from_folder", [False, True], ids=["--directory", "current folder"])
+async def test_a_folder_shaped_like_a_bare_repository_is_reviewed_from_the_checkouts_repository(
+    action: ReviewAction, repo: Path, from_folder: bool, monkeypatch: pytest.MonkeyPatch, caplog
+):
+    hw = commit_bare_shaped(repo)
+    monkeypatch.setenv("ARISTOTLE_WEB_URL", "http://127.0.0.1:9")
+    if from_folder:
+        monkeypatch.chdir(hw)
+
+    with caplog.at_level(logging.INFO, logger="aristotle"):
+        code, _ = await _run(
+            action, ["--scope", "all", "--dry-run", *([] if from_folder else ["--directory", str(hw)])], []
+        )
+
+    assert code == EXIT_SUCCESS
+    # From the folder, review checks the whole checkout.
+    verified = ["fifo.v", "hw/top.v"] if from_folder else ["top.v"]
+    start = caplog.messages.index(f"Verifying {len(verified)} file(s):")
+    assert caplog.messages[start + 1 : start + 1 + len(verified)] == [f"  {name}" for name in verified]
 
 
 async def test_a_worktree_inside_a_bare_repository_is_reviewed(tmp_path: Path, repo: Path, caplog):
@@ -1247,7 +1271,7 @@ async def test_a_reporter_that_raises_does_not_change_the_exit_code(
         code, _ = await _run(
             action,
             ["--scope", "all", "--directory", str(repo), "--fail-on", "failure", "--junit", str(tmp_path / "out.xml")],
-            [make_declaration("Spec.A", DeclarationStatus.COUNTEREXAMPLE)],
+            [make_declaration("Spec.A", DeclarationStatus.REFUTED, evidence=DeclarationEvidence.COUNTEREXAMPLE)],
         )
 
     assert code == EXIT_VERIFICATION_FAILED

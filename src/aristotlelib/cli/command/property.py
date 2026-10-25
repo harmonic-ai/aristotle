@@ -6,11 +6,13 @@ from urllib.parse import quote
 
 from aristotlelib.agent_task import AgentTask
 from aristotlelib.api_request import AristotleAPIError, get_web_url
+from aristotlelib.ci.results import refuted
 from aristotlelib.cli.api_action import PROJECT_REFERENCE_HELP, APIAction, fetch_tasks, print_json
 from aristotlelib.cli.command.properties import (
     ELLIPSIS,
     KINDS,
     created_by_label,
+    evidence_label,
     location_label,
     project_not_found,
     shortened_name_pattern,
@@ -58,13 +60,13 @@ def format_record(declaration: Declaration, tasks: Sequence[AgentTask]) -> str:
     fields = [
         ("Kind", kind_label(declaration)),
         ("Status", status_label(declaration, tasks)),
+        ("Evidence", evidence_label(declaration)),
         ("Created by", created_by_label(declaration)),
         ("Created", format_timestamp(declaration.created_at)),
         ("Last updated", format_timestamp(declaration.last_updated)),
         ("Source", location_label(declaration)),
         ("Anchor", declaration.source_anchor or "-"),
         ("Generated", declaration.filename),
-        ("Artifacts", f"\n{' ' * (LABEL_WIDTH + 1)}".join(declaration.artifact_paths) or "-"),
         ("Web", f"{get_web_url()}/projects/{quote(declaration.project_id, safe='')}"),
     ]
     lines = [declaration.name]
@@ -75,6 +77,14 @@ def format_record(declaration: Declaration, tasks: Sequence[AgentTask]) -> str:
         lines.extend(["", "Description:   -"])
     # Lean code is whitespace-sensitive and is printed verbatim.
     lines.extend(["", "Lean statement:", declaration.lean_code or "-"])
+    if (
+        declaration.declaration_type == DeclarationType.PROPERTY
+        and refuted(declaration)
+        and declaration.evidence_message
+    ):
+        lines.extend(["", "Refutation evidence:", f"  {declaration.evidence_message}"])
+    artifacts = f"\n{' ' * (LABEL_WIDTH + 1)}".join(declaration.artifact_paths) or "-"
+    lines.extend(["", f"{'Artifacts:':<{LABEL_WIDTH}} {artifacts}"])
     return "\n".join(lines)
 
 
@@ -153,5 +163,5 @@ class PropertyAction(APIAction):
             return
         print_line(format_record(declaration, tasks))
         if hint := download_artifacts_hint(declaration.project_id, declaration.artifact_paths):
-            # A blank line first: the record ends with Lean code, printed verbatim.
+            # Separate the download hint from the record.
             logging.info(f"\n{hint}")

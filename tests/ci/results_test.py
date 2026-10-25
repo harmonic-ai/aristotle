@@ -23,14 +23,27 @@ from aristotlelib.ci.results import (
     refuted,
     result_label,
 )
-from aristotlelib.declaration import Declaration, DeclarationFailureReason, DeclarationStatus, DeclarationType
+from aristotlelib.declaration import (
+    Declaration,
+    DeclarationEvidence,
+    DeclarationFailureReason,
+    DeclarationStatus,
+    DeclarationType,
+)
 from aristotlelib.exit_codes import EXIT_INFRASTRUCTURE_ERROR, EXIT_RATE_LIMITED, EXIT_SUCCESS, EXIT_VERIFICATION_FAILED
 from tests.ci.conftest import make_declaration
 
 
 def _results(*statuses: DeclarationStatus) -> RunResults:
     return RunResults.from_declarations(
-        [make_declaration(f"Spec.P{i}", status) for i, status in enumerate(statuses)],
+        [
+            make_declaration(
+                f"Spec.P{i}",
+                status,
+                evidence=DeclarationEvidence.NEGATION_PROVED if status == DeclarationStatus.REFUTED else None,
+            )
+            for i, status in enumerate(statuses)
+        ],
         duration_seconds=1.0,
     )
 
@@ -53,8 +66,7 @@ def test_properties_are_sorted_by_file_then_name():
     "status,bucket",
     [
         (DeclarationStatus.PROVED, "passed"),
-        (DeclarationStatus.NEGATED, "failed"),
-        (DeclarationStatus.COUNTEREXAMPLE, "failed"),
+        (DeclarationStatus.REFUTED, "failed"),
         (DeclarationStatus.IN_PROGRESS, "without_verdict"),
         (DeclarationStatus.FAILED, "without_verdict"),
         (DeclarationStatus.UNKNOWN, "without_verdict"),
@@ -82,9 +94,11 @@ def test_definitions_are_excluded_from_the_verdict():
     assert results.exit_code(FailOn.FAILURE) == EXIT_SUCCESS
 
 
-@pytest.mark.parametrize("status", [DeclarationStatus.NEGATED, DeclarationStatus.COUNTEREXAMPLE])
-def test_a_definitive_negative_fails_the_build(status: DeclarationStatus):
-    assert _results(DeclarationStatus.PROVED, status).exit_code(FailOn.FAILURE) == EXIT_VERIFICATION_FAILED
+def test_a_definitive_negative_fails_the_build():
+    assert (
+        _results(DeclarationStatus.PROVED, DeclarationStatus.REFUTED).exit_code(FailOn.FAILURE)
+        == EXIT_VERIFICATION_FAILED
+    )
 
 
 def test_a_property_in_progress_does_not_fail_the_build_by_default():
@@ -105,7 +119,7 @@ def test_strict_mode_fails_on_a_property_without_a_verdict():
 
 
 def test_advisory_mode_never_fails_the_build():
-    results = _results(DeclarationStatus.NEGATED, DeclarationStatus.COUNTEREXAMPLE)
+    results = _results(DeclarationStatus.REFUTED)
 
     assert results.exit_code(FailOn.NEVER) == EXIT_SUCCESS
 
@@ -120,14 +134,21 @@ def test_strict_mode_fails_an_empty_run():
 
 def _failed_task(*statuses: DeclarationStatus) -> RunResults:
     return RunResults.from_declarations(
-        [make_declaration(f"Spec.P{i}", status) for i, status in enumerate(statuses)],
+        [
+            make_declaration(
+                f"Spec.P{i}",
+                status,
+                evidence=DeclarationEvidence.NEGATION_PROVED if status == DeclarationStatus.REFUTED else None,
+            )
+            for i, status in enumerate(statuses)
+        ],
         duration_seconds=1.0,
         task_failed=True,
     )
 
 
 def test_a_failed_task_with_a_refutation_is_a_verification_failure():
-    assert _failed_task(DeclarationStatus.NEGATED).exit_code(FailOn.FAILURE) == EXIT_VERIFICATION_FAILED
+    assert _failed_task(DeclarationStatus.REFUTED).exit_code(FailOn.FAILURE) == EXIT_VERIFICATION_FAILED
 
 
 @pytest.mark.parametrize("fail_on", [FailOn.FAILURE, FailOn.NO_VERDICT])
@@ -135,7 +156,7 @@ def test_a_failed_task_without_a_refutation_is_an_infrastructure_error(fail_on: 
     assert _failed_task(DeclarationStatus.PROVED).exit_code(fail_on) == EXIT_INFRASTRUCTURE_ERROR
 
 
-@pytest.mark.parametrize("statuses", [(), (DeclarationStatus.PROVED,), (DeclarationStatus.NEGATED,)])
+@pytest.mark.parametrize("statuses", [(), (DeclarationStatus.PROVED,), (DeclarationStatus.REFUTED,)])
 def test_advisory_mode_does_not_fail_the_build_for_a_failed_task(statuses: tuple[DeclarationStatus, ...]):
     assert _failed_task(*statuses).exit_code(FailOn.NEVER) == EXIT_SUCCESS
 
@@ -150,7 +171,9 @@ def test_a_cancelled_task_without_a_refutation_is_an_infrastructure_error(fail_o
 
 def test_a_cancelled_task_with_a_refutation_is_a_verification_failure():
     results = RunResults.from_declarations(
-        [make_declaration(status=DeclarationStatus.NEGATED)], duration_seconds=1.0, canceled=True
+        [make_declaration(status=DeclarationStatus.REFUTED, evidence=DeclarationEvidence.NEGATION_PROVED)],
+        duration_seconds=1.0,
+        canceled=True,
     )
 
     assert results.exit_code(FailOn.FAILURE) == EXIT_VERIFICATION_FAILED
@@ -163,10 +186,10 @@ def test_an_unknown_status_counts_as_unresolved_rather_than_passing():
     assert len(results.without_verdict) == 1
     assert results.exit_code(FailOn.NO_VERDICT) == EXIT_VERIFICATION_FAILED
     # Nor as work still going.
-    assert results.summary_line() == "0 proved, 0 disproved, 0 in progress, 1 unknown"
+    assert results.summary_line() == "0 proved, 0 refuted, 0 in progress, 1 unknown"
 
 
-def test_a_run_that_stopped_is_unresolved_rather_than_disproved():
+def test_a_run_that_stopped_is_unresolved_rather_than_refuted():
     # FAILED is the run's failure, not the property's: it has no verdict.
     results = _results(DeclarationStatus.PROVED, DeclarationStatus.FAILED)
 
@@ -174,7 +197,7 @@ def test_a_run_that_stopped_is_unresolved_rather_than_disproved():
     assert len(results.without_verdict) == 1
     assert results.exit_code(FailOn.FAILURE) == EXIT_SUCCESS
     assert results.exit_code(FailOn.NO_VERDICT) == EXIT_VERIFICATION_FAILED
-    assert results.summary_line() == "1 proved, 0 disproved, 0 in progress, 1 unresolved"
+    assert results.summary_line() == "1 proved, 0 refuted, 0 in progress, 1 unresolved"
 
 
 @pytest.mark.parametrize(
@@ -210,23 +233,28 @@ def test_a_proof_that_no_longer_checks_counts_like_any_other_unverified_property
     )
 
     assert broken.exit_code(fail_on) == out_of_budget.exit_code(fail_on)
-    assert broken.summary_line() == out_of_budget.summary_line() == "0 proved, 0 disproved, 0 in progress, 1 unresolved"
+    assert broken.summary_line() == out_of_budget.summary_line() == "0 proved, 0 refuted, 0 in progress, 1 unresolved"
 
 
 def test_a_verdict_carries_no_failure_reason():
     assert failure_reason_label(make_declaration("Spec.P", DeclarationStatus.PROVED)) is None
-    assert result_label(make_declaration("Spec.P", DeclarationStatus.NEGATED)) == "disproved"
+    assert (
+        result_label(
+            make_declaration("Spec.P", DeclarationStatus.REFUTED, evidence=DeclarationEvidence.NEGATION_PROVED)
+        )
+        == "refuted"
+    )
 
 
 def test_summary_line_counts_each_bucket():
     results = _results(
         DeclarationStatus.PROVED,
         DeclarationStatus.PROVED,
-        DeclarationStatus.COUNTEREXAMPLE,
+        DeclarationStatus.REFUTED,
         DeclarationStatus.IN_PROGRESS,
     )
 
-    assert results.summary_line() == "2 proved, 1 disproved, 1 in progress"
+    assert results.summary_line() == "2 proved, 1 refuted, 1 in progress"
 
 
 def _declared(declaration_id: str, name: str = "Spec.P", **kwargs) -> Declaration:
@@ -240,7 +268,9 @@ def _requested(*ids: str) -> list[RequestedProperty]:
 
 def test_requested_properties_are_matched_by_id_in_manifest_order():
     zeta = _declared("zeta", name="alpha", status=DeclarationStatus.PROVED)
-    alpha = _declared("alpha", name="zeta", status=DeclarationStatus.NEGATED)
+    alpha = _declared(
+        "alpha", name="zeta", status=DeclarationStatus.REFUTED, evidence=DeclarationEvidence.NEGATION_PROVED
+    )
 
     results = RunResults.from_declarations([alpha, zeta], duration_seconds=1.0, requested=_requested("zeta", "alpha"))
 
@@ -260,7 +290,7 @@ def test_a_requested_id_with_nothing_registered_is_an_unresolved_row():
     assert (row.label, row.result_label, row.failure_reason) == (NOT_REGISTERED, NOT_REGISTERED, None)
     assert row.description == "fifo holds."
     assert results.not_registered == results.without_verdict == [row]
-    assert results.summary_line() == "0 proved, 0 disproved, 0 in progress, 1 not registered"
+    assert results.summary_line() == "0 proved, 0 refuted, 0 in progress, 1 not registered"
 
 
 def test_a_property_registered_under_another_id_is_a_suggestion():
@@ -313,7 +343,15 @@ def test_suggestions_are_the_other_live_properties_sorted_by_file_then_name():
 @pytest.mark.parametrize("fail_on", [FailOn.FAILURE, FailOn.NO_VERDICT])
 def test_a_refuted_suggestion_does_not_fail_the_build(fail_on: FailOn):
     results = RunResults.from_declarations(
-        [_declared("fifo"), _declared("extra", name="Spec.Extra", status=DeclarationStatus.COUNTEREXAMPLE)],
+        [
+            _declared("fifo"),
+            _declared(
+                "extra",
+                name="Spec.Extra",
+                status=DeclarationStatus.REFUTED,
+                evidence=DeclarationEvidence.COUNTEREXAMPLE,
+            ),
+        ],
         duration_seconds=1.0,
         requested=_requested("fifo"),
     )
@@ -322,9 +360,14 @@ def test_a_refuted_suggestion_does_not_fail_the_build(fail_on: FailOn):
     assert results.exit_code(fail_on) == EXIT_SUCCESS
 
 
-def test_a_disproved_requested_property_fails_the_build():
+def test_a_refuted_requested_property_fails_the_build():
     results = RunResults.from_declarations(
-        [_declared("a"), _declared("b", name="Spec.B", status=DeclarationStatus.NEGATED)],
+        [
+            _declared("a"),
+            _declared(
+                "b", name="Spec.B", status=DeclarationStatus.REFUTED, evidence=DeclarationEvidence.NEGATION_PROVED
+            ),
+        ],
         duration_seconds=1.0,
         requested=_requested("a", "b"),
     )
@@ -356,10 +399,18 @@ def test_a_manifest_run_that_verified_no_property_fails_unless_advisory(declarat
     assert results.exit_code(fail_on) == expected
 
 
-@pytest.mark.parametrize("status", [DeclarationStatus.PROVED, DeclarationStatus.COUNTEREXAMPLE])
+@pytest.mark.parametrize("status", [DeclarationStatus.PROVED, DeclarationStatus.REFUTED])
 def test_one_verdict_is_enough_for_a_manifest_run_to_have_verified_something(status: DeclarationStatus):
     results = RunResults.from_declarations(
-        [_declared("a", status=status)], duration_seconds=1.0, requested=_requested("a", "b")
+        [
+            _declared(
+                "a",
+                status=status,
+                evidence=DeclarationEvidence.NEGATION_PROVED if status == DeclarationStatus.REFUTED else None,
+            )
+        ],
+        duration_seconds=1.0,
+        requested=_requested("a", "b"),
     )
 
     assert not results.nothing_verified
@@ -403,11 +454,11 @@ CUT_SHORT_IDS = ["out of budget", "out of time"]
 @pytest.mark.parametrize(
     ("cut", "reason"), zip(CUT_SHORT, [OUT_OF_BUDGET_REASON, TIME_BUDGET_REASON]), ids=CUT_SHORT_IDS
 )
-def test_a_cut_short_run_reports_every_proof_and_disproof_as_unchecked(cut: dict[str, bool], reason: str):
+def test_a_cut_short_run_reports_every_proof_and_refutation_as_unchecked(cut: dict[str, bool], reason: str):
     results = RunResults.from_declarations(
         [
             _declared("a", status=DeclarationStatus.PROVED),
-            _declared("b", status=DeclarationStatus.NEGATED),
+            _declared("b", status=DeclarationStatus.REFUTED, evidence=DeclarationEvidence.NEGATION_PROVED),
             _declared("c", status=DeclarationStatus.IN_PROGRESS),
             _declared("extra", name="Spec.Extra", status=DeclarationStatus.PROVED),
         ],
@@ -419,17 +470,17 @@ def test_a_cut_short_run_reports_every_proof_and_disproof_as_unchecked(cut: dict
     assert results.cut_short and results.unchecked_reason == reason
     assert results.passed == results.failed == []
     assert [(p.unchecked_verdict, p.result_label) for p in results.without_verdict] == [
-        (True, "disproved, unchecked"),
+        (True, "refuted, unchecked"),
         (True, "proved, unchecked"),
         (False, "in progress"),
     ]
     assert [s.result_label for s in results.suggestions] == ["proved, unchecked"]
-    assert results.summary_line() == "0 proved, 0 disproved, 1 in progress, 2 unchecked (1 disproved and 1 proved)"
+    assert results.summary_line() == "0 proved, 0 refuted, 1 in progress, 2 unchecked (1 refuted and 1 proved)"
 
 
 @pytest.mark.parametrize("cut", CUT_SHORT, ids=CUT_SHORT_IDS)
 @pytest.mark.parametrize("requested", [_requested("a"), None], ids=["manifest", "open-ended"])
-@pytest.mark.parametrize("status", [DeclarationStatus.PROVED, DeclarationStatus.NEGATED], ids=["proved", "negated"])
+@pytest.mark.parametrize("status", [DeclarationStatus.PROVED, DeclarationStatus.REFUTED], ids=["proved", "refuted"])
 @pytest.mark.parametrize(
     ("fail_on", "expected"),
     [
@@ -443,7 +494,16 @@ def test_a_cut_short_run_is_an_infrastructure_error_unless_advisory_and_ended(
 ):
     """A run the time budget cut hasn't ended, so --fail-on never doesn't pass it either."""
     results = RunResults.from_declarations(
-        [_declared("a", status=status)], duration_seconds=1.0, requested=requested, **cut
+        [
+            _declared(
+                "a",
+                status=status,
+                evidence=DeclarationEvidence.NEGATION_PROVED if status == DeclarationStatus.REFUTED else None,
+            )
+        ],
+        duration_seconds=1.0,
+        requested=requested,
+        **cut,
     )
 
     assert not results.nothing_verified
@@ -528,7 +588,7 @@ def test_a_run_that_finished_keeps_its_verdicts():
 
     assert not results.cut_short and results.unchecked_reason is None
     assert [p.result_label for p in results.passed] == ["proved"]
-    assert results.summary_line() == "1 proved, 0 disproved, 0 in progress"
+    assert results.summary_line() == "1 proved, 0 refuted, 0 in progress"
 
 
 @pytest.mark.parametrize(
@@ -545,7 +605,7 @@ def test_a_run_that_failed_or_was_cancelled_leaves_its_proofs_unchecked(kwargs: 
     assert results.unchecked_reason == reason
     assert results.passed == []
     assert [p.result_label for p in results.without_verdict] == ["proved, unchecked"]
-    assert results.summary_line() == "0 proved, 0 disproved, 0 in progress, 1 unchecked (1 proved)"
+    assert results.summary_line() == "0 proved, 0 refuted, 0 in progress, 1 unchecked (1 proved)"
 
 
 @pytest.mark.parametrize(("fail_on", "expected"), [(FailOn.FAILURE, 1), (FailOn.NO_VERDICT, 1), (FailOn.NEVER, 0)])
@@ -563,7 +623,7 @@ def test_a_run_that_stopped_with_work_left_fails_the_build_unless_fail_on_is_nev
 
 
 def _with_summary(summary: str) -> RunResults:
-    return dataclasses.replace(_results(DeclarationStatus.NEGATED), run_summary=summary)
+    return dataclasses.replace(_results(DeclarationStatus.REFUTED), run_summary=summary)
 
 
 def test_a_short_run_summary_is_carried_whole():
@@ -589,35 +649,77 @@ def test_a_long_run_summary_without_line_ends_is_cut_at_the_limit():
 
 
 def test_a_run_without_a_summary_has_no_excerpt():
-    assert _results(DeclarationStatus.NEGATED).run_summary_excerpt is None
+    assert _results(DeclarationStatus.REFUTED).run_summary_excerpt is None
 
 
 def _expecting(status: DeclarationStatus, **run: bool) -> RunResults:
-    """A manifest run with one property the manifest expects disproved, which the run left with ``status``."""
-    declaration = make_declaration("Spec.Demo", status).model_copy(update={"declaration_id": "demo"})
-    requested = [RequestedProperty("demo", Kind.NATURAL_LANGUAGE, "A full FIFO takes no write.", expect_disproved=True)]
+    """A manifest run with one property the manifest expects refuted, which the run left with ``status``."""
+    declaration = make_declaration(
+        "Spec.Demo",
+        status,
+        evidence=DeclarationEvidence.NEGATION_PROVED if status == DeclarationStatus.REFUTED else None,
+    ).model_copy(update={"declaration_id": "demo"})
+    requested = [RequestedProperty("demo", Kind.NATURAL_LANGUAGE, "A full FIFO takes no write.", expect_refuted=True)]
     return RunResults.from_declarations([declaration], duration_seconds=1.0, requested=requested, **run)
 
 
-@pytest.mark.parametrize("status", [DeclarationStatus.NEGATED, DeclarationStatus.COUNTEREXAMPLE])
-def test_a_disproof_the_manifest_expects_passes_as_an_expected_failure(status: DeclarationStatus):
-    results = _expecting(status)
+def test_a_refutation_the_manifest_expects_passes_as_an_expected_failure():
+    results = _expecting(DeclarationStatus.REFUTED)
 
     assert [p.name for p in results.passed] == ["demo"]
     assert results.failed == [] and results.without_verdict == []
     assert (results.passed[0].label, results.passed[0].result_label) == (EXPECTED_FAILURE, EXPECTED_FAILURE)
-    assert results.summary_line() == "0 proved, 1 disproved as expected, 0 disproved, 0 in progress"
+    assert results.summary_line() == "0 proved, 1 refuted as expected, 0 refuted, 0 in progress"
     assert results.exit_code(FailOn.FAILURE) == EXIT_SUCCESS
     assert results.exit_code(FailOn.NO_VERDICT) == EXIT_SUCCESS
 
 
-def test_a_proof_of_a_property_the_manifest_expects_disproved_fails():
+def test_a_counterexample_has_a_refuted_verdict():
+    declaration = make_declaration(status=DeclarationStatus.REFUTED, evidence=DeclarationEvidence.COUNTEREXAMPLE)
+    results = RunResults.from_declarations([declaration], duration_seconds=1.0)
+
+    assert results.failed == results.properties
+    assert (results.properties[0].label, results.properties[0].result_label) == ("refuted", "refuted")
+    assert results.exit_code(FailOn.FAILURE) == EXIT_VERIFICATION_FAILED
+
+    requested = [RequestedProperty(declaration.declaration_id, Kind.NATURAL_LANGUAGE, "P holds.", expect_refuted=True)]
+    expected = RunResults.from_declarations([declaration], duration_seconds=1.0, requested=requested)
+
+    assert expected.passed == expected.properties
+    assert expected.properties[0].result_label == EXPECTED_FAILURE
+    assert expected.exit_code(FailOn.NO_VERDICT) == EXIT_SUCCESS
+
+
+@pytest.mark.parametrize(
+    ("run", "unchecked"),
+    [
+        ({"out_of_budget": True}, True),
+        ({"timed_out": True}, True),
+        ({"task_failed": True}, False),
+        ({"canceled": True}, False),
+    ],
+)
+def test_both_evidence_preserves_unchecked_and_artifact_rules(run: dict[str, bool], unchecked: bool):
+    artifacts = ["sim/cex.vcd", "sim/replay.log"]
+    declaration = make_declaration(status=DeclarationStatus.REFUTED, evidence=DeclarationEvidence.BOTH).model_copy(
+        update={"artifact_paths": artifacts}
+    )
+    results = RunResults.from_declarations([declaration], duration_seconds=1.0, **run)
+    row = results.properties[0]
+
+    assert row.unchecked_verdict == unchecked
+    assert row.artifact_paths == ([] if unchecked else artifacts)
+    assert row.result_label == "refuted" + (", unchecked" if unchecked else "")
+    assert results.exit_code(FailOn.FAILURE) == (EXIT_INFRASTRUCTURE_ERROR if unchecked else EXIT_VERIFICATION_FAILED)
+
+
+def test_a_proof_of_a_property_the_manifest_expects_refuted_fails():
     results = _expecting(DeclarationStatus.PROVED)
 
     assert [p.name for p in results.failed] == ["demo"]
     assert results.passed == []
     assert results.failed[0].label == UNEXPECTEDLY_PROVED
-    assert results.summary_line() == "0 proved, 0 disproved, 1 unexpectedly proved, 0 in progress"
+    assert results.summary_line() == "0 proved, 0 refuted, 1 unexpectedly proved, 0 in progress"
     assert results.exit_code(FailOn.FAILURE) == EXIT_VERIFICATION_FAILED
 
 
@@ -625,12 +727,13 @@ def test_a_proof_of_a_property_the_manifest_expects_disproved_fails():
     ("status", "run"),
     [
         (DeclarationStatus.IN_PROGRESS, {}),
-        (DeclarationStatus.NEGATED, {"out_of_budget": True}),
+        (DeclarationStatus.FAILED, {}),
+        (DeclarationStatus.REFUTED, {"out_of_budget": True}),
         (DeclarationStatus.PROVED, {"canceled": True}),
     ],
-    ids=["no verdict", "unchecked disproof", "unchecked proof"],
+    ids=["no verdict", "failed", "unchecked refutation", "unchecked proof"],
 )
-def test_a_property_the_manifest_expects_disproved_without_a_checked_verdict_is_unresolved(status, run):
+def test_a_property_the_manifest_expects_refuted_without_a_checked_verdict_is_unresolved(status, run):
     results = _expecting(status, **run)
 
     assert [p.name for p in results.without_verdict] == ["demo"]

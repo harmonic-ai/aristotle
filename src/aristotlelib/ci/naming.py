@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
+from aristotlelib import local_file_utils
 from aristotlelib.ci import context, scope
 from aristotlelib.ci.manifest import MANIFEST_NAME
 from aristotlelib.printable import escape_controls
@@ -70,7 +71,7 @@ def _revision(root: Path, build: context.CIContext) -> str:
     # status, not diff: diff rewrites the index under its lock, which a timeout's kill would leave behind. Without
     # renames: only whether there is a change matters, and pairing many of them up can take longer than the timeout.
     status = ("-c", "status.renames=false", "--no-optional-locks", "status", "--porcelain", "--untracked-files=no")
-    if commit and _git(root, *status, "--ignore-submodules=all", "--", "."):
+    if commit and _git(root, *status, "--ignore-submodules=all", "--", local_file_utils.git_pathspec(root)):
         logger.info(f"Checking uncommitted changes, so the project's name says {commit}+changes.")
         commit += "+changes"
     return " ".join(part for part in (branch, commit) if part)

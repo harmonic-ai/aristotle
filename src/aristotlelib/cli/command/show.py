@@ -45,11 +45,9 @@ from aristotlelib.results import (
 
 def format_property_counts(declarations: list[Declaration], tasks: Sequence[AgentTask] = ()) -> str:
     """Count properties by outcome, with those the project's ``tasks`` show Aristotle never checked apart;
-    counterexamples, unresolved properties and unchecked verdicts appear only when nonzero, as on the web."""
+    unresolved properties and unchecked verdicts appear only when nonzero, as on the web."""
     counts = PropertyCounts.from_declarations(declarations, tasks)
-    line = f"{counts.proved} proved · {counts.disproved} disproved"
-    if counts.counterexample:
-        line += f" ({counts.counterexample} by counterexample)"
+    line = f"{counts.proved} proved · {counts.refuted} refuted"
     line += f" · {counts.in_progress} in progress"
     if counts.unresolved:
         line += f" · {counts.unresolved} unresolved"

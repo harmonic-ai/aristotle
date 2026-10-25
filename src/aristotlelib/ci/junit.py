@@ -67,7 +67,7 @@ def _failure_text(result: PropertyResult, workspace: Path | None, run_summary: s
         lines.extend(["", *artifacts])
     if run_summary:
         heading = "Aristotle's summary of the run" + (
-            "" if result.expect_disproved else ", which usually names the counterexample"
+            "" if result.expect_refuted else ", which usually names the counterexample"
         )
         lines.extend(["", f"{heading}:", run_summary])
     return "\n".join(lines)
@@ -105,19 +105,19 @@ def _add_testcase(suite: ET.Element, result: PropertyResult, results: RunResults
 
     if result.failed:
         # A proof the manifest didn't expect says so; its description is what was proved.
-        message = f"{result.name} {result.label}" if result.expect_disproved else result.description
+        message = f"{result.name} {result.label}" if result.expect_refuted else result.description
         failure = ET.SubElement(
             testcase, "failure", {"message": message or f"{result.name} {result.label}", "type": result.label}
         )
         failure.text = _failure_text(result, workspace, results.run_summary_excerpt)
     elif not result.passed:
         ET.SubElement(testcase, "skipped", {"message": _no_verdict_message(result, results)})
-    elif result.description or result.expect_disproved or result.assumptions:
+    elif result.description or result.expect_refuted or result.assumptions:
         # system-out is the only place JUnit allows text on a passing case.
         system_out = ET.SubElement(testcase, "system-out")
-        lines = [f"Result: {result.label}"] if result.expect_disproved else []
+        lines = [f"Result: {result.label}"] if result.expect_refuted else []
         head = "\n".join([*lines, *([result.description] if result.description else [])])
-        verdict = "Assuming:" if result.expect_disproved else "Holds, assuming"
+        verdict = "Assuming:" if result.expect_refuted else "Holds, assuming"
         assuming = f"{verdict} {result.assumptions}" if result.assumptions else ""
         system_out.text = "\n\n".join(part for part in (head, assuming) if part)
 

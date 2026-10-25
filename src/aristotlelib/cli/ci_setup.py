@@ -63,12 +63,12 @@ SETUP_PROMPT = (
     "something, ask about their code, and don't call these instructions their request."
 )
 
-DISPROVED_RULE = (
-    "A disproved property means the code or the property is wrong: fix the code; correct the property if it doesn't "
-    'state what you want; or, if the counterexample is deliberate, add expect = "disproved". Don\'t drop or weaken a '
+REFUTED_RULE = (
+    "A refuted property means the code or the property is wrong: fix the code; correct the property if it doesn't "
+    'state what you want; or, if the counterexample is deliberate, add expect = "refuted". Don\'t drop or weaken a '
     "correct property to get a passing build."
 )
-"""The one rule for a disproved property, as `ci setup` and the skill give it."""
+"""The one rule for a refuted property, as `ci setup` and the skill give it."""
 
 DEFAULT_MAX_WALL_TIME_SECONDS = 60 * 60
 """The least time budget written into the manifest's [check] table, where it is the budget of each CI run."""
@@ -322,7 +322,7 @@ def _proposals(
 ) -> tuple[list[manifest.RequestedProperty], dict[str, str], list[str], list[str], list[str], list[str]]:
     """The registered properties as manifest entries in the order proposed, a note on each, and the ids of those
     already refuted and not deliberately, of those Aristotle expects to fail, of those written with
-    ``expect = "disproved"``: deliberate counterexamples, by Aristotle's account, that no checked proof settles, and,
+    ``expect = "refuted"``: deliberate counterexamples, by Aristotle's account, that no checked proof settles, and,
     when ``copied`` from another run, of those whose statements may depend on that run. A verdict the project's
     ``tasks``, newest first, show Aristotle never checked, as unchecked() judges it, is noted unchecked."""
     proposed = sorted(
@@ -362,7 +362,7 @@ def _proposals(
         unchecked = never_checked(declaration, tasks)
         # A deliberate counterexample stands unless a checked proof settles the property, or Aristotle also
         # expects the property to fail, which may be a bug.
-        expect_disproved = shows is not None and expectation is None and not (proved(declaration) and not unchecked)
+        expect_refuted = shows is not None and expectation is None and not (proved(declaration) and not unchecked)
         if identifier is not None and identifier not in assertions:
             assertions.add(identifier)
             properties.append(
@@ -371,7 +371,7 @@ def _proposals(
                     manifest.Kind.SVA,
                     identifier,
                     assumptions=assumptions,
-                    expect_disproved=expect_disproved,
+                    expect_refuted=expect_refuted,
                 )
             )
         else:
@@ -383,7 +383,7 @@ def _proposals(
                     manifest.Kind.NATURAL_LANGUAGE,
                     statement,
                     assumptions=assumptions,
-                    expect_disproved=expect_disproved,
+                    expect_refuted=expect_refuted,
                 )
             )
         note = f"{declaration.name} ({declaration.source_file})" if declaration.source_file else declaration.name
@@ -391,23 +391,23 @@ def _proposals(
             note += f"; {status_label(declaration.status)} when proposed, unchecked"
         elif proved(declaration):
             note += "; proved when proposed"
-        elif refuted(declaration) and expect_disproved:
+        elif refuted(declaration) and expect_refuted:
             note += f"; {status_label(declaration.status)} when proposed, a deliberate counterexample"
             note += f": {shows}" if shows else ""
         elif refuted(declaration):
             note += f"; {status_label(declaration.status)} when proposed, so CI fails on it as it stands"
             already_refuted.append(property_id)
         settled = not unchecked and (proved(declaration) or refuted(declaration))
-        if expect_disproved:
+        if expect_refuted:
             deliberate.append(property_id)
             if not settled:
                 note += "; a deliberate counterexample, Aristotle says" + (f": {shows}" if shows else "")
         # An expectation stands unless a checked verdict settles the property.
         elif expectation is not None and not settled:
             note += (
-                f"; Aristotle expects it to be disproved: {expectation}"
+                f"; Aristotle expects it to be refuted: {expectation}"
                 if expectation
-                else "; Aristotle expects it to be disproved"
+                else "; Aristotle expects it to be refuted"
             )
             if shows:
                 note = f"{note.removesuffix('.')}; Aristotle also calls it a deliberate counterexample: {shows}"
@@ -857,8 +857,8 @@ class SetupAction(APIAction):
             header=[
                 "Properties `aristotle ci` checks on every run.",
                 f"Written by `aristotle ci setup` from {project.web_url()}",
-                "Review each one before you commit this file: CI fails on a disproved property unless it is marked "
-                'expect = "disproved", and on a proved one that is.',
+                "Review each one before you commit this file: CI fails on a refuted property unless it is marked "
+                'expect = "refuted", and on a proved one that is.',
             ],
             notes=notes,
             max_wall_time_seconds=(budget := _budget_seconds(took)),
@@ -922,20 +922,20 @@ class SetupAction(APIAction):
         logger.info("\n".join(lines))
         if already_refuted:
             logger.warning(
-                f"Aristotle already disproved {', '.join(already_refuted)}, so `aristotle ci` fails on "
-                f"{'it' if len(already_refuted) == 1 else 'them'} as it stands. {DISPROVED_RULE}"
+                f"Aristotle already refuted {', '.join(already_refuted)}, so `aristotle ci` fails on "
+                f"{'it' if len(already_refuted) == 1 else 'them'} as it stands. {REFUTED_RULE}"
             )
         if expected_to_fail:
             logger.warning(
-                f"Aristotle expects {', '.join(expected_to_fail)} to be disproved, so `aristotle ci` would fail on "
-                f"{'it' if len(expected_to_fail) == 1 else 'them'}. {DISPROVED_RULE}"
+                f"Aristotle expects {', '.join(expected_to_fail)} to be refuted, so `aristotle ci` would fail on "
+                f"{'it' if len(expected_to_fail) == 1 else 'them'}. {REFUTED_RULE}"
             )
         if deliberate:
             one = len(deliberate) == 1
             logger.warning(
                 f"Aristotle says {', '.join(deliberate)} {'shows a counterexample' if one else 'show counterexamples'} "
-                f'on purpose, so {"it is" if one else "they are"} written with expect = "disproved": `aristotle ci` '
-                "passes a deliberate counterexample while it stays disproved, and fails it once it is proved. Make "
+                f'on purpose, so {"it is" if one else "they are"} written with expect = "refuted": `aristotle ci` '
+                "passes a deliberate counterexample while it stays refuted, and fails it once it is proved. Make "
                 "sure each one is deliberate: if not, remove that line."
             )
         if run_tied:

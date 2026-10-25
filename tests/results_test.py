@@ -11,6 +11,7 @@ from aristotlelib.cli.command import properties
 from aristotlelib.cli.command.show import format_property_counts
 from aristotlelib.declaration import (
     Declaration,
+    DeclarationEvidence,
     DeclarationFailureReason,
     DeclarationSource,
     DeclarationStatus,
@@ -30,15 +31,14 @@ def _declaration(status: DeclarationStatus) -> Declaration:
         source=DeclarationSource.AGENT,
         name=f"Spec.{status.name}",
         status=status,
+        evidence=DeclarationEvidence.NEGATION_PROVED if status == DeclarationStatus.REFUTED else None,
         filename="Spec.lean",
         created_at=datetime(2026, 1, 1),
         last_updated=datetime(2026, 1, 2),
     )
 
 
-VERDICTS = [
-    _declaration(s) for s in (DeclarationStatus.PROVED, DeclarationStatus.NEGATED, DeclarationStatus.COUNTEREXAMPLE)
-]
+VERDICTS = [_declaration(s) for s in (DeclarationStatus.PROVED, DeclarationStatus.REFUTED)]
 
 
 def _task(status: TaskStatus, created_at: datetime = datetime(2026, 1, 1)) -> AgentTask:
@@ -53,12 +53,12 @@ LATER = datetime(2026, 1, 3)
 @pytest.mark.parametrize(
     ("task_status", "expected"),
     [
-        (TaskStatus.COMPLETE, {"proved": 1, "negated": 1, "counterexample": 1, "unchecked": 0}),
-        (TaskStatus.COMPLETE_WITH_ERRORS, {"proved": 1, "negated": 1, "counterexample": 1, "unchecked": 0}),
-        (None, {"proved": 1, "negated": 1, "counterexample": 1, "unchecked": 0}),
-        (TaskStatus.OUT_OF_BUDGET, {"proved": 0, "negated": 0, "counterexample": 0, "unchecked": 3}),
-        (TaskStatus.FAILED, {"proved": 0, "negated": 1, "counterexample": 1, "unchecked": 1}),
-        (TaskStatus.CANCELED, {"proved": 0, "negated": 1, "counterexample": 1, "unchecked": 1}),
+        (TaskStatus.COMPLETE, {"proved": 1, "refuted": 1, "unchecked": 0}),
+        (TaskStatus.COMPLETE_WITH_ERRORS, {"proved": 1, "refuted": 1, "unchecked": 0}),
+        (None, {"proved": 1, "refuted": 1, "unchecked": 0}),
+        (TaskStatus.OUT_OF_BUDGET, {"proved": 0, "refuted": 0, "unchecked": 2}),
+        (TaskStatus.FAILED, {"proved": 0, "refuted": 1, "unchecked": 1}),
+        (TaskStatus.CANCELED, {"proved": 0, "refuted": 1, "unchecked": 1}),
     ],
 )
 def test_a_proof_or_disproof_aristotle_never_checked_counts_as_unchecked(task_status, expected):
@@ -66,8 +66,7 @@ def test_a_proof_or_disproof_aristotle_never_checked_counts_as_unchecked(task_st
     counts, _, _ = summarize_properties(VERDICTS, [_task(task_status)] if task_status else [])
 
     assert counts is not None
-    disproved = expected["negated"] + expected["counterexample"]
-    assert counts.model_dump() == {"in_progress": 0, "unresolved": 0, "disproved": disproved, **expected}
+    assert counts.model_dump() == {"in_progress": 0, "unresolved": 0, **expected}
 
 
 def test_each_listed_property_says_whether_aristotle_checked_it():
@@ -75,8 +74,7 @@ def test_each_listed_property_says_whether_aristotle_checked_it():
 
     assert [(p.name, p.unchecked) for p in properties or []] == [
         ("Spec.PROVED", True),
-        ("Spec.NEGATED", False),
-        ("Spec.COUNTEREXAMPLE", False),
+        ("Spec.REFUTED", False),
     ]
 
 
@@ -84,7 +82,7 @@ def test_each_listed_property_says_whether_aristotle_checked_it():
 def test_a_verdict_a_finished_task_set_stays_checked_after_a_later_task_ends_unchecked(status):
     counts, _, _ = summarize_properties(VERDICTS, [_task(status, created_at=LATER), _task(TaskStatus.COMPLETE)])
 
-    assert counts == PropertyCounts(proved=1, negated=1, counterexample=1)
+    assert counts == PropertyCounts(proved=1, refuted=1)
 
 
 def test_a_verdict_the_task_that_set_it_left_unchecked_stays_so_after_a_later_task_ends_unchecked():
@@ -92,7 +90,7 @@ def test_a_verdict_the_task_that_set_it_left_unchecked_stays_so_after_a_later_ta
         VERDICTS, [_task(TaskStatus.CANCELED, created_at=LATER), _task(TaskStatus.OUT_OF_BUDGET)]
     )
 
-    assert counts == PropertyCounts(unchecked=3)
+    assert counts == PropertyCounts(unchecked=2)
 
 
 def test_a_later_task_that_only_finished_leaves_what_an_earlier_one_left_unchecked_unchecked():
@@ -101,16 +99,16 @@ def test_a_later_task_that_only_finished_leaves_what_an_earlier_one_left_uncheck
         VERDICTS, [_task(TaskStatus.COMPLETE, created_at=LATER), _task(TaskStatus.OUT_OF_BUDGET)]
     )
 
-    assert counts == PropertyCounts(unchecked=3)
+    assert counts == PropertyCounts(unchecked=2)
 
 
 @pytest.mark.parametrize(
     ("statuses", "expected"),
     [
-        ((TaskStatus.COMPLETE, TaskStatus.CANCELED), PropertyCounts(negated=1, counterexample=1, unchecked=1)),
-        ((TaskStatus.CANCELED, TaskStatus.COMPLETE), PropertyCounts(negated=1, counterexample=1, unchecked=1)),
-        ((TaskStatus.COMPLETE, TaskStatus.OUT_OF_BUDGET), PropertyCounts(unchecked=3)),
-        ((TaskStatus.COMPLETE, TaskStatus.COMPLETE_WITH_ERRORS), PropertyCounts(proved=1, negated=1, counterexample=1)),
+        ((TaskStatus.COMPLETE, TaskStatus.CANCELED), PropertyCounts(refuted=1, unchecked=1)),
+        ((TaskStatus.CANCELED, TaskStatus.COMPLETE), PropertyCounts(refuted=1, unchecked=1)),
+        ((TaskStatus.COMPLETE, TaskStatus.OUT_OF_BUDGET), PropertyCounts(unchecked=2)),
+        ((TaskStatus.COMPLETE, TaskStatus.COMPLETE_WITH_ERRORS), PropertyCounts(proved=1, refuted=1)),
     ],
     ids=["oldest cancelled", "latest cancelled", "one out of budget", "all finished"],
 )
@@ -126,7 +124,7 @@ def test_a_verdict_older_than_every_task_listed_is_unchecked_if_any_of_them_coul
 def test_a_verdict_updated_the_moment_a_task_was_created_is_that_tasks():
     counts, _, _ = summarize_properties(VERDICTS, [_task(TaskStatus.CANCELED, created_at=datetime(2026, 1, 2))])
 
-    assert counts == PropertyCounts(negated=1, counterexample=1, unchecked=1)
+    assert counts == PropertyCounts(refuted=1, unchecked=1)
 
 
 @pytest.mark.parametrize(("offset", "unchecked"), [(timedelta(hours=1), 0), (timedelta(hours=-1), 1)])
@@ -150,7 +148,7 @@ def test_no_count_stands_until_the_task_has_ended(status):
     counts, _, properties = summarize_properties(VERDICTS, [_task(status)])
 
     assert counts is None
-    assert [p.name for p in properties or []] == ["Spec.PROVED", "Spec.NEGATED", "Spec.COUNTEREXAMPLE"]
+    assert [p.name for p in properties or []] == ["Spec.PROVED", "Spec.REFUTED"]
 
 
 def test_a_property_aristotle_withdrew_is_neither_listed_nor_counted():
@@ -158,8 +156,8 @@ def test_a_property_aristotle_withdrew_is_neither_listed_nor_counted():
 
     counts, _, properties = summarize_properties([withdrawn, *VERDICTS], [_task(TaskStatus.COMPLETE)])
 
-    assert [p.name for p in properties or []] == ["Spec.PROVED", "Spec.NEGATED", "Spec.COUNTEREXAMPLE"]
-    assert counts == PropertyCounts(proved=1, negated=1, counterexample=1)
+    assert [p.name for p in properties or []] == ["Spec.PROVED", "Spec.REFUTED"]
+    assert counts == PropertyCounts(proved=1, refuted=1)
 
 
 def test_each_listed_property_carries_its_artifact_paths():
@@ -179,6 +177,34 @@ def test_a_declaration_record_carries_its_artifact_paths():
     assert DeclarationRecord.of(linked, []).model_dump(mode="json")["artifact_paths"] == ["sim/cex.vcd"]
 
 
+def test_refutations_count_once_by_evidence_and_keep_evidence_in_summary_json():
+    message = "Refuted by a counterexample and a formal proof of the negation."
+    declarations = [
+        Declaration.model_validate(
+            {
+                **VERDICTS[1].model_dump(mode="json"),
+                "evidence": evidence,
+                "evidence_message": message,
+                "artifact_paths": ["sim/cex.vcd"],
+            }
+        )
+        for evidence in DeclarationEvidence
+        if evidence != DeclarationEvidence.UNKNOWN
+    ]
+
+    counts, _, properties = summarize_properties(declarations)
+
+    assert counts == PropertyCounts(refuted=3)
+    assert PropertyCounts.model_validate(counts.model_dump(mode="json")) == counts
+    assert format_property_counts(declarations) == "0 proved · 3 refuted · 0 in progress"
+    assert properties is not None
+    both = properties[2].model_dump(mode="json")
+    assert both["status_name"] == "REFUTED"
+    assert both["evidence"] == DeclarationEvidence.BOTH
+    assert both["evidence_message"] == message
+    assert both["artifact_paths"] == ["sim/cex.vcd"]
+
+
 def test_a_declaration_record_carries_unchecked_without_decoding_its_description_again():
     declaration = Declaration.model_validate({**VERDICTS[0].model_dump(mode="json"), "description": "a &amp;lt; b"})
 
@@ -192,13 +218,11 @@ def test_a_declaration_record_carries_unchecked_without_decoding_its_description
     ("status", "unchecked", "expected"),
     [
         (DeclarationStatus.PROVED, False, "proved"),
-        (DeclarationStatus.NEGATED, False, "disproved"),
-        (DeclarationStatus.COUNTEREXAMPLE, False, "disproved"),
+        (DeclarationStatus.REFUTED, False, "refuted"),
         (DeclarationStatus.IN_PROGRESS, False, "in_progress"),
         (DeclarationStatus.FAILED, False, "unresolved"),
         (DeclarationStatus.PROVED, True, "unchecked"),
-        (DeclarationStatus.NEGATED, True, "unchecked"),
-        (DeclarationStatus.COUNTEREXAMPLE, True, "unchecked"),
+        (DeclarationStatus.REFUTED, True, "unchecked"),
         (DeclarationStatus.UNKNOWN, False, "unknown"),
         (DeclarationStatus.REMOVED, False, "unknown"),
     ],
@@ -209,20 +233,11 @@ def test_each_status_comes_to_one_outcome(status, unchecked, expected):
     assert record.model_dump(mode="json")["outcome"] == expected
 
 
-def test_disproved_counts_negated_and_counterexample_together():
-    counts = PropertyCounts(proved=4, negated=2, counterexample=1, unresolved=3)
-
-    assert counts.model_dump(mode="json")["disproved"] == 3
-    # Read back, as a script validating the output would, the computed count is recomputed rather than refused.
-    assert PropertyCounts.model_validate(counts.model_dump(mode="json")) == counts
-
-
 @pytest.mark.parametrize(
     "status",
     [
         DeclarationStatus.PROVED,
-        DeclarationStatus.NEGATED,
-        DeclarationStatus.COUNTEREXAMPLE,
+        DeclarationStatus.REFUTED,
         DeclarationStatus.IN_PROGRESS,
         DeclarationStatus.FAILED,
     ],
@@ -237,7 +252,7 @@ def test_disproved_counts_negated_and_counterexample_together():
     ],
 )
 def test_no_command_calls_a_property_failed_or_negated(status, reason):
-    """ "failed" meant disproved in `aristotle ci` and unresolved in `show`; each outcome now has one word."""
+    """ "failed" meant refuted in `aristotle ci` and unresolved in `show`; each outcome now has one word."""
     declaration = _declaration(status).model_copy(
         update={"failure_reason": reason if status == DeclarationStatus.FAILED else None}
     )
@@ -300,7 +315,7 @@ def test_each_numeric_code_has_its_name_beside_it():
 
 
 def test_requested_counts_leave_out_what_aristotle_suggested():
-    asked = _declaration(DeclarationStatus.NEGATED).model_copy(update={"source": DeclarationSource.USER})
+    asked = _declaration(DeclarationStatus.REFUTED).model_copy(update={"source": DeclarationSource.USER})
     # A property of unknown source isn't one Aristotle suggested, so it counts as asked for.
     legacy = _declaration(DeclarationStatus.PROVED).model_copy(
         update={"declaration_id": "id-legacy", "source": DeclarationSource.UNKNOWN}
@@ -311,8 +326,8 @@ def test_requested_counts_leave_out_what_aristotle_suggested():
     running = summarize_properties([asked], [_task(TaskStatus.IN_PROGRESS)])
 
     assert summary.property_counts is not None and summary.requested_counts is not None
-    assert (summary.property_counts.proved, summary.property_counts.disproved) == (2, 1)
-    assert (summary.requested_counts.proved, summary.requested_counts.disproved) == (1, 1)
+    assert (summary.property_counts.proved, summary.property_counts.refuted) == (2, 1)
+    assert (summary.requested_counts.proved, summary.requested_counts.refuted) == (1, 1)
     assert summary.properties is not None
     assert [p.model_dump(mode="json")["source_name"] for p in summary.properties] == ["USER", "UNKNOWN", "AGENT"]
     assert (running.property_counts, running.requested_counts) == (None, None)

@@ -9,7 +9,7 @@ from typing import Any
 
 from aristotlelib.agent_task import AgentTask
 from aristotlelib.api_request import AristotleAPIError, _IntermediaryError
-from aristotlelib.ci.results import FAILURE_REASON_LABELS
+from aristotlelib.ci.results import FAILURE_REASON_LABELS, refuted
 from aristotlelib.cli.api_action import (
     PROJECT_REFERENCE_HELP,
     APIAction,
@@ -32,17 +32,14 @@ from aristotlelib.results import DeclarationPage, DeclarationRecord, unchecked
 #: The outcome words --status takes, as the table shows them, and the statuses each covers; PROVED and IN_PROGRESS
 #: are words and status names both. NOT_VERIFIED is the old name for UNRESOLVED, still taken but no longer listed.
 OUTCOME_STATUSES = {
-    "DISPROVED": {DeclarationStatus.NEGATED, DeclarationStatus.COUNTEREXAMPLE},
     "UNRESOLVED": {DeclarationStatus.FAILED},
     "NOT_VERIFIED": {DeclarationStatus.FAILED},
 }
 LISTED_STATUS_CHOICES = [
     "PROVED",
-    "DISPROVED",
+    "REFUTED",
     "IN_PROGRESS",
     "UNRESOLVED",
-    "NEGATED",
-    "COUNTEREXAMPLE",
     "FAILED",
     "ALL",
 ]
@@ -59,7 +56,7 @@ SORT_KEYS: dict[str, tuple[Callable[[Declaration], Any], bool]] = {
 DEFAULT_LIMIT = 30
 
 NAME_WIDTH = 40
-"""The name column's least width; it widens to the longest name, at a terminal as far as the terminal allows."""
+"""The name column's preferred width; evidence and longer statuses can take space from it at a terminal."""
 STATUS_WIDTH = 22
 CREATED_BY_WIDTH = 10
 UPDATED_WIDTH = 14
@@ -89,15 +86,14 @@ SHORT_FAILURE_REASONS = {DeclarationFailureReason.PROOF_CHECK_FAILED: "proof bro
 #: The outcome each status comes to, as every command words it; any other status shows its name.
 OUTCOME_LABELS = {
     DeclarationStatus.PROVED: "PROVED",
-    DeclarationStatus.NEGATED: "DISPROVED",
-    DeclarationStatus.COUNTEREXAMPLE: "DISPROVED",
+    DeclarationStatus.REFUTED: "REFUTED",
     DeclarationStatus.IN_PROGRESS: "IN PROGRESS",
     DeclarationStatus.FAILED: "UNRESOLVED",
 }
 
 
 def status_label(declaration: Declaration, tasks: Sequence[AgentTask], short: bool = False) -> str:
-    """The outcome the status comes to, with how a property was disproved, why one is unresolved, and "unchecked"
+    """The outcome the status comes to, with why a property is unresolved, and "unchecked"
     for a verdict the project's ``tasks`` show Aristotle never checked (``short`` to fit the table); "-" for a
     definition, as on the web."""
     if declaration.declaration_type != DeclarationType.PROPERTY:
@@ -105,8 +101,6 @@ def status_label(declaration: Declaration, tasks: Sequence[AgentTask], short: bo
         return "-"
     label = OUTCOME_LABELS.get(declaration.status, declaration.status.name)
     details = []
-    if declaration.status == DeclarationStatus.COUNTEREXAMPLE:
-        details.append("counterexample")
     if declaration.status == DeclarationStatus.FAILED and (reason := declaration.failure_reason) is not None:
         reason_label = SHORT_FAILURE_REASONS.get(reason) if short else None
         details.append(reason_label or FAILURE_REASON_LABELS.get(reason) or reason.name.lower().replace("_", " "))
@@ -115,6 +109,17 @@ def status_label(declaration: Declaration, tasks: Sequence[AgentTask], short: bo
             "unchecked" if short else "unchecked: the task that last updated it ended before Aristotle checked it"
         )
     return f"{label} ({', '.join(details)})" if details else label
+
+
+def evidence_label(declaration: Declaration) -> str:
+    """The reported evidence kind for a refuted property; a dash otherwise."""
+    if (
+        declaration.declaration_type == DeclarationType.PROPERTY
+        and refuted(declaration)
+        and declaration.evidence is not None
+    ):
+        return declaration.evidence.name
+    return "-"
 
 
 def location_label(declaration: Declaration) -> str:
@@ -212,8 +217,7 @@ def terminal_width() -> int | None:
 
 
 def _statuses(args: argparse.Namespace) -> set[DeclarationStatus]:
-    """The statuses the --status flags keep, an outcome word standing for each status it covers; empty for ALL, the
-    default."""
+    """The --status filters; empty for ALL, the default."""
     if not args.status or "ALL" in args.status:
         return set()
     return {s for name in args.status for s in OUTCOME_STATUSES.get(name) or {DeclarationStatus[name]}}
@@ -255,9 +259,8 @@ class PropertiesAction(APIAction):
             metavar="{" + ",".join(LISTED_STATUS_CHOICES) + "}",
             help=(
                 "Only show properties with this status, as the table words it or as Aristotle reports it; repeat it "
-                "for several, to show those with any of them. DISPROVED is NEGATED, a property Aristotle proved false, "
-                "as it reports a refuted Verilog or Lean property, or COUNTEREXAMPLE, one it broke with concrete inputs "
-                "without proving it false, as it reports a refuted C property. IN PROGRESS in the table is "
+                "for several, to show those with any of them. REFUTED includes counterexample evidence, a formal "
+                "proof of the negation, or both. IN PROGRESS in the table is "
                 "IN_PROGRESS, and UNRESOLVED is FAILED (NOT_VERIFIED, its old name, still works). A verdict Aristotle "
                 "never checked is listed under its word, marked (unchecked), though show counts it as unchecked. "
                 "Default: ALL"
@@ -269,7 +272,7 @@ class PropertiesAction(APIAction):
             default="property",
             help=(
                 "Show properties (what Aristotle was asked to establish) or definitions "
-                "(supporting context, never proved or disproved). Default: property"
+                "(supporting context, never proved or refuted). Default: property"
             ),
         )
         self.parser.add_argument(
@@ -294,7 +297,7 @@ class PropertiesAction(APIAction):
         if args.status and "ALL" in args.status and len(set(args.status)) > 1:
             self.parser.error("--status ALL can't be combined with another status.")
         if _statuses(args) and KINDS[args.kind] != DeclarationType.PROPERTY:
-            self.parser.error("--status applies to properties; definitions are never proved or disproved.")
+            self.parser.error("--status applies to properties; definitions are never proved or refuted.")
         if args.limit is not None and args.limit < 1:
             self.parser.error("--limit must be at least 1")
         return None
@@ -355,25 +358,28 @@ class PropertiesAction(APIAction):
         names = [declaration.name for declaration in declarations]
         statuses = [status_label(declaration, tasks, short=True) for declaration in declarations]
         status_width = max(STATUS_WIDTH, *map(len, statuses))
+        evidence = [evidence_label(declaration) for declaration in declarations]
+        evidence_width = max(len("EVIDENCE"), *map(len, evidence))
         locations = [location_label(declaration) for declaration in declarations]
         location_width = min(LOCATION_WIDTH, max(len(location) for location in [*locations, "LOCATION"]))
-        others = status_width + CREATED_BY_WIDTH + UPDATED_WIDTH + location_width + 4
+        others = status_width + evidence_width + CREATED_BY_WIDTH + UPDATED_WIDTH + location_width + 5
         name_width = max(NAME_WIDTH, *map(len, names))
         if (columns := terminal_width()) is not None:
-            # A status wider than its column takes its excess from the name's least width, so the table keeps its fit.
-            least = NAME_WIDTH - (status_width - STATUS_WIDTH)
+            # Evidence and a wider status take space from names so the table keeps its fit.
+            least = NAME_WIDTH - (status_width - STATUS_WIDTH) - evidence_width - 1
             name_width = max(least, min(name_width, columns - others))
         shown = shown_names(names, name_width)
 
         print(
-            f"{'NAME':<{name_width}} {'STATUS':<{status_width}} {'CREATED BY':<{CREATED_BY_WIDTH}} "
+            f"{'NAME':<{name_width}} {'STATUS':<{status_width}} {'EVIDENCE':<{evidence_width}} "
+            f"{'CREATED BY':<{CREATED_BY_WIDTH}} "
             f"{'UPDATED':<{UPDATED_WIDTH}} LOCATION"
         )
         print("-" * (name_width + others))
-        for declaration, name, status, location in zip(declarations, shown, statuses, locations):
+        for declaration, name, status, kind, location in zip(declarations, shown, statuses, evidence, locations):
             updated = format_relative_time(declaration.last_updated)
             print_line(
-                f"{name:<{name_width}} {status:<{status_width}} "
+                f"{name:<{name_width}} {status:<{status_width}} {kind:<{evidence_width}} "
                 f"{created_by_label(declaration):<{CREATED_BY_WIDTH}} {updated:<{UPDATED_WIDTH}} {location}"
             )
         return shown != names

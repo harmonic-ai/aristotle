@@ -35,7 +35,7 @@ def _uploaded(root: Path) -> str:
 def test_the_digest_is_of_what_the_run_checks_not_of_how_the_manifest_lists_it():
     reordered = Manifest(
         path=Path("other.toml"),
-        properties=[EMPTY, dataclasses.replace(FULL, expect_disproved=True)],
+        properties=[EMPTY, dataclasses.replace(FULL, expect_refuted=True)],
         max_wall_time_seconds=600,
     )
 

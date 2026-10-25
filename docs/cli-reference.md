@@ -101,7 +101,7 @@ At a terminal, `show` follows a running task until it ends. Piped, as in `show <
 stands and says how to wait for it, as `--json` does.
 
 A wait (`submit --wait`, `continue --wait`, or `show` of a running task) ends with how the task ended and, if the
-project has properties, a count such as `Properties: 25 proved · 5 disproved · 0 in progress`. If it breaks off or is
+project has properties, a count such as `Properties: 25 proved · 5 refuted · 0 in progress`. If it breaks off or is
 interrupted, or the task fails, is cancelled or runs out of budget, it prints on stderr the command that carries on the
 same way:
 
@@ -136,7 +136,7 @@ replaced if it exists, or a directory to save into under the archive's own name,
 `<project-id>-aristotle.tar.gz`. A path ending in `/` is a directory, and missing directories are made.
 `submit --wait` checks it before submitting anything, and `show` before sending any request.
 
-**Artifacts** are files Aristotle linked to a property, such as a disproved property's counterexample trace or a
+**Artifacts** are files Aristotle linked to a property, such as a refuted property's counterexample trace or a
 testbench that reproduces it. `aristotle property` lists them as `Artifacts`, then the command that downloads them into
 `aristotle-artifacts`. So that the command pastes the same into any shell on any system, it names only paths of
 letters, digits and `_.+-`, with `/` between folders, that every system can save; give any other with `--artifact`
@@ -236,24 +236,29 @@ means. Each comes from the status Aristotle reports, with `IN PROGRESS` and `UNR
 | Status | `aristotle properties` shows |
 |---|---|
 | `PROVED` | `PROVED` |
-| `NEGATED`: proved false, as a refuted Verilog or Lean property comes back | `DISPROVED` |
-| `COUNTEREXAMPLE`: broken with concrete inputs without being proved false, as a refuted C property comes back | `DISPROVED (counterexample)` |
+| `REFUTED`: refuted by a counterexample, a proof of the negation, or both | `REFUTED`, with the kind in `EVIDENCE` |
 | `IN_PROGRESS`: no verdict yet | `IN PROGRESS` |
 | `FAILED`: the run stopped short of it, or its proof no longer checks | `UNRESOLVED`, with the reason |
 
-- A disproved property's failing case is in the run's summary, and the project's files (`aristotle download`) can hold
+Every `REFUTED` property requires `evidence`: `COUNTEREXAMPLE` (1), `NEGATION_PROVED` (2) or `BOTH` (3).
+`aristotle property` shows the evidence kind separately and the agent's `evidence_message` before `Artifacts`.
+The SDK preserves the message as received, including inline Markdown. It normalizes old API responses to this
+contract, inferring missing evidence without creating a message. A kind of evidence this version doesn't know shows as
+`UNKNOWN`, and as `0` in JSON. A `Declaration` created in Python requires explicit evidence of a known kind.
+
+- A refuted property's failing case is in the run's summary, and the project's files (`aristotle download`) can hold
   a reproducer under `sim/`.
-- `--status` takes these words, `IN_PROGRESS` for `IN PROGRESS`, or the statuses (`NOT_VERIFIED`, the old name for
-  `UNRESOLVED`, still works), and repeats: `--status DISPROVED` lists what `--status NEGATED --status COUNTEREXAMPLE`
-  does.
-- A proof or disproof Aristotle never checked shows `(unchecked)` after its status until a later task updates it,
+- `--status` takes `REFUTED`, `PROVED`, `IN_PROGRESS`, `UNRESOLVED`, `FAILED` or `ALL`, and repeats.
+  `NOT_VERIFIED`, the old name for `UNRESOLVED`, still works. `--status REFUTED` lists every refutation; the filter
+  does not select evidence kinds.
+- A proof or refutation Aristotle never checked shows `(unchecked)` after its status until a later task updates it,
   because the task that set it ran out of budget or, for a proof, failed or was cancelled ([the rule](#json-output)).
   `--status` goes by the reported status, so `--status PROVED` lists unchecked proofs too, though `show` and `--json`
   count them as unchecked. In `--json`, each `properties` and `property` record says so in `unchecked`, and keeps its
   `status` as reported.
 - `--created-by you` lists only the properties you asked for, and `--created-by aristotle` those Aristotle proposed.
   `--kind definition` lists the definitions Aristotle wrote as supporting context instead of properties: they're never
-  proved or disproved, so it takes no `--status`.
+  proved or refuted, so it takes no `--status`.
 - `aristotle property` looks among properties and definitions both. A name that matches several lists them, with
   their kinds and ids, and exits 2: give the full name or the id, or, when a property and a definition share the name,
   `--kind property` or `--kind definition`.
@@ -331,22 +336,22 @@ warnings and errors go to stderr.
 printed, after any wait, most recently updated first, leaving out any Aristotle withdrew. Each has its
 `declaration_id`, `name`, `status` and `failure_reason` as its declaration has them, with `status_name` and
 `failure_reason_name`, whether it's `unchecked`, its `source` and `source_name` (`USER` if you asked for it, `AGENT` if
-Aristotle suggested it), its declaration's `artifact_paths`, and its `outcome`. The `outcome` is the word every command
-uses for what the status comes to: `proved`, `disproved` (`NEGATED` or `COUNTEREXAMPLE`), `in_progress` (`IN_PROGRESS`:
+Aristotle suggested it), its declaration's `evidence`, `evidence_message` and `artifact_paths`, and its `outcome`. The `outcome` is the word every command
+uses for what the status comes to: `proved`, `refuted` (`REFUTED`), `in_progress` (`IN_PROGRESS`:
 no verdict), `unresolved` (`FAILED`: the run stopped first, or the proof no longer checks), `unchecked`, or `unknown`
 for a status this version of the CLI doesn't know.
 
 | Topic | Detail |
 |---|---|
-| `property_counts` | Counts `proved`, `negated`, `counterexample`, `in_progress`, `unresolved` and `unchecked`, plus `disproved` for `negated` and `counterexample` together, once the task has ended. Until then, or for a task status this version doesn't know, it's `null`. For `show --task`, it waits for the project's latest task, which can be newer than the one shown. |
+| `property_counts` | Counts only `proved`, `refuted`, `in_progress`, `unresolved` and `unchecked`, once the task has ended. Each refutation counts once, including one with both kinds of evidence; evidence stays on each property. Until then, or for a task status this version doesn't know, it's `null`. For `show --task`, it waits for the project's latest task, which can be newer than the one shown. |
 | `requested_counts` | Counts the same way, but only the properties you asked for, and is `null` when `property_counts` is. Gate on it when you named the properties, and on `property_counts` for an open-ended run, whose properties may all be Aristotle's. |
-| Unchecked | Aristotle checks a task's results when it finishes, so a proof or disproof is unchecked if the task that set it, the newest created by its `last_updated`, ended first: any when that task is `OUT_OF_BUDGET`, and a proof when it's `FAILED` or `CANCELED`. It stays unchecked until a later task updates it, and a checked one stays checked when a later task that leaves it alone is cancelled. Unchecked ones count as nothing else in `property_counts`, and keep their reported `status` in `properties`. |
+| Unchecked | Aristotle checks a task's results when it finishes, so a proof or refutation is unchecked if the task that set it, the newest created by its `last_updated`, ended first: any when that task is `OUT_OF_BUDGET`, and a proof when it's `FAILED` or `CANCELED`. It stays unchecked until a later task updates it, and a checked one stays checked when a later task that leaves it alone is cancelled. Unchecked ones count as nothing else in `property_counts`, and keep their reported `status` in `properties`. |
 | `null` | The counts and `properties` are `null` if the properties couldn't be fetched, or the project's tasks couldn't be listed, since no verdict can then be told checked or not. When the tasks couldn't be listed, `show --json`, with or without `--wait`, exits as for the error (3 for a server error, 6 when rate limited), and `submit --wait` and `continue --wait` exit 3, after saving any files they would. Don't send the run again: `task.status` says whether it finished. `continue` without `--wait` still exits 0, as the prompt was sent. |
 
 **Fields.** Timestamps are ISO 8601 in UTC, with a `+00:00` offset, such as `2026-10-11T09:50:21.413442+00:00`, which
-Python's `datetime.fromisoformat` reads as an aware datetime. Each numeric code has its name in a field named after it
-with `_name` added, such as `status_name`: `PROVED` beside `status` 3. A numeric code this version doesn't know is
-`0`, named `UNKNOWN`; a task status it doesn't know is `UNKNOWN`.
+Python's `datetime.fromisoformat` reads as an aware datetime. Numeric codes other than `evidence` have their names
+in fields with `_name` added, such as `status_name`: `PROVED` beside `status` 3. A numeric code this version doesn't
+know is `0`, named `UNKNOWN`. An unknown task status is `UNKNOWN`.
 
 | Record | Fields |
 |---|---|
@@ -354,7 +359,7 @@ with `_name` added, such as `status_name`: `PROVED` beside `status` 3. A numeric
 | Task | `agent_task_id`, `project_id`, `status` (`QUEUED`, `IN_PROGRESS`, `COMPLETE`, `COMPLETE_WITH_ERRORS`, `OUT_OF_BUDGET`, `FAILED`, `CANCELED` or `UNKNOWN`), `percent_complete` (deprecated: `null` from current servers; each property's `outcome` in `properties` says how the run stands), `description`, `output_summary`, `file_name`, `created_at`, `started_at` (when the run's job started, shortly before the run reports `IN_PROGRESS`; `null` while it is queued, for a run cancelled before it started, and from a server that doesn't send it, though a run that failed before it started may carry one), `last_updated_at`, `read_only` (someone else's shared project). |
 | Event | `event_id`, `agent_task_id`, `event_type` (a number; see `aristotlelib.EventType`) and `event_type_name`, `content`, `explanation`, `file_path`, `suggestions`, `status` (1 complete, 2 awaiting an answer) and `status_name`, `created_at`, `duration_seconds`. `EventType.AGENT_FOLLOW_UP` (`18`) carries a post-run message in `content`, such as a bug-fix offer or an invitation to continue after reaching the time limit. It's informational, and doesn't open the question-answer flow: act on it with a new prompt, through `Project.ask()` or `aristotle continue`. |
 | Question | `question_id`, `event_id`, `project_id`, `agent_task_id` (the task), `content`, `suggestions`, `response`, `state` (`PENDING` while it awaits an answer, `ANSWERED`, `IGNORED` when it closed without one, or, in `questions`, `UNANSWERED` when its run ended first, as the table shows it), `created_at`, `updated_at`, `blocking_since`, `ever_awaited`, `answered_at`, `ignored_at`. |
-| Declaration | `declaration_id`, `project_id`, `declaration_type` (1 property, 2 definition) and `declaration_type_name`, `name`, `status` (1 in progress, 2 negated, 3 proved, 4 removed, 5 counterexample, 6 failed) and `status_name`, `failure_reason` (1 out of budget, 2 system error, 3 the proof no longer checks, 4 the run finished without a verdict on it, 5 the run was cancelled) and `failure_reason_name`, `source` (1 Aristotle, 2 you) and `source_name`, `filename`, `source_file`, `source_line`, `source_anchor`, `lean_code`, `description`, `artifact_paths` (the paths in the project of the files Aristotle linked to it, such as a counterexample's trace, as `download --artifact` takes them; empty when there are none), `created_at`, `last_updated`. |
+| Declaration | `declaration_id`, `project_id`, `declaration_type` (1 property, 2 definition) and `declaration_type_name`, `name`, `status` (0 unknown, 1 in progress, 2 refuted, 3 proved, 4 removed, 6 failed) and `status_name`, `failure_reason` (1 out of budget, 2 system error, 3 the proof no longer checks, 4 the run finished without a verdict on it, 5 the run was cancelled) and `failure_reason_name`, `evidence` (0 unknown, 1 `COUNTEREXAMPLE`, 2 `NEGATION_PROVED`, 3 `BOTH`; required for `REFUTED`, otherwise nullable), `evidence_message` (the agent's explanation, preserved as received; it may contain inline Markdown), `source` (1 Aristotle, 2 you) and `source_name`, `filename`, `source_file`, `source_line`, `source_anchor`, `lean_code`, `description`, `artifact_paths` (the paths in the project of the files Aristotle linked to it, such as a counterexample's trace, as `download --artifact` takes them; empty when there are none), `created_at`, `last_updated`. |
 
 The shapes are the SDK's pydantic models: a program can validate against them, or take their JSON Schema, as with
 `aristotlelib.results.TaskSnapshot.model_json_schema(mode="serialization")`, which names every key the output carries,

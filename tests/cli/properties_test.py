@@ -23,13 +23,15 @@ from aristotlelib.cli.command.properties import (
 from aristotlelib.cli.controller import main
 from aristotlelib.declaration import (
     Declaration,
+    DeclarationEvidence,
     DeclarationFailureReason,
     DeclarationSource,
     DeclarationStatus,
     DeclarationType,
 )
 from aristotlelib.project import Project
-from aristotlelib.results import DeclarationRecord
+from aristotlelib.results import DeclarationPage, DeclarationRecord
+from tests.cli.conftest import UNKNOWN_EVIDENCE_NAME, unknown_evidence_page
 
 LIST_ALL = "aristotlelib.cli.command.properties.Declaration.list_all_for_project"
 TERMINAL_WIDTH = "aristotlelib.cli.command.properties.terminal_width"
@@ -66,6 +68,8 @@ def _declaration(name: str = "Spec.Foo", **overrides) -> Declaration:
         last_updated=NOW - timedelta(hours=1),
     )
     fields.update(overrides)
+    if fields["status"] == DeclarationStatus.REFUTED:
+        fields.setdefault("evidence", DeclarationEvidence.NEGATION_PROVED)
     return Declaration(**fields)
 
 
@@ -99,7 +103,7 @@ async def test_the_default_reads_every_page_and_shows_the_30_most_recently_updat
     mock_all.assert_called_once_with("project-123", declaration_type=DeclarationType.PROPERTY)
     out = capsys.readouterr().out
     assert out.startswith("NAME")
-    assert "STATUS" in out and "CREATED BY" in out and "UPDATED" in out and "LOCATION" in out
+    assert "STATUS" in out and "EVIDENCE" in out and "CREATED BY" in out and "UPDATED" in out and "LOCATION" in out
     assert [row.split()[0] for row in _rows(out)] == [f"Spec.P{i:02}" for i in range(30)]
     assert "15 more not shown. Raise --limit to see more." in caplog.text
     assert "Pagination key" not in caplog.text
@@ -142,26 +146,28 @@ async def test_empty_table_says_so_and_prints_nothing(capsys, caplog):
 # --- filters and sorts ---
 
 
-async def test_a_status_filter_picks_from_every_page(capsys):
+async def test_refuted_filter_drains_every_page_and_keeps_all_evidence(capsys):
     everything = [
         _declaration("Spec.Proved", status=DeclarationStatus.PROVED),
-        _declaration("Spec.Negated", status=DeclarationStatus.NEGATED),
+        _declaration("Spec.Refuted", status=DeclarationStatus.REFUTED),
+        _declaration("Spec.Cex", status=DeclarationStatus.REFUTED, evidence=DeclarationEvidence.COUNTEREXAMPLE),
+        _declaration("Spec.Both", status=DeclarationStatus.REFUTED, evidence=DeclarationEvidence.BOTH),
         _declaration("Spec.Open", status=DeclarationStatus.IN_PROGRESS),
     ]
 
-    mock_all = await _run(["project-123", "--status", "NEGATED"], everything=everything)
+    mock_all = await _run(["project-123", "--status", "REFUTED"], everything=everything)
 
     mock_all.assert_called_once_with("project-123", declaration_type=DeclarationType.PROPERTY)
-    assert [row.split()[0] for row in _rows(capsys.readouterr().out)] == ["Spec.Negated"]
+    assert {row.split()[0] for row in _rows(capsys.readouterr().out)} == {"Spec.Refuted", "Spec.Cex", "Spec.Both"}
 
 
-@pytest.mark.parametrize("status", ["PROVED", "NEGATED", "IN_PROGRESS", "COUNTEREXAMPLE", "FAILED"])
+@pytest.mark.parametrize("status", ["PROVED", "REFUTED", "IN_PROGRESS", "FAILED"])
 async def test_each_status_filter_keeps_only_that_status(status: str, capsys):
     everything = [_declaration(f"Spec.{s.name}", status=s) for s in DeclarationStatus if s != DeclarationStatus.UNKNOWN]
 
     await _run(["project-123", "--status", status], everything=everything)
 
-    assert [row.split()[0] for row in _rows(capsys.readouterr().out)] == [f"Spec.{status}"]
+    assert [row.split()[0] for row in _rows(capsys.readouterr().out)] == [f"Spec.{DeclarationStatus[status].name}"]
 
 
 @pytest.mark.parametrize("json_flag", [[], ["--json"]], ids=["table", "--json"])
@@ -169,7 +175,7 @@ async def test_status_repeated_keeps_properties_with_any_of_them(json_flag, caps
     everything = [_declaration(f"Spec.{s.name}", status=s) for s in DeclarationStatus if s != DeclarationStatus.UNKNOWN]
 
     await _run(
-        ["project-123", "--status", "NEGATED", "--status", "COUNTEREXAMPLE", "--sort", "name", *json_flag],
+        ["project-123", "--status", "REFUTED", "--status", "PROVED", "--sort", "name", *json_flag],
         everything=everything,
     )
 
@@ -177,17 +183,60 @@ async def test_status_repeated_keeps_properties_with_any_of_them(json_flag, caps
     names = (
         [d["name"] for d in json.loads(out)["declarations"]] if json_flag else [row.split()[0] for row in _rows(out)]
     )
-    assert names == ["Spec.COUNTEREXAMPLE", "Spec.NEGATED"]
+    assert names == ["Spec.PROVED", "Spec.REFUTED"]
+
+
+async def test_refutation_rows_show_evidence_separately_without_printing_the_message(capsys):
+    message = "Refuted by a counterexample. See the VCD trace in Artifacts."
+    declarations = [
+        _declaration(f"Spec.{name}", status=DeclarationStatus.REFUTED, evidence=evidence, evidence_message=message)
+        for name, evidence in [
+            ("Cex", DeclarationEvidence.COUNTEREXAMPLE),
+            ("Formal", DeclarationEvidence.NEGATION_PROVED),
+            ("Both", DeclarationEvidence.BOTH),
+        ]
+    ]
+    declarations.append(_declaration("Spec.Proved", evidence=DeclarationEvidence.COUNTEREXAMPLE))
+
+    await _run(["project-123"], everything=declarations)
+
+    out = capsys.readouterr().out
+    assert message not in out
+    header = out.splitlines()[0]
+    labels = [row[header.index("STATUS") : header.index("EVIDENCE")].strip() for row in _rows(out)]
+    assert labels == ["REFUTED", "REFUTED", "REFUTED", "PROVED"]
+    evidence = [row[header.index("EVIDENCE") : header.index("CREATED BY")].strip() for row in _rows(out)]
+    assert evidence == ["COUNTEREXAMPLE", "NEGATION_PROVED", "BOTH", "-"]
+
+
+@pytest.mark.parametrize("json_flag", [[], ["--json"]], ids=["table", "--json"])
+def test_an_evidence_kind_this_version_does_not_know_reads_as_unknown(json_flag, api_server, capsys, caplog):
+    project_id = "5f2b8c1e-3d4a-4b6c-8e9f-0a1b2c3d4e5f"
+    api_server(unknown_evidence_page(project_id))
+
+    with patch("sys.argv", ["aristotle", "properties", project_id, *json_flag]):
+        assert main() == 0
+
+    out, err = capsys.readouterr()
+    assert "Traceback" not in err
+    if json_flag:
+        [record] = json.loads(out)["declarations"]
+        assert (record["name"], record["status_name"], record["evidence"]) == (UNKNOWN_EVIDENCE_NAME, "REFUTED", 0)
+        assert DeclarationPage.model_validate_json(out).declarations[0].evidence is DeclarationEvidence.UNKNOWN
+    else:
+        header, _, row = out.splitlines()
+        assert row[header.index("STATUS") : header.index("CREATED BY")].split() == ["REFUTED", "UNKNOWN"]
+    assert caplog.messages == ["Unknown DeclarationEvidence value '4'; treating as UNKNOWN"]
 
 
 def test_status_before_the_project_id_still_parses():
-    args = _action().parser.parse_args(["--status", "NEGATED", "project-123"])
+    args = _action().parser.parse_args(["--status", "REFUTED", "project-123"])
 
-    assert (args.project_id, args.status) == ("project-123", ["NEGATED"])
+    assert (args.project_id, args.status) == ("project-123", ["REFUTED"])
 
 
 @pytest.mark.parametrize(
-    "argv", [["--status", "ALL", "--status", "NEGATED"], ["--status", "PROVED", "--status", "ALL"]]
+    "argv", [["--status", "ALL", "--status", "REFUTED"], ["--status", "PROVED", "--status", "ALL"]]
 )
 async def test_status_all_with_another_status_is_refused(argv, capsys):
     action = _action()
@@ -302,7 +351,7 @@ async def test_status_is_refused_for_definitions(capsys, resolve_project):
             action.preflight(args)
 
     assert exit_info.value.code == 2
-    assert "definitions are never proved or disproved" in capsys.readouterr().err
+    assert "definitions are never proved or refuted" in capsys.readouterr().err
     mock_all.assert_not_called()
     resolve_project.assert_not_awaited()
 
@@ -353,13 +402,13 @@ async def test_json_carries_each_declarations_artifact_paths(capsys):
 async def test_json_with_a_filter_is_the_filtered_set(capsys):
     everything = [
         _declaration("Spec.Proved", status=DeclarationStatus.PROVED),
-        _declaration("Spec.Negated", status=DeclarationStatus.NEGATED),
+        _declaration("Spec.Refuted", status=DeclarationStatus.REFUTED),
     ]
 
-    await _run(["project-123", "--status", "NEGATED", "--json"], everything=everything)
+    await _run(["project-123", "--status", "REFUTED", "--json"], everything=everything)
 
     page = json.loads(capsys.readouterr().out)
-    assert [r["name"] for r in page["declarations"]] == ["Spec.Negated"]
+    assert [r["name"] for r in page["declarations"]] == ["Spec.Refuted"]
     assert page["pagination_key"] is None
 
 
@@ -429,10 +478,12 @@ async def test_a_row_whose_proof_no_longer_checks_says_so_within_the_status_colu
 
     await _run(["project-123"], everything=[broken, _declaration("Spec.Holds")])
 
-    rows = _rows(capsys.readouterr().out)
+    out = capsys.readouterr().out
+    rows = _rows(out)
     # The column widens to the longest status, so the next one stays aligned.
+    evidence = out.splitlines()[0].index("EVIDENCE")
     created_by = rows[0].index("Aristotle")
-    assert rows[0][NAME_WIDTH + 1 : created_by].rstrip() == "UNRESOLVED (proof broken)"
+    assert rows[0][NAME_WIDTH + 1 : evidence].rstrip() == "UNRESOLVED (proof broken)"
     assert rows[1].index("Aristotle") == created_by
 
 
@@ -448,11 +499,13 @@ async def test_a_verdict_aristotle_never_checked_says_so_within_the_status_colum
 
     await _run(["project-123"], everything=page)
 
-    rows = _rows(capsys.readouterr().out)
+    out = capsys.readouterr().out
+    rows = _rows(out)
     status = rows[0].index("PROVED")
+    evidence = out.splitlines()[0].index("EVIDENCE")
     created_by = rows[0].index("Aristotle")
-    assert rows[0][status:created_by].rstrip() == "PROVED (unchecked)"
-    assert rows[1][status:created_by].rstrip() == "PROVED"
+    assert rows[0][status:evidence].rstrip() == "PROVED (unchecked)"
+    assert rows[1][status:evidence].rstrip() == "PROVED"
     assert rows[1].index("Aristotle") == created_by
     tasks.assert_awaited_once_with("project-123", page, strict=False)
 
@@ -522,9 +575,9 @@ async def test_created_by_and_location_columns(capsys):
     await _run(["project-123"], everything=everything)
 
     rows = _rows(capsys.readouterr().out)
-    assert rows[0].split()[2:] == ["you", "1", "hour", "ago", "rtl/top.sv:12"]
-    assert rows[1].split()[2:] == ["Aristotle", "1", "hour", "ago", "rtl/top.sv"]
-    assert rows[2].split()[2:] == ["-", "1", "hour", "ago", "-"]
+    assert rows[0].split()[3:] == ["you", "1", "hour", "ago", "rtl/top.sv:12"]
+    assert rows[1].split()[3:] == ["Aristotle", "1", "hour", "ago", "rtl/top.sv"]
+    assert rows[2].split()[3:] == ["-", "1", "hour", "ago", "-"]
 
 
 CREDITS = [f"CreditCounterSpec.Credits{n}.credit_counter_never_exceeds_max_zero_unconstrained" for n in (2, 3)]
@@ -562,22 +615,22 @@ async def test_a_narrow_terminal_cuts_the_shared_namespace_before_the_middle(cap
 
     out = capsys.readouterr().out
     shown = [row.split()[0] for row in _rows(out)]
-    width = 120 - (STATUS_WIDTH + 10 + 14 + len("LOCATION") + 4)
+    width = 120 - (STATUS_WIDTH + len("EVIDENCE") + 10 + 14 + len("LOCATION") + 5)
     assert all(len(name) == width for name in shown)
     assert shown[0].startswith("...Credits2.") and shown[1].startswith("...Credits3.")
     assert all(len(line) <= 120 for line in out.splitlines())
     assert SHORTENED in caplog.text
 
 
-async def test_the_name_column_never_narrows_below_its_default_width(capsys):
+async def test_a_narrow_terminal_keeps_room_for_readable_names(capsys):
     name = "Spec.Arbiter.Fairness." + "VeryLongIdentifier" * 3
 
     with patch(TERMINAL_WIDTH, return_value=80):
         await _run(["project-123"], everything=[_declaration(name)])
 
     shown = _rows(capsys.readouterr().out)[0].split()[0]
-    assert len(shown) == NAME_WIDTH
-    assert shown.startswith("Spec.Arbiter") and shown.endswith("VeryLongIdentifier")
+    assert len(shown) == NAME_WIDTH - len("EVIDENCE") - 1
+    assert shown.startswith("Spec.Arbiter") and shown.endswith("LongIdentifier")
 
 
 @pytest.mark.parametrize(
@@ -670,14 +723,15 @@ async def test_other_api_errors_still_reach_the_generic_handler():
 @pytest.mark.parametrize(
     "status",
     [
-        {"status": DeclarationStatus.COUNTEREXAMPLE},
+        {"status": DeclarationStatus.REFUTED, "evidence": DeclarationEvidence.COUNTEREXAMPLE},
+        {"status": DeclarationStatus.REFUTED, "evidence": DeclarationEvidence.BOTH},
         {"status": DeclarationStatus.FAILED, "failure_reason": DeclarationFailureReason.OUT_OF_BUDGET},
     ],
-    ids=["counterexample", "out of budget"],
+    ids=["counterexample", "both", "out of budget"],
 )
-async def test_a_wider_status_takes_its_width_from_the_names_so_the_table_still_fits(status, capsys):
+async def test_wider_columns_take_space_from_names_so_the_table_still_fits(status, capsys):
     long_name = "Spec.Arbiter.Fairness." + "VeryLongIdentifier" * 3
-    # A 30-character location, the column's most, leaves the names 40 columns at 120 beside a 22-wide status.
+    # A 30-character location is the column's most; names shorten to accommodate status and evidence.
     located = {"source_file": "rtl/arbiter/round_robin.sv", "source_line": 117}
     everything = [_declaration(long_name, **status, **located), _declaration("Spec.Holds", **located)]
 
@@ -690,14 +744,14 @@ async def test_a_wider_status_takes_its_width_from_the_names_so_the_table_still_
 @pytest.mark.parametrize(
     ("argv", "expected"),
     [
-        (["--status", "DISPROVED"], ["Spec.COUNTEREXAMPLE", "Spec.NEGATED"]),
+        (["--status", "REFUTED"], ["Spec.REFUTED"]),
         (["--status", "IN_PROGRESS"], ["Spec.IN_PROGRESS"]),
         (["--status", "UNRESOLVED"], ["Spec.FAILED"]),
         # NOT_VERIFIED, UNRESOLVED's old name, still works for scripts written against it.
         (["--status", "NOT_VERIFIED"], ["Spec.FAILED"]),
         (["--status", "UNRESOLVED", "--status", "PROVED"], ["Spec.FAILED", "Spec.PROVED"]),
     ],
-    ids=["disproved", "in progress", "unresolved", "not verified, the old name", "unresolved or proved"],
+    ids=["refuted", "in progress", "unresolved", "not verified, the old name", "unresolved or proved"],
 )
 async def test_status_takes_the_outcome_words_the_table_shows(argv, expected, capsys):
     everything = [_declaration(f"Spec.{s.name}", status=s) for s in DeclarationStatus if s != DeclarationStatus.UNKNOWN]
@@ -711,12 +765,12 @@ async def test_a_status_word_lists_a_verdict_aristotle_never_checked_marked_so(c
     """The word matches the status reported, as the table words it, though show counts the verdict as unchecked."""
     now = datetime.now(timezone.utc)
     tasks.return_value = [Mock(status=TaskStatus.OUT_OF_BUDGET, created_at=now - timedelta(hours=2))]
-    negated = _declaration("Spec.Neg", status=DeclarationStatus.NEGATED, last_updated=now - timedelta(hours=1))
+    refuted = _declaration("Spec.Refuted", status=DeclarationStatus.REFUTED, last_updated=now - timedelta(hours=1))
 
-    await _run(["project-123", "--status", "DISPROVED"], everything=[negated, _declaration("Spec.Holds")])
+    await _run(["project-123", "--status", "REFUTED"], everything=[refuted, _declaration("Spec.Holds")])
 
     [row] = _rows(capsys.readouterr().out)
-    assert row.split()[:3] == ["Spec.Neg", "DISPROVED", "(unchecked)"]
+    assert row.split()[:3] == ["Spec.Refuted", "REFUTED", "(unchecked)"]
 
 
 POINTER = "properties lists a project's properties; show one property with:\n  aristotle property <project-id> <name>"
@@ -728,11 +782,11 @@ POINTER = "properties lists a project's properties; show one property with:\n  a
         (["project-123", "fifo_never_overflows"], "fifo_never_overflows"),
         (["FIFO run", "Spec.never overflows", "--json"], "Spec.never overflows"),
         (["FIFO", "overflow"], "overflow"),
-        (["project-123", "--status", "PROVED", "DISPROVED"], "DISPROVED"),
-        (["--status", "PROVED", "DISPROVED", "project-123"], "project-123"),
+        (["project-123", "--status", "PROVED", "REFUTED"], "REFUTED"),
+        (["--status", "PROVED", "REFUTED", "project-123"], "project-123"),
         (["project-123", "--kind", "property", "definition"], "definition"),
         (["project-123", "--limit", "5", "10"], "10"),
-        (["FIFO", "run", "--status", "PROVED", "DISPROVED"], "run DISPROVED"),
+        (["FIFO", "run", "--status", "PROVED", "REFUTED"], "run REFUTED"),
     ],
     ids=[
         "a name",

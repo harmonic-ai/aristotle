@@ -1360,7 +1360,7 @@ def _cut_short_error(run_results: results.RunResults, url: str, access: dict[str
     note = f" {SLOT_WAIT_NOTE}" if timed_out else ""
     if not run_results.nothing_registered:
         advice = f" Raise --timeout.{note}" if timed_out else ""
-        return f"{run_results.unchecked_reason} None of them counts as proved or disproved.{advice}"
+        return f"{run_results.unchecked_reason} None of them counts as proved or refuted.{advice}"
     see = f"See how far it got at {url}" if timed_out else f"{_summary_pointer(run_results)} {url}"
     off, unknown = _language_causes(access)
     if not off and not unknown:

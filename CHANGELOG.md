@@ -108,8 +108,19 @@ aristotle submit "Formalize paper.tex" --project-dir formalize-paper --wait
 
 From 2.1.0, skip this section.
 
-3.0.0rc7 settles the `--json` shapes 3.0.0 keeps. A script written against an earlier release candidate needs these
-changes:
+Update scripts and manifests from 3.0.0rc12 or earlier for the refutation contract:
+
+- Use `DeclarationStatus.REFUTED` (2); `NEGATED` and `COUNTEREXAMPLE` (5) are removed. `FAILED` stays 6.
+  Each refutation requires `DeclarationEvidence.COUNTEREXAMPLE` (1), `NEGATION_PROVED` (2) or `BOTH` (3).
+  Python-created declarations require explicit evidence. The SDK infers missing evidence only when reading old API
+  responses and preserves `evidence_message` as received.
+- Use `properties --status REFUTED`; `NEGATED`, `COUNTEREXAMPLE` and `DISPROVED` filters are removed.
+- Read `refuted` outcomes and counts. `PropertyCounts` has only `proved`, `refuted`, `in_progress`, `unresolved`
+  and `unchecked`; remove uses of `negated`, `counterexample` and `disproved` counters.
+- Change `expect = "disproved"` to `expect = "refuted"` in `aristotle.toml`; the old value is rejected.
+  `--fail-on failure`, `no-verdict` (also accepted as `unresolved`) and `never` keep their behavior.
+
+Scripts from before 3.0.0rc7 also need these JSON changes:
 
 - `list`, `tasks`, `properties` and `questions` print an object rather than a bare array: `{"projects",
   "pagination_key"}`, `{"project_id", "tasks", "pagination_key"}`, `{"project_id", "declarations",
@@ -166,7 +177,7 @@ follows, so run both.
   values wherever the response echoes them and the proxy's credentials, as written or Base64-encoded, replaces the
   value of any header named for authorization, a cookie, an API key, a token or a secret, and prints no terminal
   control characters. (#292)
-- A property's artifacts, the files Aristotle linked to it, such as a disproved property's counterexample trace or a
+- A property's artifacts, the files Aristotle linked to it, such as a refuted property's counterexample trace or a
   testbench that reproduces it. `aristotle property` lists them and prints the command that downloads them, and
   `property --json`, `properties --json` and the `properties` of `show --json`, `submit --json` and `continue --json`
   carry them as `artifact_paths`. `aristotle download <project-id> --artifact <path>`, repeated for more, saves those
@@ -178,7 +189,7 @@ follows, so run both.
   `HEAD`; a folder inside a `.git` folder or a git directory, as named or once links are followed; and, without
   `--destination`, an `aristotle-artifacts` that is a link, naming where it leads (exit 2). A path the project has no
   file at is named, the other files are saved, and it exits 4.
-  `aristotle ci` and `aristotle review` list a disproved property's artifacts, with that command, in its failing row,
+  `aristotle ci` and `aristotle review` list a refuted property's artifacts, with that command, in its failing row,
   its annotation and its JUnit failure; the run's summary is printed as before. The printed command names only paths
   that every shell reads as written, unquoted, and every system can save, so it pastes the same anywhere. In the SDK,
   `Declaration.artifact_paths` and `PropertyStatus.artifact_paths` carry the paths, and
@@ -248,8 +259,8 @@ follows, so run both.
   "requested_counts", "properties"}`, where 3.0.0rc1 to rc4 printed the bare task, and `show --json` carries the
   `project` and its `web_url` too. 3.0.0rc6 and earlier printed neither in `continue --json` or `show --json`. Fewer
   than 100 properties take one request, and longer lists are read at most two pages a second.
-  `property_counts.disproved` counts `negated` and `counterexample` together, and each property's `outcome` says what
-  its status comes to: `proved`, `disproved`, `in_progress`, `unresolved`, `unchecked` or `unknown`.
+  `property_counts.refuted` counts each refutation once, and each property's `outcome` says what
+  its status comes to: `proved`, `refuted`, `in_progress`, `unresolved`, `unchecked` or `unknown`.
   `property_counts` counts every property, Aristotle's suggestions included; `requested_counts` counts only those you
   asked for, which each property's `source` tells apart, and `show` and a wait add a `You asked for 5:` line when
   Aristotle suggested others. Gate on `requested_counts` when you named the properties. (#176, #245)
@@ -293,7 +304,7 @@ follows, so run both.
   enabled. A run that never left the queue exits 6, whatever `--fail-on` is. (#119, #148, #184)
 - `aristotle ci setup` writes `aristotle.toml`: at a terminal, Aristotle reads the repository, asks its questions and
   proposes properties, and the command writes them for you to review and commit, noting any it already proved or
-  disproved. It never replaces an existing manifest without `--force`, and `--from <project>` (or `ARISTOTLE_FROM`)
+  refuted. It never replaces an existing manifest without `--force`, and `--from <project>` (or `ARISTOTLE_FROM`)
   writes one from a finished project's properties instead of starting a run. (#149, #227)
 - `aristotle review` has Aristotle work out what should hold of the files in scope and check it, reported as
   `aristotle ci` reports. `--scope changed|paths|all`, `--path`, `--base-ref` and `--instructions` (or
@@ -425,13 +436,13 @@ follows, so run both.
   the same properties. The message says what differs, and to check out the run's commit, if the run started from a
   clean checkout, or start a fresh run, and gives the `aristotle cancel` command for a run that hasn't ended.
   (#208, #227, #233)
-- `expect = "disproved"` on a manifest property marks a deliberate counterexample. `aristotle ci` passes its
-  disproof, reported as `disproved, as expected` in the log, the JUnit report and the GitHub job summary, and fails a
+- `expect = "refuted"` on a manifest property marks a deliberate counterexample. `aristotle ci` passes its
+  refutation, reported as `refuted, as expected` in the log, the JUnit report and the GitHub job summary, and fails a
   proof of it as `unexpectedly proved: update the manifest`, since the counterexample is gone. Without a checked
   verdict it has none, as any property. `aristotle ci setup` writes it where Aristotle says a property shows its
-  counterexample on purpose, unless a checked proof settles it or Aristotle also expects it to be disproved, and names
-  each one so you can make sure; a property Aristotle merely expects to be disproved keeps its note. Its warnings give
-  one rule for a disproved property: fix the code, correct the property if it doesn't say what you want, or mark a
+  counterexample on purpose, unless a checked proof settles it or Aristotle also expects it to be refuted, and names
+  each one so you can make sure; a property Aristotle merely expects to be refuted keeps its note. Its warnings give
+  one rule for a refuted property: fix the code, correct the property if it doesn't say what you want, or mark a
   deliberate counterexample, but don't drop or weaken a correct property to pass the build. The skill gives the same
   rule. (#206)
 - A manifest property can carry `assumptions`: what it is checked under, in plain language, such as an answer to one
@@ -470,17 +481,17 @@ follows, so run both.
 - `aristotle list` has a LAST RUN column, how each project's latest run stands or ended, such as `COMPLETE` or
   `FAILED`, since STATUS says only whether a run is going. A project record in `--json` carries it as
   `latest_run_status`. (#245)
-- One word for each outcome of a property, in every command, as the web app shows it: proved, disproved (`NEGATED` or
-  `COUNTEREXAMPLE`), in progress (`IN_PROGRESS`: no verdict yet), unresolved (`FAILED`, with the reason) and unchecked.
-  `show` and a wait count `9 proved · 3 disproved · 0 in progress`, adding `(1 by counterexample)`, `1 unresolved` and
-  `1 unchecked` when there are some. `aristotle ci` and `aristotle review` count `9 proved, 3 disproved, 0 in progress`
+- One word for each outcome of a property, in every command, as the web app shows it: proved, refuted (`REFUTED`),
+  in progress (`IN_PROGRESS`: no verdict yet), unresolved (`FAILED`, with the reason) and unchecked.
+  `show` and a wait count `9 proved · 3 refuted · 0 in progress`, adding `1 unresolved` and
+  `1 unchecked` when there are some. `aristotle ci` and `aristotle review` count `9 proved, 3 refuted, 0 in progress`
   in the same words, adding `1 unexpectedly proved`, `1 unresolved`, `1 not registered`, `1 unknown` and
-  `2 unchecked (1 disproved and 1 proved)`; in progress counts only `IN_PROGRESS`, so a manifest property the run
+  `2 unchecked (1 refuted and 1 proved)`; in progress counts only `IN_PROGRESS`, so a manifest property the run
   never registered doesn't read as work still going.
-  `properties` and `property` show `DISPROVED`, `DISPROVED (counterexample)`, `IN PROGRESS` and
-  `UNRESOLVED (out of budget)`, and `properties --status` takes `DISPROVED` and `UNRESOLVED` beside the statuses. The
-  CI reports label a counterexample `disproved by counterexample` and an unresolved property
-  `unresolved (out of budget)`, and `aristotle ci setup` notes that Aristotle expects a property to be disproved.
+  `properties` and `property` show `REFUTED`, `IN PROGRESS` and `UNRESOLVED (out of budget)`, with the evidence kind
+  separate from the status. `properties --status` takes `REFUTED` and `UNRESOLVED` beside the statuses. The
+  CI reports label a refutation `refuted` and an unresolved property
+  `unresolved (out of budget)`, and `aristotle ci setup` notes that Aristotle expects a property to be refuted.
   `--fail-on no-verdict` fails the build on any property without a verdict, in progress, unresolved or unchecked,
   and the log names those properties; `unresolved`, its old name, is still accepted by the flag, `ARISTOTLE_FAIL_ON`
   and the Action's `fail-on` input, so the word means only `FAILED` in what the CLI prints. Under `--json`, `outcome`
@@ -519,10 +530,10 @@ follows, so run both.
   run's final status and its last events, the summary among them, stay above the outcome. `download` and
   `submit --wait` say where they saved the archive. 2.1.0 cleared the screen and saved the archive silently. (#152)
 - In the `--json` results of `show`, `submit` and `continue`, `property_counts` gains `unchecked`: the proofs and
-  disproofs Aristotle never checked because the task that set them ended first, every one if it ran out of budget and
+  refutations Aristotle never checked because the task that set them ended first, every one if it ran out of budget and
   every proof if it failed or was cancelled, until a later task updates them. A verdict an earlier task checked stays
-  checked when a later one that leaves it alone is cancelled. Those no longer count as `proved`, `negated` or
-  `counterexample`, and each has `unchecked` set in `properties`, as in the records `properties --json` and
+  checked when a later one that leaves it alone is cancelled. Those no longer count as `proved` or `refuted`,
+  and each has `unchecked` set in `properties`, as in the records `properties --json` and
   `property --json` print, whose `status` stays as reported. `show`, `properties`, `property` and `ci setup --from`
   label them unchecked too. `property_counts` is `null` until the task has ended, so a script that gates on it
   can't pass a task still queued, and `properties` leaves out a property Aristotle withdrew, as the counts already
@@ -695,7 +706,7 @@ follows, so run both.
   and with a stalled lookup until the lookup gave up, since the CLI waited for it. In Codex's sandbox, each failed
   lookup also took 10 seconds to notice, and now takes under one. (#289)
 - A wait at a terminal (`submit --wait`, `continue --wait`, `show`) counts the project's properties as `show` does
-  after it, such as `Properties: 1 proved · 0 disproved · 5 in progress`, recounted every 30 seconds while the run goes
+  after it, such as `Properties: 1 proved · 0 refuted · 5 in progress`, recounted every 30 seconds while the run goes
   on. It drew a bar of the task's `percent_complete`, which a Verilog run reports as 1% until it ends, and the bar's
   empty part, drawn in `░`, looked filled in some terminals. A running task's status reads `IN_PROGRESS`, as the
   others read `QUEUED` or `COMPLETE`, and an event whose line repeats the one above it, such as a Verilog run's next
@@ -937,6 +948,18 @@ follows, so run both.
 
 For beta users: these entries fix problems only a 3.0.0 release candidate had, which a user of 2.1.0 never met.
 
+- `aristotle ci`, `aristotle review` and `submit --project-dir` run git from the top of the checkout, the nearest folder
+  at or above the one they read that holds a `.git`, with `safe.bareRepository=explicit` and with `core.fsmonitor` off.
+  They ran git in that folder, so a committed folder that git reads as a bare repository, one holding `HEAD`,
+  `objects/` and `refs/`, was the repository git used, with its `config`'s settings: `--directory` on it failed with
+  `this operation must be run in a work tree` or found no tracked files, and `submit` applied only that folder's
+  `.gitignore`. (#340)
+- Refutations use one `REFUTED` status and count once, with `COUNTEREXAMPLE`, `NEGATION_PROVED` or `BOTH` evidence
+  on each property. Text output lists the evidence kind separately, and `aristotle property` includes the agent's
+  message before its artifacts. JSON preserves the message as received. `FAILED` keeps its wire value 6.
+- An evidence kind this version doesn't know, such as one a later server adds, reads as `UNKNOWN`, as an unknown
+  status does. The `EVIDENCE` column and `aristotle property` show `UNKNOWN`, JSON gives `0`, and `show` still counts
+  the property. A `Declaration` created in Python with an unknown kind is still refused. (#342)
 - Following the skill or the setup guide, a coding agent with no key asks the user which way to log in before it
   starts a login, so a headless session, such as `claude -p` or `codex exec`, ends with the question. It started a
   login in the background, showed the code in a message that `claude -p` doesn't print, and waited 10 minutes for the
@@ -982,7 +1005,7 @@ For beta users: these entries fix problems only a 3.0.0 release candidate had, w
   only when the user asked for that change, and write or change a manifest only where one already covers the code
   or the user asked for Aristotle in CI. The plugin's description no longer mentions `aristotle.toml`. (#315)
 - Following the skill, a coding agent asked to send a follow-up that only asks about a project's results, such as a
-  summary of its disproved properties, reads them with `show`, `properties`, `property` or `download` instead, says why,
+  summary of its refuted properties, reads them with `show`, `properties`, `property` or `download` instead, says why,
   and sends it only if the user still wants it. It sent the follow-up, which on an idle project starts a new run that
   can spend hours checking the proofs again before it answers. The skill and the README now say to read results rather
   than ask for them with `continue`. (#326)
@@ -1081,9 +1104,9 @@ For beta users: these entries fix problems only a 3.0.0 release candidate had, w
   `show --json` exits as for the error (3, or 6 when rate limited), and the `--wait` results exit 3. They used to
   judge the verdicts by the tasks they did list, so a proof that a cancelled run left unchecked could count as
   checked. `continue --json` without `--wait` prints them `null` too, and still exits 0. `ci setup --from` writes
-  nothing then, and the text output warns that a proof or disproof may count as checked. (#252)
+  nothing then, and the text output warns that a proof or refutation may count as checked. (#252)
 - `aristotle properties --status` repeats, and lists the properties with any of the statuses given, so
-  `--status NEGATED --status COUNTEREXAMPLE` lists every refuted property; it kept only the last. `--status ALL` with
+  `--status PROVED --status REFUTED` lists both outcomes; it kept only the last. `--status ALL` with
   another status exits 2. (#241)
 - A manifest property a run had registered nothing under when it ended early, by running out of budget or time,
   failing or being cancelled, is labelled `not registered, run cut short`, not `not registered`, which reads as
@@ -1143,20 +1166,20 @@ For beta users: these entries fix problems only a 3.0.0 release candidate had, w
 - `aristotle ci` no longer passes a run that ran out of budget, or hit its time budget, on the proofs it had
   reported: Aristotle checks a run's results when the run finishes, so those proofs were never checked. Such a run
   exits 3, unless it ran out of budget and `--fail-on never` is set, and every report labels what it reached as
-  unchecked: a proof or disproof it reported has no verdict, as `proved, unchecked` or `disproved, unchecked`, and the
-  summary line counts them (`0 proved, 0 disproved, 0 in progress, 2 unchecked (1 disproved and 1 proved)`).
+  unchecked: a proof or refutation it reported has no verdict, as `proved, unchecked` or `refuted, unchecked`, and the
+  summary line counts them (`0 proved, 0 refuted, 0 in progress, 2 unchecked (1 refuted and 1 proved)`).
   `aristotle review` reports such a run the same way, and exits 3 under `--fail-on failure` or `no-verdict`, or
   whatever `--fail-on` is when the time budget cut it. (#164, #249)
 - A run that failed or was cancelled elsewhere also ends before Aristotle checks its results, so `aristotle ci` and
   `aristotle review` report a proof it had reported as `proved, unchecked` instead of `PASS`. Such a run still exits
-  3, or 1 when a disproof it reported fails the build, since a disproof keeps its verdict. `aristotle ci setup`
-  notes as unchecked any verdict from an out-of-budget run, which it used to note as proved or as a disproof that
-  fails CI, and a proof from a failed or cancelled one; an unchecked disproof draws no warning unless Aristotle also
-  expects the property to be disproved, or calls it a deliberate counterexample. (#193)
+  3, or 1 when a refutation it reported fails the build, since a refutation keeps its verdict. `aristotle ci setup`
+  notes as unchecked any verdict from an out-of-budget run, which it used to note as proved or as a refutation that
+  fails CI, and a proof from a failed or cancelled one; an unchecked refutation draws no warning unless Aristotle also
+  expects the property to be refuted, or calls it a deliberate counterexample. (#193)
 - `aristotle ci`'s annotation and JUnit entry for a property still in progress lead with `in progress` and the reason,
   such as that Aristotle stopped the run for questions, where they gave only the property's statement, which read as
   though it held. A run Aristotle stopped is an error in the JUnit report, which showed nothing wrong. The summary
-  line counts unchecked disproofs and proofs apart, and an unchecked disproof's annotation comes ahead of those of the
+  line counts unchecked refutations and proofs apart, and an unchecked refutation's annotation comes ahead of those of the
   other properties without a verdict, so the limit of 10 per step drops those first. (#205)
 - When `aristotle ci` or `aristotle review` can't cancel a run, it says why, that the cancel didn't finish within 5
   seconds when it ran out of time, and prints `aristotle cancel <project-id>` to cancel it by hand. An interrupt
@@ -1190,9 +1213,9 @@ For beta users: these entries fix problems only a 3.0.0 release candidate had, w
 - `aristotle review --scope changed` stops with exit 2 when CI reports the commit before a push and it can't be fetched,
   as for a base branch with no merge base. It used to compare with the last commit alone, so it could pass a push it
   never checked, even under `--fail-on no-verdict`. (#182)
-- After a disproved property, `aristotle ci` and `aristotle review` print the run's summary, where Aristotle usually
+- After a refuted property, `aristotle ci` and `aristotle review` print the run's summary, where Aristotle usually
   describes the counterexample: whole in the log, quoted in the GitHub job summary, and with each JUnit failure, the
-  last two cut at 4000 characters. A disproved property's annotation points at it. Aristotle records no counterexample with the
+  last two cut at 4000 characters. A refuted property's annotation points at it. Aristotle records no counterexample with the
   property yet, so the failing row still shows the property, and the CI guide no longer promises the counterexample
   there. (#185)
 - SVA or C copied from a code span or fenced block in the GitHub job summary parses: code spans and fenced blocks from
@@ -1268,5 +1291,5 @@ For beta users: these entries fix problems only a 3.0.0 release candidate had, w
   again, as `submit` and `continue` do: `aristotle questions <id> --json` shows an answered question's `response`. A
   request refused by the per-second limit whose `Retry-After` passes the retry deadline says how long Aristotle asked
   to wait, instead of "a few seconds". A slow name or id-prefix lookup says it is searching your 2,000 most recent
-  projects. After a disproved property, `aristotle ci` and `aristotle review` give the
+  projects. After a refuted property, `aristotle ci` and `aristotle review` give the
   `aristotle download` command for the run's files, where a reproducer its summary names would be. (#202)

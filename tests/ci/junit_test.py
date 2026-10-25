@@ -24,8 +24,8 @@ from aristotlelib.ci.results import (
     UNCHECKED_PROOFS_NOTE,
     RunResults,
 )
-from aristotlelib.declaration import DeclarationFailureReason, DeclarationStatus, DeclarationType
-from tests.ci.conftest import expecting_disproved, make_declaration
+from aristotlelib.declaration import DeclarationEvidence, DeclarationFailureReason, DeclarationStatus, DeclarationType
+from tests.ci.conftest import expecting_refuted, make_declaration
 from tests.conftest import hard_link
 
 NO_OVERFLOW = RequestedProperty("no_overflow", Kind.NATURAL_LANGUAGE, "The FIFO never overflows.")
@@ -41,7 +41,7 @@ def test_each_property_becomes_a_test_case():
     results = RunResults.from_declarations(
         [
             make_declaration("Spec.A", DeclarationStatus.PROVED),
-            make_declaration("Spec.B", DeclarationStatus.COUNTEREXAMPLE),
+            make_declaration("Spec.B", DeclarationStatus.REFUTED, evidence=DeclarationEvidence.COUNTEREXAMPLE),
             make_declaration("Spec.C", DeclarationStatus.IN_PROGRESS),
         ],
         duration_seconds=12.5,
@@ -80,25 +80,26 @@ def test_withdrawn_declarations_are_not_reported():
 def test_a_counterexample_becomes_a_failure_carrying_the_detail():
     declaration = make_declaration(
         "Spec.NoOverflow",
-        DeclarationStatus.COUNTEREXAMPLE,
+        DeclarationStatus.REFUTED,
         description="The write pointer wraps past the read pointer at cycle 12.",
         lean_code="def NoOverflow : Prop := ...",
+        evidence=DeclarationEvidence.COUNTEREXAMPLE,
     )
     results = RunResults.from_declarations([declaration], duration_seconds=1.0)
 
     failure = _suite(results).find("testcase/failure")
 
     assert failure is not None
-    assert failure.get("type") == "disproved by counterexample"
+    assert failure.get("type") == "refuted"
     assert failure.get("message") == "The write pointer wraps past the read pointer at cycle 12."
     assert failure.text is not None
     assert "Spec.NoOverflow" in failure.text
     assert "def NoOverflow" in failure.text
 
 
-def test_a_disproved_property_is_a_failure_not_a_skip():
+def test_a_refuted_property_is_a_failure_not_a_skip():
     results = RunResults.from_declarations(
-        [make_declaration("Spec.Wrong", DeclarationStatus.NEGATED)],
+        [make_declaration("Spec.Wrong", DeclarationStatus.REFUTED, evidence=DeclarationEvidence.NEGATION_PROVED)],
         duration_seconds=1.0,
     )
 
@@ -547,10 +548,11 @@ def test_a_testcase_carries_the_source_location():
         [
             make_declaration(
                 "Spec.A",
-                DeclarationStatus.COUNTEREXAMPLE,
+                DeclarationStatus.REFUTED,
                 filename="Spec/Counter.lean",
                 source_file="rtl/counter.sv",
                 source_line=42,
+                evidence=DeclarationEvidence.COUNTEREXAMPLE,
             )
         ],
         duration_seconds=1.0,
@@ -586,9 +588,10 @@ def test_characters_xml_cannot_carry_are_stripped_from_every_field():
         [
             make_declaration(
                 "Spec.\x07Bell",
-                DeclarationStatus.COUNTEREXAMPLE,
+                DeclarationStatus.REFUTED,
                 description="\x1b[31mred\x1b[0m and a \x00null",
                 lean_code="theorem t : \x0bTrue",
+                evidence=DeclarationEvidence.COUNTEREXAMPLE,
             ),
             make_declaration("Spec.Ok", DeclarationStatus.PROVED, description="tab\tstays\x1f"),
         ],
@@ -608,7 +611,15 @@ def test_characters_xml_cannot_carry_are_stripped_from_every_field():
 
 def test_a_test_case_from_a_subproject_names_the_file_from_the_repository_top():
     results = RunResults.from_declarations(
-        [make_declaration("Spec.A", DeclarationStatus.COUNTEREXAMPLE, source_file="rtl/counter.sv", source_line=42)],
+        [
+            make_declaration(
+                "Spec.A",
+                DeclarationStatus.REFUTED,
+                source_file="rtl/counter.sv",
+                source_line=42,
+                evidence=DeclarationEvidence.COUNTEREXAMPLE,
+            )
+        ],
         duration_seconds=1.0,
         path_prefix="hw/",
     )
@@ -635,9 +646,10 @@ def test_a_manifest_property_the_run_did_not_register_is_a_skipped_case_with_no_
 def test_a_refuted_manifest_property_is_named_by_its_id_and_its_failure_quotes_the_request():
     declaration = make_declaration(
         "Spec.NoOverflow",
-        DeclarationStatus.COUNTEREXAMPLE,
+        DeclarationStatus.REFUTED,
         description="The write pointer wraps past the read pointer at cycle 12.",
         source_file="rtl/fifo.sv",
+        evidence=DeclarationEvidence.COUNTEREXAMPLE,
     ).model_copy(update={"declaration_id": "no_overflow"})
     results = RunResults.from_declarations([declaration], duration_seconds=1.0, requested=[NO_OVERFLOW])
 
@@ -671,9 +683,9 @@ def test_a_manifest_property_keeps_one_classname_wherever_the_run_put_it(where: 
 
 
 def test_a_refuted_manifest_property_without_a_description_states_the_request_once():
-    declaration = make_declaration("Spec.NoOverflow", DeclarationStatus.NEGATED, description=None).model_copy(
-        update={"declaration_id": "no_overflow"}
-    )
+    declaration = make_declaration(
+        "Spec.NoOverflow", DeclarationStatus.REFUTED, description=None, evidence=DeclarationEvidence.NEGATION_PROVED
+    ).model_copy(update={"declaration_id": "no_overflow"})
     results = RunResults.from_declarations([declaration], duration_seconds=1.0, requested=[NO_OVERFLOW])
 
     failure = _suite(results).find("testcase/failure")
@@ -687,7 +699,7 @@ def test_suggestions_are_not_test_cases():
     results = RunResults.from_declarations(
         [
             make_declaration("Spec.NoOverflow").model_copy(update={"declaration_id": "no_overflow"}),
-            make_declaration("Spec.Extra", DeclarationStatus.COUNTEREXAMPLE),
+            make_declaration("Spec.Extra", DeclarationStatus.REFUTED, evidence=DeclarationEvidence.COUNTEREXAMPLE),
             make_declaration("Spec.Idea", DeclarationStatus.IN_PROGRESS),
         ],
         duration_seconds=1.0,
@@ -711,11 +723,13 @@ def test_suggestions_are_not_test_cases():
     ],
     ids=["out of budget", "out of time"],
 )
-def test_a_cut_short_runs_proofs_and_disproofs_are_skipped_as_unchecked(cut: dict[str, bool], reason: str):
+def test_a_cut_short_runs_proofs_and_refutations_are_skipped_as_unchecked(cut: dict[str, bool], reason: str):
     results = RunResults.from_declarations(
         [
             make_declaration("Spec.Good", description="Holds."),
-            make_declaration("Spec.Bad", DeclarationStatus.NEGATED, description=None),
+            make_declaration(
+                "Spec.Bad", DeclarationStatus.REFUTED, description=None, evidence=DeclarationEvidence.NEGATION_PROVED
+            ),
         ],
         duration_seconds=1.0,
         **cut,
@@ -730,7 +744,7 @@ def test_a_cut_short_runs_proofs_and_disproofs_are_skipped_as_unchecked(cut: dic
     assert suite.get("skipped") == "2"
     assert suite.find("testcase/failure") is None
     assert skipped["Spec.Good"].get("message") == f"Reported proved, unchecked. {reason} Holds."
-    assert skipped["Spec.Bad"].get("message") == f"Reported disproved, unchecked. {reason}"
+    assert skipped["Spec.Bad"].get("message") == f"Reported refuted, unchecked. {reason}"
 
 
 @pytest.mark.parametrize(
@@ -835,9 +849,9 @@ def test_a_manifest_property_of_a_run_that_never_started_is_skipped_with_that_re
 
 
 def test_a_failure_carries_an_excerpt_of_the_runs_summary():
-    refuted = make_declaration("Spec.NoOverflow", DeclarationStatus.COUNTEREXAMPLE).model_copy(
-        update={"declaration_id": "no_overflow"}
-    )
+    refuted = make_declaration(
+        "Spec.NoOverflow", DeclarationStatus.REFUTED, evidence=DeclarationEvidence.COUNTEREXAMPLE
+    ).model_copy(update={"declaration_id": "no_overflow"})
     results = dataclasses.replace(
         RunResults.from_declarations([refuted], duration_seconds=1.0, requested=[NO_OVERFLOW]),
         run_summary="no_overflow fails at cycle 12.\n" + "w" * MAX_SUMMARY_CHARACTERS,
@@ -859,7 +873,13 @@ def test_a_verdict_under_assumptions_says_so():
     proved = make_declaration("Spec.NoOverflow", description="It never overflows.").model_copy(
         update={"declaration_id": "no_overflow"}
     )
-    refuted = proved.model_copy(update={"declaration_id": "full_drops", "status": DeclarationStatus.NEGATED})
+    refuted = proved.model_copy(
+        update={
+            "declaration_id": "full_drops",
+            "status": DeclarationStatus.REFUTED,
+            "evidence": DeclarationEvidence.NEGATION_PROVED,
+        }
+    )
     full_drops = dataclasses.replace(ASSUMED, id="full_drops")
 
     root = junit.build_root(
@@ -874,13 +894,13 @@ def test_a_verdict_under_assumptions_says_so():
 
 
 def test_an_expected_failure_passes_and_an_unexpected_proof_fails():
-    suite = _suite(expecting_disproved(DeclarationStatus.COUNTEREXAMPLE, DeclarationStatus.PROVED))
+    suite = _suite(expecting_refuted(DeclarationStatus.REFUTED, DeclarationStatus.PROVED))
     expected, unexpected = suite.findall("testcase")
 
     assert suite.get("failures") == "1"
     assert expected.find("failure") is None and expected.find("skipped") is None
     system_out = expected.find("system-out")
-    assert system_out is not None and (system_out.text or "").startswith("Result: disproved, as expected\n")
+    assert system_out is not None and (system_out.text or "").startswith("Result: refuted, as expected\n")
     failure = unexpected.find("failure")
     assert failure is not None
     assert failure.get("message") == "demo1 unexpectedly proved: update the manifest"
@@ -888,24 +908,32 @@ def test_an_expected_failure_passes_and_an_unexpected_proof_fails():
 
 
 def _deliberate_under_an_assumption(status: DeclarationStatus) -> RunResults:
-    declaration = make_declaration("Spec.Demo", status).model_copy(update={"declaration_id": "demo"})
+    declaration = make_declaration(
+        "Spec.Demo",
+        status,
+        evidence=DeclarationEvidence.NEGATION_PROVED if status == DeclarationStatus.REFUTED else None,
+    ).model_copy(update={"declaration_id": "demo"})
     requested = RequestedProperty(
-        "demo", Kind.NATURAL_LANGUAGE, "A full FIFO takes no write.", assumptions="pop is low.", expect_disproved=True
+        "demo", Kind.NATURAL_LANGUAGE, "A full FIFO takes no write.", assumptions="pop is low.", expect_refuted=True
     )
     return RunResults.from_declarations([declaration], duration_seconds=1.0, requested=[requested])
 
 
 def test_a_deliberate_counterexample_under_an_assumption_says_what_it_assumed():
-    suite = _suite(_deliberate_under_an_assumption(DeclarationStatus.NEGATED))
+    suite = _suite(_deliberate_under_an_assumption(DeclarationStatus.REFUTED))
 
     system_out = suite.find("testcase").find("system-out")
     assert system_out is not None
-    assert system_out.text == "Result: disproved, as expected\nThe example property holds.\n\nAssuming: pop is low."
+    assert system_out.text == "Result: refuted, as expected\nThe example property holds.\n\nAssuming: pop is low."
 
 
 def _linked_failure_text(artifact_paths: list[str]) -> str:
     declaration = make_declaration(
-        "Spec.NoOverflow", DeclarationStatus.NEGATED, description="Overflows.", lean_code="def NoOverflow : Prop"
+        "Spec.NoOverflow",
+        DeclarationStatus.REFUTED,
+        description="Overflows.",
+        lean_code="def NoOverflow : Prop",
+        evidence=DeclarationEvidence.NEGATION_PROVED,
     ).model_copy(update={"artifact_paths": artifact_paths})
     results = dataclasses.replace(
         RunResults.from_declarations([declaration], duration_seconds=1.0), run_summary="It overflows at cycle 12."
@@ -915,7 +943,7 @@ def _linked_failure_text(artifact_paths: list[str]) -> str:
     return failure.text
 
 
-def test_a_disproved_propertys_failure_names_its_artifacts_and_the_download_command_before_the_summary():
+def test_a_refuted_propertys_failure_names_its_artifacts_and_the_download_command_before_the_summary():
     text = _linked_failure_text(["sim/cex.vcd", "sim/cex_tb.sv"])
 
     assert (
@@ -931,7 +959,7 @@ def test_a_disproved_propertys_failure_names_its_artifacts_and_the_download_comm
     ) in text
 
 
-def test_a_disproved_propertys_failure_without_artifacts_reads_as_it_did():
+def test_a_refuted_propertys_failure_without_artifacts_reads_as_it_did():
     text = _linked_failure_text([])
 
     assert "Artifacts" not in text

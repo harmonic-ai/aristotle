@@ -1,6 +1,6 @@
 ---
 name: aristotle
-description: Formally verify code with Harmonic's Aristotle through the `aristotle` CLI. Submits a project, answers its questions, reports which properties were proved or disproved, and keeps an existing `aristotle.toml`, the properties `aristotle ci` checks, in step with the code. Use when the user asks to prove, formally verify or find a counterexample to a property of Verilog/SystemVerilog, C, Rust or Lean code, mentions Aristotle or `aristotle.toml`, or changes code or a spec that an `aristotle.toml` covers.
+description: Formally verify code with Harmonic's Aristotle through the `aristotle` CLI. Submits a project, answers its questions, reports which properties were proved or refuted, and keeps an existing `aristotle.toml`, the properties `aristotle ci` checks, in step with the code. Use when the user asks to prove, formally verify or find a counterexample to a property of Verilog/SystemVerilog, C, Rust or Lean code, mentions Aristotle or `aristotle.toml`, or changes code or a spec that an `aristotle.toml` covers.
 ---
 
 # Aristotle
@@ -213,12 +213,12 @@ the user which questions you answered and what evidence you used.
 
 `aristotle show <id> --json` never waits. Like the `submit` and `continue` results, it holds `task.status` (how the
 run ended), `task.output_summary` (Aristotle's summary) and:
-- `property_counts`: `proved`, `disproved`, `in_progress`, `unresolved` and `unchecked`, `null` until the run has
+- `property_counts`: `proved`, `refuted`, `in_progress`, `unresolved` and `unchecked`, `null` until the run has
   ended. `in_progress` counts properties with no verdict yet; `unresolved`, those the run stopped short of, never a
-  disproof; `unchecked`, proofs and disproofs Aristotle never checked.
+  refutation; `unchecked`, proofs and refutations Aristotle never checked.
 - `requested_counts`: the same, over only the properties the user asked for. Gate on it when they named the
   properties, and on `property_counts` for an open-ended run, whose properties may all be Aristotle's.
-- `properties`: each one's `name`, `outcome` (`proved`, `disproved`, `in_progress`, `unresolved` or `unchecked`) and
+- `properties`: each one's `name`, `outcome` (`proved`, `refuted`, `in_progress`, `unresolved` or `unchecked`) and
   `source_name` (`USER` if the user asked for it, `AGENT` if Aristotle suggested it).
 
 All three are `null` when the project's tasks couldn't be listed (exit 3, or 6 from `show`). Never send the run again
@@ -226,23 +226,28 @@ for that: `task.status` says whether it has finished, and a later `aristotle sho
 
 `aristotle properties <id> --json` lists every property under `declarations`, with its `description` (the property as
 Aristotle formalized it), `source_file` and `source_anchor` (the text of its line, to look for if the file has
-changed). Its `status_name` `NEGATED` or `COUNTEREXAMPLE` is disproved, `IN_PROGRESS` in progress, `FAILED`
-unresolved (a re-run should re-prove it if `failure_reason_name` is `PROOF_CHECK_FAILED`), and `REMOVED` withdrawn,
-which is no result.
+changed). Its `status_name` `REFUTED` is refuted, `IN_PROGRESS` in progress, `FAILED` unresolved (a re-run should
+re-prove it if `failure_reason_name` is `PROOF_CHECK_FAILED`), and `REMOVED` withdrawn, which is no result.
+Every `REFUTED` property requires `evidence`: 1 (`COUNTEREXAMPLE`), 2 (`NEGATION_PROVED`) or 3 (`BOTH`), or 0
+(`UNKNOWN`) for a kind newer than this CLI, which is still a refutation.
+`evidence_message` explains it, preserved as received, including inline Markdown. Text output shows the kind in an
+`EVIDENCE` column or `Evidence` field, and `aristotle property` shows the message before `Artifacts`.
+Use `--status REFUTED` to list all refutations; the status filter does not select evidence kinds. A property with
+`BOTH` counts once in `refuted`.
 
 `aristotle download <id> --destination <out>/result.tar.gz` saves the project's files, including any that Aristotle
 wrote. Extract them into a scratch directory and compare. Never unpack them over the user's files.
 
-A disproved property's `artifact_paths` name its counterexample's files, such as a waveform or a testbench that
+When a refutation has a counterexample, its `artifact_paths` identify files such as a waveform or a testbench that
 reproduces it. Fetch them with `aristotle download <id> --artifact <path> --destination <out>/artifacts`, with
 `--artifact` once for each path. They arrive without execute permission. A script among them is code Aristotle
 wrote: read it before you run it, with the interpreter its `#!` line names, such as `bash`.
 
 When you report, remember that a proof is only as strong as its statement. Compare each `description` with what the
 user meant, and say when it is weaker, for example because of an extra assumption or a narrower range. For a
-disproof, describe the failing scenario and where the code goes wrong: `task.output_summary` usually describes it,
+refutation, describe the failing scenario and where the code goes wrong: `task.output_summary` usually describes it,
 and the project's files may hold a reproducer under `sim/`. A property in progress or unresolved is neither proved
-nor disproved. Aristotle checks a run's results when it finishes, so a run that ran out of budget never checked what
+nor refuted. Aristotle checks a run's results when it finishes, so a run that ran out of budget never checked what
 it reported, and one that failed or was cancelled never checked its proofs: report a property whose `unchecked` is
 `true` as unchecked, whatever its status.
 
@@ -276,9 +281,9 @@ When you change the code or the spec, update the manifest in the same change:
 
 - For a new behavior or requirement, add a property. For a changed requirement, edit the statement and keep the id,
   which carries the test's history. For a removed feature, remove its property.
-- A disproved property means the code or the property is wrong: fix the code; if the property doesn't state what
+- A refuted property means the code or the property is wrong: fix the code; if the property doesn't state what
   the user wants, correct it with them; if the user confirms the counterexample is deliberate, mark it
-  `expect = "disproved"`, which passes while it stays disproved. Never drop or weaken a correct property to get a
+  `expect = "refuted"`, which passes while it stays refuted. Never drop or weaken a correct property to get a
   passing build, and report every failure to the user.
 - State each property as precisely as a prompt, or a good `description` from `aristotle properties`, with what it
   assumes, such as an answer the user gave, in its statement or its `assumptions`.
@@ -289,7 +294,7 @@ When you change the code or the spec, update the manifest in the same change:
 - Before writing properties by hand, look in `aristotle list --json` for a finished project that verified this code,
   and start from it: `aristotle ci setup --from <project-id>` writes a whole manifest from its properties. It copies
   statements as they are, and comments on any that may depend on that project's run: fix those first, and review
-  the ones that never got a result. Confirm each `expect = "disproved"` it writes with the user before you commit.
+  the ones that never got a result. Confirm each `expect = "refuted"` it writes with the user before you commit.
   `ci setup` won't replace a manifest without `--force`, which you never pass: edit an existing one by hand, and
   leave replacing it to the user. Plain `aristotle ci setup` needs an interactive terminal, so leave it to the user
   too. Other candidates are what a finished project on related code proved
@@ -321,7 +326,7 @@ Then check it:
    - Don't run a check that ran out of budget or time again as it was: for time, raise `--timeout`.
 4. Read the log: one `PASS`, `FAIL` or `SKIP` line per id, then Aristotle's suggestions.
    - Exit 0: the gate passes.
-   - Exit 1: a property fails the gate (disproved, or proved while marked `expect = "disproved"`), none was verified
+   - Exit 1: a property fails the gate (refuted, or proved while marked `expect = "refuted"`), none was verified
      (the log names the likely causes), or Aristotle stopped for decisions only the user can make. Relay the
      questions under `Aristotle stopped before finishing:` to the user, put their answers in the statements, an `sva`
      property's `assumptions` or the code, and run again. Don't reply with `aristotle continue`, even if the summary
@@ -396,6 +401,14 @@ Then check it:
       alone: `rtl/alu.sv` goes up as `alu.sv`, and the project's `rtl/alu.sv` stays as it was. Send one file of each
       name: two exit 2, or, before 3.0.0rc11, the second replaces the first. To send changed files to their paths,
       submit the whole folder as a new project.
+  - Before 3.0.0rc13:
+    - A refuted property's `status_name` is `NEGATED` or `COUNTEREXAMPLE`, and its `outcome` is `disproved`. The
+      counts have `disproved`, the sum of `negated` and `counterexample`, in place of `refuted`, and tables and the CI
+      reports say disproved. List refutations with `--status DISPROVED`, since `--status REFUTED` exits 2. Results
+      have no `evidence` or `evidence_message`, and from current servers a counterexample reads `NEGATED` too, so
+      take how a property was refuted from `task.output_summary`.
+    - `aristotle.toml` takes `expect = "disproved"` and refuses `expect = "refuted"`, and later versions refuse
+      `"disproved"`. Change the value together with the version the CI job pins.
 
   To upgrade, ask the user to install the exact file or version Harmonic gives them, as under
   [Before the first command](#before-the-first-command).

@@ -5,6 +5,7 @@ import logging
 import os
 import posixpath
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -60,6 +61,11 @@ BASE_FETCH_DEPTH = 50
 BASE_FETCH_DEEPEN_ATTEMPTS = 4
 
 REMOTE_PREFIX = "origin/"
+
+GIT_MISSING = (
+    "git is not installed, so the files to upload and verify cannot be determined. Install git, in the job's image if "
+    "the job runs in a container."
+)
 
 
 class Scope(str, Enum):
@@ -154,7 +160,8 @@ def _checkout_owner(root: Path) -> tuple[int, int] | None:
 
 
 def _run_git(root: Path, *args: str, timeout: float = GIT_TIMEOUT_SECONDS, writes: bool = False) -> str:
-    """Run a git command in ``root`` and return its stdout; raises ScopeError if git is missing or fails.
+    """Run a git command for ``root`` as local_file_utils.run_git() does and return its stdout; raises ScopeError outside
+    a repository, or if git is missing or fails.
 
     ``writes`` runs it as the checkout's owner: the image runs as root, and root-owned files left in a runner's
     .git break every later fetch and clean of that workspace.
@@ -166,8 +173,9 @@ def _run_git(root: Path, *args: str, timeout: float = GIT_TIMEOUT_SECONDS, write
         as_owner = {"user": owner[0], "group": owner[1], "extra_groups": []}
         env["HOME"] = tempfile.gettempdir()
     try:
-        result = subprocess.run(
-            ["git", "-C", str(root), *args],
+        result = local_file_utils.run_git(
+            root,
+            *args,
             capture_output=True,
             stdin=subprocess.DEVNULL,
             # As os.fsdecode decodes a path on POSIX, so that each name maps back to its bytes on disk.
@@ -179,14 +187,13 @@ def _run_git(root: Path, *args: str, timeout: float = GIT_TIMEOUT_SECONDS, write
             **as_owner,
         )
     except FileNotFoundError as e:
-        raise ScopeError(
-            "git is not installed, so the files to upload and verify cannot be determined. Install git, in the job's "
-            "image if the job runs in a container."
-        ) from e
+        raise ScopeError(GIT_MISSING) from e
     except subprocess.TimeoutExpired as e:
         raise ScopeError(f"git {' '.join(args)} timed out after {timeout:g}s.") from e
     except subprocess.CalledProcessError as e:
         raise GitError(f"git {' '.join(args)} failed: {e.stderr.strip()}", e.returncode, e.stderr) from e
+    if result is None:
+        raise ScopeError(f"{root} is not in a git repository.")
     return result.stdout
 
 
@@ -231,32 +238,45 @@ def require_repository(root: Path) -> None:
         raise ScopeError(f"{root} is not a directory.")
     if not os.access(root, os.R_OK | os.X_OK):
         raise ScopeError(f"{root} can't be read.")
+    if local_file_utils.enclosing_repository(root) is None:
+        # A checkout made without git has no .git either.
+        if shutil.which("git") is None:
+            raise ScopeError(GIT_MISSING)
+        raise ScopeError(
+            f"{root} is not a git repository. Aristotle's CI mode uses git to determine "
+            "which files to upload and verify."
+        )
     try:
         _run_git(root, "rev-parse", "--git-dir")
     except ScopeError as e:
         if not isinstance(e.__cause__, subprocess.CalledProcessError):
             raise
-        if local_file_utils.enclosing_repository(root):
-            raise ScopeError(f"git refused {root}: {e.__cause__.stderr.strip()}") from e
-        raise ScopeError(
-            f"{root} is not a git repository. Aristotle's CI mode uses git to determine "
-            "which files to upload and verify."
-        ) from e
+        raise ScopeError(f"git refused {root}: {e.__cause__.stderr.strip()}") from e
+
+
+def _prefix(root: Path) -> str:
+    """Where ``root`` sits in its repository, as git prints a prefix ("hw/")."""
+    # git prints one for where run_git() runs it only when it passes over the .git there.
+    return _run_git(root, "rev-parse", "--show-prefix").rstrip("\n") + local_file_utils.git_prefix(root)
+
+
+def _ls_files(root: Path, *options: str) -> list[str]:
+    prefix = local_file_utils.git_prefix(root)
+    output = _run_git(root, "ls-files", "-z", *options, "--", local_file_utils.git_pathspec(root))
+    return [line[len(prefix) :] for line in output.split("\0") if line and line.startswith(prefix)]
 
 
 def _tracked_files(root: Path, warn: bool = True) -> tuple[list[Path], list[Path], list[Path]]:
     """Every file git tracks, less those an ignore rule matches unless they are LEAN_BUILD_FILES: those whose names are
     UTF-8, the upload set, and those whose names aren't, which Aristotle fails a run on and, if ``warn``, a warning
     names; and those an ignore rule holds back."""
-    tracked = [line for line in _run_git(root, "ls-files", "-z").split("\0") if line]
+    tracked = _ls_files(root)
     # Tracked files stay in the index after a later .gitignore rule matches them. Only the repository's .gitignore
     # files hold one back, never .git/info/exclude or a global excludes file, which are this machine's alone.
     ignored = {
         line
-        for line in _run_git(
-            root, "ls-files", "-z", "--cached", "--ignored", "--exclude-per-directory=.gitignore"
-        ).split("\0")
-        if line and Path(line).name not in local_file_utils.LEAN_BUILD_FILES
+        for line in _ls_files(root, "--cached", "--ignored", "--exclude-per-directory=.gitignore")
+        if Path(line).name not in local_file_utils.LEAN_BUILD_FILES
     }
     kept = [Path(line) for line in tracked if line not in ignored]
     # A git directory committed as plain files, as a bare repository can be: its config may hold a remote's token.
@@ -480,17 +500,25 @@ def _changed_files(root: Path, base_ref: str | None, push_before: str | None = N
             ) from e
         logger.info(f"Comparing against the previous commit ({diff_target[:12]}); set --base-ref to compare a branch")
 
-    # --relative: ls-files lists paths from root, which may be a subdirectory, while diff lists them from the top.
-    output = _run_git(root, "diff", "--relative", "--name-status", "-z", "--no-renames", diff_target, "HEAD")
+    pathspec = local_file_utils.git_pathspec(root)
+    # --relative: paths from where git runs, as the pathspec is, whatever diff.relative says.
+    output = _run_git(
+        root, "diff", "--relative", "--name-status", "-z", "--no-renames", diff_target, "HEAD", "--", pathspec
+    )
     fields = output.split("\0")
-    entries = [(status, Path(path)) for status, path in zip(fields[::2], fields[1::2]) if path]
+    prefix = local_file_utils.git_prefix(root)
+    entries = [
+        (status, Path(path[len(prefix) :]))
+        for status, path in zip(fields[::2], fields[1::2])
+        if path and path.startswith(prefix)
+    ]
     entries += _build_files_above(root, diff_target)
     return [p for status, p in entries if status != "D"], [p for status, p in entries if status == "D"]
 
 
 def _build_files_above(root: Path, diff_target: str) -> list[tuple[str, Path]]:
     """The change's (status, path) entries for Lean's build files in the folders above ``root``, as ``../`` paths."""
-    prefix = _run_git(root, "rev-parse", "--show-prefix").rstrip("\n").rstrip("/")
+    prefix = _prefix(root).rstrip("/")
     if not prefix:
         return []
     parts = PurePosixPath(prefix).parts
@@ -779,13 +807,13 @@ def tracked_paths(root: Path) -> set[str]:
     Raises:
         ScopeError: git failed.
     """
-    return {line for line in _run_git(root, "ls-files", "-z").split("\0") if line}
+    return set(_ls_files(root))
 
 
 def tracked_source_files(root: Path) -> list[Path]:
     """The source files git tracks under ``root``, listed without the upload set's warnings; raises ScopeError outside
     a git checkout."""
-    return [Path(line) for line in _run_git(root, "ls-files", "-z").split("\0") if line and is_source_file(Path(line))]
+    return [Path(line) for line in _ls_files(root) if is_source_file(Path(line))]
 
 
 def resolve_checkout(root: Path, warn: bool = True, allow_empty: bool = False) -> ScopeResult:
@@ -823,7 +851,7 @@ def _result(root: Path, upload_files: list[Path], focus_files: list[Path], held_
     result = ScopeResult(
         upload_files=sorted(upload_files),
         focus_files=sorted(focus_files),
-        prefix=_run_git(root, "rev-parse", "--show-prefix").strip(),
+        prefix=_prefix(root),
         held_back=held_back,
     )
     if result.has_verilog_focus:

@@ -32,7 +32,7 @@ identifier = "fifo_push"                 # a C function that must have no undefi
 | `identifier` | One name without spaces. For `sva`, the labelled concurrent assertion that must hold (`<label>: assert property (...)`), named by its label, optionally after its module; state an immediate assertion (`assert #0`, `assert final`) or an unlabelled one as `natural_language`. For `c_function_no_ub`, the C function that must have no undefined behavior. |
 | `assumptions` | Optional: what the property is checked under, in plain language, such as an answer to one of Aristotle's questions; the only place for one on an `sva` property. The log shows it with the verdict. |
 | `check.max_wall_time_seconds` | The time budget in whole seconds, from 1 to 604800. `--timeout` (in minutes) overrides it. The default is 60 minutes. |
-| `expect` | Optional, and only `"disproved"`: a deliberate counterexample. A disproof passes (`disproved, as expected`), and a proof fails (`unexpectedly proved: update the manifest`), usually because the bug was fixed. |
+| `expect` | Optional, and only `"refuted"`: a deliberate counterexample. A refutation passes (`refuted, as expected`), and a proof fails (`unexpectedly proved: update the manifest`), usually because the bug was fixed. |
 | `repo_id`, `check.max_cost_dollars`, `check.enable_proof_repair`, `property_result_id` | Accepted but not yet enforced. |
 
 Validation is strict: an unknown key, a missing `kind`, a statement under the other kind's key, or a character that
@@ -43,8 +43,8 @@ key. The file is TOML 1.0: an inline table spread over several lines is rejected
 
 Each manifest property gets one result under its id:
 
-- `PASS`: proved, or, with `expect = "disproved"`, disproved.
-- `FAIL`: disproved, by counterexample too, or, with `expect = "disproved"`, proved. The log gives the source line,
+- `PASS`: proved, or, with `expect = "refuted"`, refuted.
+- `FAIL`: refuted, or, with `expect = "refuted"`, proved. The log gives the source line,
   the property and the run's summary, which usually describes the counterexample.
 - `SKIP`, with no verdict, and why: in progress (the run finished without checking it, or the time budget ran out
   with the run left going); unresolved (the run ended short of it, by failing, running out of budget, being cancelled
@@ -52,15 +52,15 @@ Each manifest property gets one result under its id:
   Aristotle stops it for questions), or the proof no longer checks, so re-run to re-prove it);
   `not registered` (Aristotle registered nothing under the id, or withdrew it); or `not registered, run cut short`
   (the run ended first). A run that ran out of budget or time ended before Aristotle checked its results, so each
-  proof or disproof it reported is a `SKIP` labelled `unchecked`. So is a proof from a run that failed or was
-  cancelled; a disproof from one keeps its verdict.
+  proof or refutation it reported is a `SKIP` labelled `unchecked`. So is a proof from a run that failed or was
+  cancelled; a refutation from one keeps its verdict.
 
 Properties that Aristotle proposes on its own are listed as suggestions, and never change the exit code. To check one
 on every run, add it to the manifest.
 
 `--fail-on` decides what fails the build:
 
-- `failure`, the default: a `FAIL`, no property in the manifest proved or disproved, or a run Aristotle stopped for
+- `failure`, the default: a `FAIL`, no property in the manifest proved or refuted, or a run Aristotle stopped for
   decisions only the user can make. When the build passes with properties that have no verdict, the log names them.
 - `no-verdict`: also any property with no verdict: in progress, unresolved or unchecked. `unresolved` is its old name,
   still accepted.
@@ -135,7 +135,7 @@ level for `aristotle review`. Aristotle uses it as the build configuration, and 
 
 - Write it by hand in the format above, then run `aristotle ci --dry-run`.
 - `aristotle ci setup --from <project-id>` writes one from a finished project's properties, under the ids Aristotle
-  chose, with a note above each saying what that run found. It writes `expect = "disproved"` for a property Aristotle
+  chose, with a note above each saying what that run found. It writes `expect = "refuted"` for a property Aristotle
   says shows its counterexample on purpose: confirm each with the user. The note also flags a statement that may
   depend on that project's run, such as one mentioning "the input contract", or one fixing a parameter to a number
   the code never sets: check those. It refuses to replace an existing manifest unless you pass `--force`. From a

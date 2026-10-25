@@ -4,17 +4,20 @@ import html
 from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
+import pydantic
 import pytest
 
 from aristotlelib.api_request import AristotleAPIError, set_api_key
 from aristotlelib.declaration import (
     Declaration,
+    DeclarationEvidence,
     DeclarationFailureReason,
     DeclarationSource,
     DeclarationStatus,
     DeclarationType,
     decode_html_entities,
 )
+from aristotlelib.results import PropertyCounts
 
 PROJECT_ID = "b2396058-7c1e-4d7a-9f3b-2a6c8e1d4f50"
 
@@ -77,6 +80,113 @@ def test_artifact_paths_are_read_and_an_absent_or_null_list_is_empty(given: dict
 
     assert declaration.artifact_paths == read
     assert declaration.model_dump(mode="json")["artifact_paths"] == read
+
+
+@pytest.mark.parametrize(
+    ("fields", "evidence"),
+    [
+        ({"status": 2, "evidence": 1}, DeclarationEvidence.COUNTEREXAMPLE),
+        ({"status": 2, "evidence": 2}, DeclarationEvidence.NEGATION_PROVED),
+        ({"status": 2, "evidence": 3}, DeclarationEvidence.BOTH),
+        ({"status": 6, "failure_reason": 3}, None),
+    ],
+    ids=["cex", "negation", "both", "failed"],
+)
+def test_refutation_responses_keep_the_evidence_kind(fields, evidence):
+    message = "Refuted by a counterexample: x < y & y > 0. See the trace in Artifacts."
+    declaration = Declaration.model_validate({**SAMPLE_DECLARATION, **fields, "evidence_message": message})
+
+    assert declaration.evidence is evidence
+    payload = declaration.model_dump(mode="json")
+    assert payload["status"] == fields["status"]
+    assert payload["evidence_message"] == message
+    assert payload["evidence"] == evidence
+    if fields["status"] == 2:
+        assert payload["status_name"] == "REFUTED"
+    elif fields["status"] == 6:
+        assert declaration.status is DeclarationStatus.FAILED
+
+
+@pytest.mark.parametrize(
+    "fields", [{}, {"evidence": None}, {"evidence": 0}, {"evidence": 99}, {"evidence": DeclarationEvidence.UNKNOWN}]
+)
+def test_refuted_declarations_require_a_known_evidence_kind(fields):
+    with pytest.raises(pydantic.ValidationError):
+        Declaration.model_validate({**SAMPLE_DECLARATION, "status": 2, **fields})
+
+
+@pytest.mark.parametrize("evidence", [0, 4, DeclarationEvidence.UNKNOWN])
+def test_a_declaration_made_in_python_refuses_an_unknown_evidence_kind_whatever_its_status(evidence):
+    with pytest.raises(pydantic.ValidationError, match="Evidence must be COUNTEREXAMPLE, NEGATION_PROVED or BOTH"):
+        Declaration.model_validate({**SAMPLE_DECLARATION, "evidence": evidence})
+
+
+@pytest.mark.parametrize(
+    ("fields", "evidence"),
+    [
+        ({"status": 2}, DeclarationEvidence.NEGATION_PROVED),
+        ({"status": 5}, DeclarationEvidence.COUNTEREXAMPLE),
+        ({"status": 2, "evidence": None, "evidence_message": None}, DeclarationEvidence.NEGATION_PROVED),
+        ({"status": 5, "evidence": None, "evidence_message": None}, DeclarationEvidence.COUNTEREXAMPLE),
+        ({"status": 2, "evidence": 1, "evidence_message": "CEX at `x = 1`."}, DeclarationEvidence.COUNTEREXAMPLE),
+        ({"status": 2, "evidence": 2, "evidence_message": "Negation proved."}, DeclarationEvidence.NEGATION_PROVED),
+        ({"status": 2, "evidence": 3, "evidence_message": "Proof and CEX."}, DeclarationEvidence.BOTH),
+        ({"status": 5, "evidence": 3, "evidence_message": "Proof and CEX."}, DeclarationEvidence.BOTH),
+    ],
+)
+async def test_api_refutations_normalize_without_changing_the_response(fields, evidence):
+    raw = {**SAMPLE_DECLARATION, **fields}
+    original = raw.copy()
+    client = _mock_client({"declarations": [raw], "pagination_key": None})
+
+    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=client):
+        declarations, _ = await Declaration.list_for_project(PROJECT_ID)
+
+    declaration = declarations[0]
+    assert declaration.status is DeclarationStatus.REFUTED
+    assert declaration.evidence is evidence
+    assert declaration.evidence_message == raw.get("evidence_message")
+    assert declaration.model_dump(mode="json")["status"] == 2
+    assert raw == original
+
+
+@pytest.mark.parametrize("status", [2, 5])
+@pytest.mark.parametrize("evidence", [0, 4, 99])
+async def test_api_refutations_read_an_unknown_evidence_kind_as_unknown_instead_of_inferring_one(status, evidence):
+    raw = {**SAMPLE_DECLARATION, "status": status, "evidence": evidence}
+    client = _mock_client({"declarations": [raw], "pagination_key": None})
+
+    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=client):
+        [declaration], _ = await Declaration.list_for_project(PROJECT_ID)
+
+    assert declaration.status is DeclarationStatus.REFUTED
+    assert declaration.evidence is DeclarationEvidence.UNKNOWN
+    assert declaration.model_dump(mode="json")["evidence"] == 0
+
+
+async def test_mixed_api_pages_preserve_every_refutation_in_counts():
+    fields = [{"status": 5}, {"status": 2}]
+    fields += [{"status": 2, "evidence": evidence} for evidence in DeclarationEvidence]
+    fields += [{"status": 3}, {"status": 6}]
+    rows = [{**SAMPLE_DECLARATION, "declaration_id": str(i), **values} for i, values in enumerate(fields)]
+    client = _mock_client(
+        {"declarations": rows[:2], "pagination_key": "next"},
+        {"declarations": rows[2:], "pagination_key": None},
+    )
+
+    with (
+        patch("aristotlelib.api_request.AristotleRequestClient", return_value=client),
+        patch("aristotlelib.declaration.asyncio.sleep", AsyncMock()),
+    ):
+        declarations = await Declaration.list_all_for_project(PROJECT_ID)
+
+    assert [d.declaration_id for d in declarations] == [str(i) for i in range(8)]
+    assert PropertyCounts.from_declarations(declarations, []) == PropertyCounts(proved=1, refuted=6, unresolved=1)
+    assert [d.evidence for d in declarations[:6]] == [
+        DeclarationEvidence.COUNTEREXAMPLE,
+        DeclarationEvidence.NEGATION_PROVED,
+        *DeclarationEvidence,
+    ]
 
 
 async def test_list_for_project_requests_the_right_endpoint():

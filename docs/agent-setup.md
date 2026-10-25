@@ -92,7 +92,7 @@ Codex's sandbox blocks the network without asking, so `aristotle` retries and th
 release:
 
 ```bash
-src=$(mktemp -d) && git clone --depth 1 --branch v3.0.0rc12 https://github.com/harmonic-ai/aristotle.git "$src" &&
+src=$(mktemp -d) && git clone --depth 1 --branch v3.0.0rc13 https://github.com/harmonic-ai/aristotle.git "$src" &&
   mkdir -p ~/.agents/skills && rm -rf ~/.agents/skills/aristotle &&
   cp -R "$src/skills/aristotle" ~/.agents/skills/
 ```
@@ -101,7 +101,7 @@ In PowerShell on Windows:
 
 ```powershell
 $src = Join-Path ([IO.Path]::GetTempPath()) ([IO.Path]::GetRandomFileName())
-git clone --depth 1 --branch v3.0.0rc12 https://github.com/harmonic-ai/aristotle.git $src
+git clone --depth 1 --branch v3.0.0rc13 https://github.com/harmonic-ai/aristotle.git $src
 if (Test-Path "$src\skills\aristotle") {
   New-Item -ItemType Directory -Force "$HOME\.agents\skills" | Out-Null
   Remove-Item -Recurse -Force "$HOME\.agents\skills\aristotle" -ErrorAction SilentlyContinue

@@ -40,7 +40,7 @@ from aristotlelib.cli.command.ci import (
     allowed_folders,
 )
 from aristotlelib.cli.controller import main
-from aristotlelib.declaration import Declaration, DeclarationFailureReason, DeclarationStatus
+from aristotlelib.declaration import Declaration, DeclarationEvidence, DeclarationFailureReason, DeclarationStatus
 from aristotlelib.exit_codes import (
     EXIT_AUTH_ERROR,
     EXIT_INFRASTRUCTURE_ERROR,
@@ -54,7 +54,7 @@ from aristotlelib.exit_codes import (
 from aristotlelib.printable import escape_logged_text
 from aristotlelib.project import Project, ProjectStatus
 from aristotlelib.verilog import bundle, filelist
-from tests.ci.conftest import git, latin1_name, make_declaration
+from tests.ci.conftest import commit_bare_shaped, git, latin1_name, make_declaration
 from tests.conftest import NEEDS_INT_DIGIT_LIMIT, NEVER_READ, UNREACHABLE_HOST, WILDCARD_FOLDERS
 
 CI_VARIABLE_PREFIXES = ("GITHUB_", "GITLAB_", "CI_", "BUILDKITE", "CIRCLE", "BUILD_", "SYSTEM_", "JENKINS_")
@@ -153,9 +153,15 @@ def _project() -> Project:
     )
 
 
-def _declaration(property_id: str, status: DeclarationStatus = DeclarationStatus.PROVED) -> Declaration:
+def _declaration(
+    property_id: str,
+    status: DeclarationStatus = DeclarationStatus.PROVED,
+    evidence: DeclarationEvidence | None = None,
+) -> Declaration:
     """A property the run registered under the manifest id ``property_id``, with a name that differs from it."""
-    return make_declaration(f"Fifo.{property_id}", status).model_copy(update={"declaration_id": property_id})
+    return make_declaration(f"Fifo.{property_id}", status, evidence=evidence).model_copy(
+        update={"declaration_id": property_id}
+    )
 
 
 def _testcases(report: Path) -> dict[str, ET.Element]:
@@ -519,7 +525,10 @@ async def test_a_counterexample_to_a_manifest_property_fails_the_build(action: C
     run = await _run(
         action,
         ["--directory", str(repo)],
-        [_declaration("write_when_full"), _declaration("read_when_empty", DeclarationStatus.COUNTEREXAMPLE)],
+        [
+            _declaration("write_when_full"),
+            _declaration("read_when_empty", DeclarationStatus.REFUTED, evidence=DeclarationEvidence.COUNTEREXAMPLE),
+        ],
     )
 
     assert run.code == EXIT_VERIFICATION_FAILED
@@ -704,7 +713,9 @@ async def test_fail_on_never_logs_a_run_that_verified_nothing_without_failing(ac
 
 
 async def test_a_refuted_suggestion_does_not_fail_the_build(action: CIAction, repo: Path, tmp_path: Path, caplog):
-    suggestion = make_declaration("Fifo.PointerWraps", DeclarationStatus.COUNTEREXAMPLE)
+    suggestion = make_declaration(
+        "Fifo.PointerWraps", DeclarationStatus.REFUTED, evidence=DeclarationEvidence.COUNTEREXAMPLE
+    )
 
     with caplog.at_level(logging.INFO, logger="aristotle"):
         run = await _run(action, ["--directory", str(repo)], [*(_declaration(i) for i in IDS), suggestion])
@@ -718,7 +729,9 @@ async def test_the_junit_report_has_a_testcase_per_manifest_id_in_manifest_order
     action: CIAction, repo: Path, tmp_path: Path
 ):
     run = await _run(
-        action, ["--directory", str(repo)], [_declaration("read_when_empty", DeclarationStatus.COUNTEREXAMPLE)]
+        action,
+        ["--directory", str(repo)],
+        [_declaration("read_when_empty", DeclarationStatus.REFUTED, evidence=DeclarationEvidence.COUNTEREXAMPLE)],
     )
 
     assert run.code == EXIT_VERIFICATION_FAILED
@@ -738,7 +751,10 @@ async def test_fail_on_never_reports_a_counterexample_without_failing(action: CI
         run = await _run(
             action,
             ["--directory", str(repo), "--fail-on", "never"],
-            [_declaration("write_when_full", DeclarationStatus.COUNTEREXAMPLE), _declaration("read_when_empty")],
+            [
+                _declaration("write_when_full", DeclarationStatus.REFUTED, evidence=DeclarationEvidence.COUNTEREXAMPLE),
+                _declaration("read_when_empty"),
+            ],
         )
 
     assert run.code == EXIT_SUCCESS
@@ -746,12 +762,19 @@ async def test_fail_on_never_reports_a_counterexample_without_failing(action: CI
 
 
 @pytest.mark.parametrize(
-    ("fail_on", "final_status", "status", "expected", "logged"),
+    ("fail_on", "final_status", "status", "evidence", "expected", "logged"),
     [
-        ("failure", TaskStatus.FAILED, DeclarationStatus.PROVED, EXIT_INFRASTRUCTURE_ERROR, "internal error"),
-        ("failure", TaskStatus.FAILED, DeclarationStatus.COUNTEREXAMPLE, EXIT_VERIFICATION_FAILED, "internal error"),
-        ("failure", TaskStatus.CANCELED, DeclarationStatus.PROVED, EXIT_INFRASTRUCTURE_ERROR, "outside this job"),
-        ("never", TaskStatus.FAILED, DeclarationStatus.PROVED, EXIT_SUCCESS, "internal error"),
+        ("failure", TaskStatus.FAILED, DeclarationStatus.PROVED, None, EXIT_INFRASTRUCTURE_ERROR, "internal error"),
+        (
+            "failure",
+            TaskStatus.FAILED,
+            DeclarationStatus.REFUTED,
+            DeclarationEvidence.COUNTEREXAMPLE,
+            EXIT_VERIFICATION_FAILED,
+            "internal error",
+        ),
+        ("failure", TaskStatus.CANCELED, DeclarationStatus.PROVED, None, EXIT_INFRASTRUCTURE_ERROR, "outside this job"),
+        ("never", TaskStatus.FAILED, DeclarationStatus.PROVED, None, EXIT_SUCCESS, "internal error"),
     ],
     ids=["failed", "failed with a refutation", "cancelled elsewhere", "failed under --fail-on never"],
 )
@@ -763,13 +786,14 @@ async def test_a_failed_or_cancelled_run_is_an_infrastructure_error_unless_a_pro
     fail_on: str,
     final_status: TaskStatus,
     status: DeclarationStatus,
+    evidence: DeclarationEvidence | None,
     expected: int,
     logged: str,
 ):
     run = await _run(
         action,
         ["--directory", str(repo), "--fail-on", fail_on],
-        [_declaration("write_when_full", status), _declaration("read_when_empty")],
+        [_declaration("write_when_full", status, evidence=evidence), _declaration("read_when_empty")],
         final_status=final_status,
     )
 
@@ -782,10 +806,10 @@ async def test_a_failed_or_cancelled_run_is_an_infrastructure_error_unless_a_pro
 
 
 OUT_OF_BUDGET_ERROR = (
-    "The run ran out of budget before Aristotle checked its results. None of them counts as proved or disproved."
+    "The run ran out of budget before Aristotle checked its results. None of them counts as proved or refuted."
 )
 TIME_BUDGET_ERROR = (
-    "The time budget ran out before Aristotle checked the run's results. None of them counts as proved or disproved. "
+    "The time budget ran out before Aristotle checked the run's results. None of them counts as proved or refuted. "
     "Raise --timeout. Waiting for a free slot counts toward --timeout."
 )
 CUT_SHORT = pytest.mark.parametrize(
@@ -813,7 +837,7 @@ async def test_a_cut_short_run_with_every_property_proved_exits_3_and_reports_th
         run = await _run(action, ["--directory", str(repo)], [_declaration(i) for i in IDS], final_status=final_status)
 
     assert run.code == EXIT_INFRASTRUCTURE_ERROR
-    assert "0 proved, 0 disproved, 0 in progress, 2 unchecked (2 proved)" in caplog.text
+    assert "0 proved, 0 refuted, 0 in progress, 2 unchecked (2 proved)" in caplog.text
     assert "  SKIP  [proved, unchecked] write_when_full\n" in caplog.text
     assert "PASS" not in caplog.text
     assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == [error]
@@ -831,7 +855,9 @@ async def test_a_cut_short_run_with_every_property_proved_exits_3_and_reports_th
     [("failure", EXIT_INFRASTRUCTURE_ERROR), ("no-verdict", EXIT_INFRASTRUCTURE_ERROR), ("never", EXIT_SUCCESS)],
 )
 @pytest.mark.parametrize(
-    "status", [DeclarationStatus.PROVED, DeclarationStatus.COUNTEREXAMPLE], ids=["proved", "counterexample"]
+    ("status", "evidence"),
+    [(DeclarationStatus.PROVED, None), (DeclarationStatus.REFUTED, DeclarationEvidence.COUNTEREXAMPLE)],
+    ids=["proved", "counterexample"],
 )
 async def test_a_cut_short_run_fails_the_build_unless_advisory_whatever_it_reported(
     action: CIAction,
@@ -842,12 +868,16 @@ async def test_a_cut_short_run_fails_the_build_unless_advisory_whatever_it_repor
     fail_on: str,
     expected: int,
     status: DeclarationStatus,
+    evidence: DeclarationEvidence | None,
 ):
     with caplog.at_level(logging.INFO, logger="aristotle"):
         run = await _run(
             action,
             ["--directory", str(repo), "--no-junit", "--fail-on", fail_on],
-            [_declaration("write_when_full", status), _declaration("read_when_empty", DeclarationStatus.IN_PROGRESS)],
+            [
+                _declaration("write_when_full", status, evidence=evidence),
+                _declaration("read_when_empty", DeclarationStatus.IN_PROGRESS),
+            ],
             final_status=final_status,
         )
 
@@ -1057,7 +1087,12 @@ async def test_project_reports_on_a_run_already_started_without_uploading(
         (run, resolve) = await _follow(
             action,
             ["--directory", str(repo)],
-            declarations=[_declaration("write_when_full"), _declaration("read_when_empty", DeclarationStatus.NEGATED)],
+            declarations=[
+                _declaration("write_when_full"),
+                _declaration(
+                    "read_when_empty", DeclarationStatus.REFUTED, evidence=DeclarationEvidence.NEGATION_PROVED
+                ),
+            ],
             summary="A write to a full FIFO overwrote the oldest entry.",
         )
 
@@ -1699,7 +1734,10 @@ async def test_a_reporter_that_raises_does_not_change_the_exit_code(
         run = await _run(
             action,
             ["--directory", str(repo), "--fail-on", fail_on],
-            [_declaration("write_when_full", DeclarationStatus.COUNTEREXAMPLE), _declaration("read_when_empty")],
+            [
+                _declaration("write_when_full", DeclarationStatus.REFUTED, evidence=DeclarationEvidence.COUNTEREXAMPLE),
+                _declaration("read_when_empty"),
+            ],
         )
 
     assert run.code == expected
@@ -1891,6 +1929,28 @@ async def test_the_project_is_named_after_the_repository_the_run_and_the_commit(
     run = await _run(action, ["--directory", str(repo)], [_declaration(i) for i in IDS])
 
     assert run.submit.await_args.kwargs["name"] == f"repo: ci @ {_revision(repo)}"
+
+
+@pytest.mark.parametrize("from_folder", [False, True], ids=["--directory", "current folder"])
+async def test_a_folder_shaped_like_a_bare_repository_is_checked_from_the_checkouts_repository(
+    action: CIAction, repo: Path, from_folder: bool, monkeypatch: pytest.MonkeyPatch, caplog
+):
+    hw = commit_bare_shaped(repo)
+    _commit(repo, f"hw/{manifest.MANIFEST_NAME}", MANIFEST)
+    monkeypatch.setenv("ARISTOTLE_WEB_URL", "http://127.0.0.1:9")
+    if from_folder:
+        monkeypatch.chdir(hw)
+
+    with caplog.at_level(logging.INFO, logger="aristotle"):
+        run = await _run(action, ["--dry-run", *([] if from_folder else ["--directory", str(hw)])])
+
+    assert run.code == EXIT_SUCCESS
+    # HEAD, config, objects/.keep, refs/.keep, top.v and the manifest.
+    assert any(
+        re.fullmatch(r"Dry run: would upload 6 files \(\d+ bytes\); checking 2 properties\.", m)
+        for m in caplog.messages
+    )
+    assert f'Dry run: would name the project "repo/hw: ci @ {_revision(repo)}".' in caplog.messages
 
 
 async def test_a_subprojects_run_is_named_by_its_directory_and_manifest(repo: Path, tmp_path: Path):
@@ -2162,7 +2222,10 @@ async def test_on_github_the_runs_text_is_escaped_and_the_clis_own_annotations_s
         run = await _run(
             action,
             ["--directory", str(repo), "--no-junit"],
-            [_declaration("write_when_full", DeclarationStatus.COUNTEREXAMPLE), _declaration("read_when_empty")],
+            [
+                _declaration("write_when_full", DeclarationStatus.REFUTED, evidence=DeclarationEvidence.COUNTEREXAMPLE),
+                _declaration("read_when_empty"),
+            ],
             final_status=TaskStatus.COMPLETE_WITH_ERRORS,
             stopped_summary="Which depth?\n::stop-commands::x\n::error file=fifo.v,line=1::forged by the run",
         )
@@ -2394,7 +2457,10 @@ def test_on_github_a_reported_run_adds_no_annotation_for_its_errors(
 ):
     monkeypatch.setenv("GITHUB_ACTIONS", "true")
     monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(tmp_path / "summary.md"))
-    refuted = [_declaration("write_when_full", DeclarationStatus.COUNTEREXAMPLE), _declaration("read_when_empty")]
+    refuted = [
+        _declaration("write_when_full", DeclarationStatus.REFUTED, evidence=DeclarationEvidence.COUNTEREXAMPLE),
+        _declaration("read_when_empty"),
+    ]
 
     assert _run_whole(action, ["--directory", str(repo), "--no-junit"], refuted) == EXIT_VERIFICATION_FAILED
 
@@ -2476,7 +2542,12 @@ async def test_a_refuted_property_prints_the_runs_summary_which_names_the_counte
         run = await _run(
             action,
             ["--directory", str(repo)],
-            [_declaration("write_when_full", DeclarationStatus.NEGATED), _declaration("read_when_empty")],
+            [
+                _declaration(
+                    "write_when_full", DeclarationStatus.REFUTED, evidence=DeclarationEvidence.NEGATION_PROVED
+                ),
+                _declaration("read_when_empty"),
+            ],
             summary=COUNTEREXAMPLE_SUMMARY,
         )
 
@@ -2502,7 +2573,12 @@ async def test_a_stopped_run_with_a_refuted_property_reports_the_summary_it_stop
         run = await _run(
             action,
             ["--directory", str(repo)],
-            [_declaration("write_when_full", DeclarationStatus.NEGATED), _declaration("read_when_empty")],
+            [
+                _declaration(
+                    "write_when_full", DeclarationStatus.REFUTED, evidence=DeclarationEvidence.NEGATION_PROVED
+                ),
+                _declaration("read_when_empty"),
+            ],
             final_status=TaskStatus.COMPLETE_WITH_ERRORS,
             stopped_summary=f"{COUNTEREXAMPLE_SUMMARY}\nWhich reset polarity is intended?",
         )
@@ -2527,7 +2603,7 @@ async def test_a_stopped_run_whose_summary_is_the_marker_alone_reports_a_refuted
     run = await _run(
         action,
         ["--directory", str(repo)],
-        [_declaration("write_when_full", DeclarationStatus.NEGATED)],
+        [_declaration("write_when_full", DeclarationStatus.REFUTED, evidence=DeclarationEvidence.NEGATION_PROVED)],
         final_status=TaskStatus.COMPLETE_WITH_ERRORS,
         stopped_summary=runner.NO_STOPPED_SUMMARY,
     )
@@ -2545,7 +2621,7 @@ async def test_a_stopped_run_whose_summary_is_the_marker_alone_reports_a_refuted
     [
         ([_declaration(i) for i in IDS], TaskStatus.COMPLETE, None),
         (
-            [_declaration("write_when_full", DeclarationStatus.NEGATED)],
+            [_declaration("write_when_full", DeclarationStatus.REFUTED, evidence=DeclarationEvidence.NEGATION_PROVED)],
             TaskStatus.COMPLETE_WITH_ERRORS,
             "Open questions:\n1. Which reset?",
         ),
@@ -2625,7 +2701,7 @@ async def test_a_build_fail_on_no_verdict_fails_says_which_properties_have_no_ve
         )
 
     assert run.code == EXIT_VERIFICATION_FAILED
-    assert "1 proved, 0 disproved, 0 in progress, 1 unresolved" in caplog.text
+    assert "1 proved, 0 refuted, 0 in progress, 1 unresolved" in caplog.text
     assert [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR] == [
         "1 of the manifest's 2 properties have no verdict: write_when_full. --fail-on no-verdict fails the build on a "
         "property without one."
@@ -2703,7 +2779,10 @@ async def test_a_summary_that_cannot_be_fetched_leaves_the_verdict_and_says_so(
         run = await _run(
             action,
             ["--directory", str(repo), "--no-junit"],
-            [_declaration("write_when_full", DeclarationStatus.COUNTEREXAMPLE), _declaration("read_when_empty")],
+            [
+                _declaration("write_when_full", DeclarationStatus.REFUTED, evidence=DeclarationEvidence.COUNTEREXAMPLE),
+                _declaration("read_when_empty"),
+            ],
             summary=error,
         )
 
@@ -2733,7 +2812,13 @@ async def test_a_summary_that_takes_too_long_is_left_out(
             patch.object(
                 Project,
                 "get_declarations",
-                AsyncMock(return_value=[_declaration("write_when_full", DeclarationStatus.NEGATED)]),
+                AsyncMock(
+                    return_value=[
+                        _declaration(
+                            "write_when_full", DeclarationStatus.REFUTED, evidence=DeclarationEvidence.NEGATION_PROVED
+                        )
+                    ]
+                ),
             ),
         ):
             assert action.preflight(args) is None

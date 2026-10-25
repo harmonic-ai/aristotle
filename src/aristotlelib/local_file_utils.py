@@ -10,7 +10,7 @@ import sys
 import tarfile
 import tempfile
 from pathlib import Path, PurePath
-from typing import BinaryIO
+from typing import Any, BinaryIO
 
 import pathspec
 
@@ -133,6 +133,10 @@ LEAN_BUILD_FILES = frozenset({"lake-manifest.json", "lakefile.lean", "lakefile.t
 """File names that no ignore rule keeps out of ci, review or submit, at any depth."""
 
 GIT_TIMEOUT_SECONDS = 60
+
+GIT_SETTINGS = ("-c", "safe.bareRepository=explicit", "-c", "core.fsmonitor=")
+"""Given to every git command. git before 2.38 ignores the first; an empty core.fsmonitor is off both as a hook's path,
+before 2.36, and as a boolean since."""
 
 # Negation patterns to always include .lake directories even if gitignored
 GITIGNORE_EXEMPT_PATTERNS = [
@@ -475,21 +479,19 @@ class LeanProjectError(Exception):
 
 
 def _git(project_dir: Path, *args: str, stdin: bytes = b"") -> subprocess.CompletedProcess[bytes]:
-    """Run git in ``project_dir``; raises FileNotFoundError without git, LeanProjectError if it fails to run or stalls."""
+    """Run git as run_git() does; raises FileNotFoundError without git, LeanProjectError outside a checkout or if git
+    fails to run or stalls."""
     try:
-        return subprocess.run(
-            ["git", "-C", str(project_dir), *args],
-            input=stdin,
-            capture_output=True,
-            timeout=GIT_TIMEOUT_SECONDS,
-            check=False,
-        )
+        result = run_git(project_dir, *args, input=stdin, capture_output=True, timeout=GIT_TIMEOUT_SECONDS, check=False)
     except FileNotFoundError:
         raise
     except subprocess.TimeoutExpired as e:
         raise _git_failure(project_dir, f"git {args[0]} timed out after {GIT_TIMEOUT_SECONDS}s") from e
     except OSError as e:
         raise _git_failure(project_dir, str(e)) from e
+    if result is None:
+        raise _git_failure(project_dir, "it is not in a git repository")
+    return result
 
 
 def _git_failure(project_dir: Path, detail: str) -> LeanProjectError:
@@ -555,20 +557,53 @@ def _ceiling(path: str) -> int:
 
 def enclosing_repository(project_dir: Path) -> Path | None:
     """The nearest of ``project_dir`` and the folders above it that holds a ``.git``, searched as git searches: from
-    ``project_dir``, up to but not into the nearest GIT_CEILING_DIRECTORIES folder above it. None if none does or its
-    path cannot be resolved."""
+    ``project_dir``, up to but not into the nearest GIT_CEILING_DIRECTORIES folder above it, and on its file system
+    unless GIT_DISCOVERY_ACROSS_FILESYSTEM is set. None if none does or its path cannot be resolved."""
     try:
         # macOS's getcwd() fails under a folder that cannot be searched; Path.exists() would raise before 3.14.
         resolved = project_dir.resolve()
     except OSError:
         return None
     ceiling = _ceiling(_slashed(str(resolved)))
+    across = os.environ.get("GIT_DISCOVERY_ACROSS_FILESYSTEM", "").lower() in ("1", "true", "yes", "on")
+    # git for Windows has no device numbers to compare.
+    device = None if across or os.name == "nt" else _device(resolved)
     for folder in (resolved, *resolved.parents):
         if folder != resolved and _length(_slashed(str(folder))) <= ceiling:
+            return None
+        if device is not None and _device(folder) != device:
             return None
         if os.path.lexists(folder / ".git"):
             return folder
     return None
+
+
+def _device(folder: Path) -> int | None:
+    try:
+        return os.stat(folder).st_dev
+    except OSError:
+        return None
+
+
+def git_prefix(folder: Path) -> str:
+    """``folder``'s path from enclosing_repository(), as git prints a prefix: ``hw/``, or "" at the top or outside one."""
+    top = enclosing_repository(folder)
+    prefix = "." if top is None else folder.resolve().relative_to(top).as_posix()
+    return "" if prefix == "." else f"{prefix}/"
+
+
+def git_pathspec(folder: Path) -> str:
+    prefix = git_prefix(folder)
+    return f":(literal){prefix}" if prefix else "."
+
+
+def run_git(folder: Path, *args: str, **kwargs: Any) -> "subprocess.CompletedProcess[Any] | None":
+    """subprocess.run() of git ``args`` with GIT_SETTINGS from enclosing_repository(), so that git never looks for a
+    repository inside ``folder``; None, without running git, when there is none."""
+    top = enclosing_repository(folder)
+    if top is None:
+        return None
+    return subprocess.run(["git", "-C", str(top), *GIT_SETTINGS, *args], **kwargs)
 
 
 def _top_level_ignored(project_dir: Path, candidates: list[Path]) -> set[Path]:
@@ -585,10 +620,11 @@ def _ignored_itself(project_dir: Path) -> str | None:
         FileNotFoundError: git isn't installed.
         LeanProjectError: git failed or stalled.
     """
+    # From git's top, which is above where run_git() runs git when git passes over the .git there.
+    prefix = os.fsdecode(_git(project_dir, "rev-parse", "--show-prefix").stdout.rstrip(b"\n")) + git_prefix(project_dir)
     # git reads "." as "<dir>/", which a "<dir>/*" rule matches; ask about the folder by name, as git status does.
-    prefix = _git(project_dir, "rev-parse", "--show-prefix").stdout.strip()
-    if prefix and _check_ignore(project_dir, "--quiet", f"../{project_dir.resolve().name}").returncode == 0:
-        return os.fsdecode(prefix)
+    if prefix and _check_ignore(project_dir, "--quiet", f":(top){prefix.rstrip('/')}").returncode == 0:
+        return prefix
     return None
 
 
@@ -600,14 +636,15 @@ def _git_ignored(project_dir: Path, candidates: list[Path], kept: frozenset[Path
     Raises:
         LeanProjectError: git could not say which files it ignores.
     """
+    if enclosing_repository(project_dir) is None:
+        return None
     try:
         inside = _git(project_dir, "rev-parse", "--is-inside-work-tree")
     except FileNotFoundError:
-        if enclosing_repository(project_dir):
-            logger.warning(f"git is not installed, so only {project_dir}'s top-level .gitignore was applied.")
+        logger.warning(f"git is not installed, so only {project_dir}'s top-level .gitignore was applied.")
         return None
     if inside.returncode != 0 or inside.stdout.strip() != b"true":
-        if inside.returncode != 0 and enclosing_repository(project_dir):
+        if inside.returncode != 0:
             # Such as a repository git calls dubiously owned, or a worktree mounted without its main repository.
             reason = os.fsdecode(inside.stderr).strip()
             logger.warning(f"git refused {project_dir}, so only its top-level .gitignore was applied: {reason}")
@@ -621,7 +658,8 @@ def _git_ignored(project_dir: Path, candidates: list[Path], kept: frozenset[Path
     if not candidates:
         return set()
     # The "./" keeps a leading ":" from being read as pathspec magic; git echoes each ignored path as given.
-    spelled = {b"./" + os.fsencode(p.as_posix()): p for p in candidates}
+    prefix = git_prefix(project_dir)
+    spelled = {b"./" + os.fsencode(prefix + p.as_posix()): p for p in candidates}
     output = _check_ignore(project_dir, "-z", "--stdin", stdin=b"".join(path + b"\0" for path in spelled)).stdout
     ignored = {spelled[path] for path in output.split(b"\0") if path}
     if held_back := _tracked(project_dir, ignored):
@@ -642,13 +680,14 @@ def _tracked(project_dir: Path, paths: set[Path]) -> list[Path]:
     if not paths:
         return []
     try:
-        result = _git(project_dir, "ls-files", "-z", "--recurse-submodules")
+        result = _git(project_dir, "ls-files", "-z", "--recurse-submodules", "--", git_pathspec(project_dir))
     except LeanProjectError as e:
         detail = str(e)
     else:
         if result.returncode == 0:
             listed = set(result.stdout.split(b"\0"))
-            return [p for p in paths if os.fsencode(p.as_posix()) in listed]
+            prefix = git_prefix(project_dir)
+            return [p for p in paths if os.fsencode(prefix + p.as_posix()) in listed]
         detail = os.fsdecode(result.stderr).strip()
     logger.warning(f"git could not say which files in {project_dir} it tracks, so none held back is named: {detail}")
     return []
@@ -676,7 +715,8 @@ def _gitignore_rules(root: Path, paths: list[Path]) -> dict[Path, str] | None:
     """``<file>:<line>: <pattern>`` for each of ``paths``, relative to ``root``, that a rule of the repository's
     .gitignore files matches, the file named from the repository's top; None if git can't say. git reads no
     .git/info/exclude or global excludes file here, so no folder rule of theirs hides a .gitignore's."""
-    spelled = {b"./" + os.fsencode(p.as_posix()): p for p in paths}
+    prefix = git_prefix(root)
+    spelled = {b"./" + os.fsencode(prefix + p.as_posix()): p for p in paths}
     try:
         top = _git(root, "rev-parse", "--show-toplevel")
         if top.returncode != 0:

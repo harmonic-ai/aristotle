@@ -7,15 +7,21 @@ import pydantic
 
 from aristotlelib.agent_task import TERMINAL_STATUSES, AgentTask, TaskStatus
 from aristotlelib.date_utils import as_utc
-from aristotlelib.declaration import Declaration, DeclarationFailureReason, DeclarationSource, DeclarationStatus
+from aristotlelib.declaration import (
+    Declaration,
+    DeclarationEvidence,
+    DeclarationFailureReason,
+    DeclarationSource,
+    DeclarationStatus,
+)
 from aristotlelib.event import Event
 from aristotlelib.project import Project
 from aristotlelib.question import Question
 
-VERDICT_STATUSES = frozenset({DeclarationStatus.PROVED, DeclarationStatus.NEGATED, DeclarationStatus.COUNTEREXAMPLE})
-"""A proof or a disproof, which Aristotle checks when the task that reported it finishes."""
+VERDICT_STATUSES = frozenset({DeclarationStatus.PROVED, DeclarationStatus.REFUTED})
+"""A proof or a refutation, which Aristotle checks when the task that reported it finishes."""
 
-Outcome = Literal["proved", "disproved", "in_progress", "unresolved", "unchecked", "unknown"]
+Outcome = Literal["proved", "refuted", "in_progress", "unresolved", "unchecked", "unknown"]
 """What a property's status comes to, in the one word every command, the web app and the MCP use for it."""
 
 
@@ -27,7 +33,7 @@ def setter(declaration: Declaration, tasks: Sequence[AgentTask]) -> AgentTask | 
 
 
 def unchecked(declaration: Declaration, tasks: Sequence[AgentTask]) -> bool:
-    """Whether a property's proof or disproof is one Aristotle never checked, by the project's ``tasks``, newest first.
+    """Whether a property's proof or refutation is one Aristotle never checked, by the project's ``tasks``, newest first.
 
     Aristotle checks a task's results when it finishes, so a verdict is unchecked if the task that set it, the newest
     created by the verdict's last update, ended first: every verdict if it ran out of budget, a proof if it failed or
@@ -44,37 +50,29 @@ def unchecked(declaration: Declaration, tasks: Sequence[AgentTask]) -> bool:
 
 
 class PropertyCounts(pydantic.BaseModel):
-    """A project's properties by status, a proof or disproof Aristotle never checked counted as ``unchecked``."""
+    """A project's properties by status, a proof or refutation Aristotle never checked counted as ``unchecked``."""
 
     proved: int = 0
-    negated: int = 0
-    counterexample: int = 0
+    refuted: int = 0
+    """Refuted properties, each counted once regardless of evidence kind."""
     in_progress: int = 0
     """No verdict yet: still ``IN_PROGRESS`` when the task ended."""
     unresolved: int = 0
-    """``FAILED``: the run stopped first, or the proof no longer checks. Not a disproof, which ``disproved`` counts."""
+    """``FAILED``: the run stopped first, or the proof no longer checks. Not a refutation."""
     unchecked: int = 0
-
-    @pydantic.computed_field  # type: ignore[prop-decorator]
-    @property
-    def disproved(self) -> int:
-        """``negated`` and ``counterexample`` together: every property Aristotle showed doesn't hold."""
-        return self.negated + self.counterexample
 
     @classmethod
     def from_declarations(cls, declarations: list[Declaration], tasks: Sequence[AgentTask]) -> "PropertyCounts":
         """Count by status, with the verdicts the project's ``tasks`` show Aristotle never checked apart, as unchecked()
-        judges them; statuses other than these five are not counted."""
+        judges them; other statuses are not counted."""
         counts = cls()
         for declaration in declarations:
             if unchecked(declaration, tasks):
                 counts.unchecked += 1
             elif declaration.status == DeclarationStatus.PROVED:
                 counts.proved += 1
-            elif declaration.status == DeclarationStatus.NEGATED:
-                counts.negated += 1
-            elif declaration.status == DeclarationStatus.COUNTEREXAMPLE:
-                counts.counterexample += 1
+            elif declaration.status == DeclarationStatus.REFUTED:
+                counts.refuted += 1
             elif declaration.status == DeclarationStatus.IN_PROGRESS:
                 counts.in_progress += 1
             elif declaration.status == DeclarationStatus.FAILED:
@@ -87,7 +85,7 @@ class DeclarationRecord(Declaration):
     verdict is one Aristotle never checked."""
 
     unchecked: bool = False
-    """True for a proof or disproof Aristotle never checked, as unchecked() judges it by the project's tasks; ``status``
+    """True for a proof or refutation Aristotle never checked, as unchecked() judges it by the project's tasks; ``status``
     stays as reported. Always false for a definition."""
 
     @classmethod
@@ -95,6 +93,14 @@ class DeclarationRecord(Declaration):
         """``declaration`` with ``unchecked`` judged by the project's ``tasks``, newest first; validated already, so its
         description isn't decoded twice."""
         return cls.model_construct(**dict(declaration), unchecked=unchecked(declaration, tasks))
+
+    @pydantic.field_validator("evidence")
+    @classmethod
+    def _known_evidence(
+        cls, evidence: DeclarationEvidence | None, info: pydantic.ValidationInfo
+    ) -> DeclarationEvidence | None:
+        """Replaces Declaration's check, so printed records with ``UNKNOWN`` evidence validate as well."""
+        return evidence
 
 
 class PropertyStatus(pydantic.BaseModel):
@@ -105,8 +111,10 @@ class PropertyStatus(pydantic.BaseModel):
     status: DeclarationStatus
     failure_reason: DeclarationFailureReason | None = None
     """Set only when ``status`` is ``FAILED``; null otherwise."""
+    evidence: DeclarationEvidence | None = None
+    evidence_message: str | None = None
     unchecked: bool = False
-    """True for a proof or disproof Aristotle never checked, which ``property_counts`` counts as ``unchecked``."""
+    """True for a proof or refutation Aristotle never checked, which ``property_counts`` counts as ``unchecked``."""
     source: DeclarationSource = DeclarationSource.UNKNOWN
     """``USER`` for a property you asked for, ``AGENT`` for one Aristotle suggested, as the declaration has it."""
     artifact_paths: list[str] = []
@@ -133,15 +141,15 @@ class PropertyStatus(pydantic.BaseModel):
     @pydantic.computed_field  # type: ignore[prop-decorator]
     @property
     def outcome(self) -> Outcome:
-        """What ``status`` comes to: ``disproved`` for ``NEGATED`` and ``COUNTEREXAMPLE``, ``in_progress`` for
-        ``IN_PROGRESS``, which has no verdict, ``unresolved`` for ``FAILED``, ``unchecked`` for a proof or disproof
+        """What ``status`` comes to: ``refuted`` for ``REFUTED``, ``in_progress`` for
+        ``IN_PROGRESS``, which has no verdict, ``unresolved`` for ``FAILED``, ``unchecked`` for a proof or refutation
         Aristotle never checked, and ``unknown`` for a status this version doesn't know."""
         if self.unchecked and self.status in VERDICT_STATUSES:
             return "unchecked"
         if self.status == DeclarationStatus.PROVED:
             return "proved"
-        if self.status in (DeclarationStatus.NEGATED, DeclarationStatus.COUNTEREXAMPLE):
-            return "disproved"
+        if self.status == DeclarationStatus.REFUTED:
+            return "refuted"
         if self.status == DeclarationStatus.IN_PROGRESS:
             return "in_progress"
         if self.status == DeclarationStatus.FAILED:
@@ -180,6 +188,8 @@ def summarize_properties(declarations: list[Declaration] | None, tasks: Sequence
             name=d.name,
             status=d.status,
             failure_reason=d.failure_reason,
+            evidence=d.evidence,
+            evidence_message=d.evidence_message,
             unchecked=unchecked(d, tasks),
             source=d.source,
             artifact_paths=d.artifact_paths,

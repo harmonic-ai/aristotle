@@ -41,8 +41,7 @@ FAIL_ON_ALIASES = {"unresolved": FailOn.NO_VERDICT}
 #: Human-readable labels for each status, for report output, in the words every command uses for its outcome.
 STATUS_LABELS = {
     DeclarationStatus.PROVED: "proved",
-    DeclarationStatus.NEGATED: "disproved",
-    DeclarationStatus.COUNTEREXAMPLE: "disproved by counterexample",
+    DeclarationStatus.REFUTED: "refuted",
     DeclarationStatus.IN_PROGRESS: "in progress",
     DeclarationStatus.UNKNOWN: "unknown",
     DeclarationStatus.REMOVED: "withdrawn",
@@ -59,17 +58,13 @@ FAILURE_REASON_LABELS = {
 }
 
 
-#: Definitive negative results. FAILED is unresolved, not a disproof: the run stopped first, or its proof no longer
-#: checks.
-REFUTED_STATUSES = frozenset({DeclarationStatus.NEGATED, DeclarationStatus.COUNTEREXAMPLE})
-
-
 def proved(declaration: Declaration) -> bool:
     return declaration.status == DeclarationStatus.PROVED
 
 
 def refuted(declaration: Declaration) -> bool:
-    return declaration.status in REFUTED_STATUSES
+    # FAILED is unresolved: the run stopped first, or its proof no longer checks.
+    return declaration.status == DeclarationStatus.REFUTED
 
 
 def status_label(status: DeclarationStatus) -> str:
@@ -100,11 +95,11 @@ NOT_REGISTERED_CUT = "not registered, run cut short"
 """The result label of a manifest property a run had registered nothing under when it was cut short: by its budget or
 the time budget, or by failing or being cancelled."""
 
-EXPECTED_FAILURE = "disproved, as expected"
-"""The result label of a property the manifest expects to be disproved, and that was: it passes."""
+EXPECTED_FAILURE = "refuted, as expected"
+"""The result label of a property the manifest expects to be refuted, and that was: it passes."""
 
 UNEXPECTEDLY_PROVED = "unexpectedly proved: update the manifest"
-"""The result label of a property the manifest expects to be disproved, but that was proved: it fails."""
+"""The result label of a property the manifest expects to be refuted, but that was proved: it fails."""
 
 NEVER_STARTED = "run never started"
 """The result label of a manifest property whose run was still queued when the time budget ran out."""
@@ -142,10 +137,12 @@ PROOF_CHECK_FAILED_REASON = (
 TIME_BUDGET_REASON = "The time budget ran out before Aristotle checked the run's results."
 """Why the property results of a run that hit this job's time budget after it started are unchecked."""
 
-UNCHECKED_NOTE = "Properties below are those it reached, unchecked: none counts as proved or disproved."
+UNCHECKED_NOTE = "Properties below are those it reached, unchecked: none counts as proved or refuted."
 """Follows the unchecked reason above a cut-short run's properties."""
 
-UNCHECKED_PROOFS_NOTE = "Properties below are those it reached: a proof among them is unchecked, but a disproof counts."
+UNCHECKED_PROOFS_NOTE = (
+    "Properties below are those it reached: a proof among them is unchecked, but a refutation counts."
+)
 """Follows the notice of a run that failed or was cancelled, which never checked the proofs it reported."""
 
 MAX_SUMMARY_CHARACTERS = 4000
@@ -181,18 +178,18 @@ class PropertyResult:
     """Aristotle had not checked the run's results, so what it reported for the property is the agent's claim."""
     assumptions: str | None = None
     """The manifest's ``assumptions`` for the property, under which its verdict holds; None when it states none."""
-    expect_disproved: bool = False
-    """The manifest expects a counterexample: a disproof passes and a proof fails."""
+    expect_refuted: bool = False
+    """The manifest expects a counterexample: a refutation passes and a proof fails."""
 
     @property
     def passed(self) -> bool:
-        """A checked verdict the manifest wants: a proof, or a disproof it expects."""
-        return self.refuted if self.expect_disproved else self.proved
+        """A checked verdict the manifest wants: a proof, or a refutation it expects."""
+        return self.refuted if self.expect_refuted else self.proved
 
     @property
     def failed(self) -> bool:
-        """A checked verdict the manifest doesn't want: a disproof, or a proof of a property it expects disproved."""
-        return self.proved if self.expect_disproved else self.refuted
+        """A checked verdict the manifest doesn't want: a refutation, or a proof of a property it expects refuted."""
+        return self.proved if self.expect_refuted else self.refuted
 
     @property
     def proved(self) -> bool:
@@ -204,7 +201,7 @@ class PropertyResult:
 
     @property
     def unchecked_verdict(self) -> bool:
-        """A proof or disproof the run reported but nothing checked, which therefore has no verdict."""
+        """A proof or refutation the run reported but nothing checked, which therefore has no verdict."""
         return (
             self.unchecked and self.declaration is not None and (proved(self.declaration) or refuted(self.declaration))
         )
@@ -226,8 +223,8 @@ class PropertyResult:
 
     @property
     def _expectation_label(self) -> str | None:
-        """The label of a checked verdict on a property the manifest expects disproved; None otherwise."""
-        if not self.expect_disproved:
+        """The label of a checked verdict on a property the manifest expects refuted; None otherwise."""
+        if not self.expect_refuted:
             return None
         if self.refuted:
             return EXPECTED_FAILURE
@@ -254,7 +251,7 @@ class PropertyResult:
 
     @property
     def artifact_paths(self) -> list[str]:
-        """The files Aristotle linked to a property that fails as disproved, such as its counterexample's trace; none
+        """The files Aristotle linked to a property that fails as refuted, such as its counterexample's trace; none
         for any other."""
         if self.declaration is None or not (self.failed and self.refuted):
             return []
@@ -356,7 +353,7 @@ class RunResults:
                     cut=out_of_budget or task_failed or canceled or (timed_out and not never_started),
                     unchecked=unchecked(registered.get(p.id)),
                     assumptions=p.assumptions,
-                    expect_disproved=p.expect_disproved,
+                    expect_refuted=p.expect_refuted,
                 )
                 for p in requested
             ]
@@ -389,7 +386,7 @@ class RunResults:
     @property
     def without_verdict(self) -> list[PropertyResult]:
         """The properties with no verdict, whether in progress, unresolved, unchecked or not registered, which --fail-on
-        no-verdict fails the build on; a disproof the run reported but nothing checked first."""
+        no-verdict fails the build on; a refutation the run reported but nothing checked first."""
         without = [p for p in self.properties if not p.passed and not p.failed]
         return sorted(without, key=lambda p: not (p.unchecked_verdict and p.declaration and refuted(p.declaration)))
 
@@ -495,11 +492,11 @@ class RunResults:
 
     def summary_line(self) -> str:
         """The counts in the words `show` uses, deliberate counterexamples and unexpected proofs apart: proved,
-        disproved, in progress, unresolved, not registered, unknown, and unchecked, with how many of those are
-        disproofs and proofs. In progress counts only IN_PROGRESS, so a property missing from the results doesn't read
+        refuted, in progress, unresolved, not registered, unknown, and unchecked, with how many of those are
+        refutations and proofs. In progress counts only IN_PROGRESS, so a property missing from the results doesn't read
         as work still going."""
-        expected = sum(p.expect_disproved for p in self.passed)
-        unexpected = sum(p.expect_disproved for p in self.failed)
+        expected = sum(p.expect_refuted for p in self.passed)
+        unexpected = sum(p.expect_refuted for p in self.failed)
         unchecked = [p.declaration for p in self.properties if p.unchecked_verdict and p.declaration]
         settled = [p for p in self.without_verdict if not (p.unchecked_verdict and p.declaration)]
         in_progress = sum(
@@ -512,8 +509,8 @@ class RunResults:
         unknown = len(settled) - in_progress - unresolved - not_registered
         line = f"{len(self.passed) - expected} proved, "
         if expected:
-            line += f"{expected} disproved as expected, "
-        line += f"{len(self.failed) - unexpected} disproved, "
+            line += f"{expected} refuted as expected, "
+        line += f"{len(self.failed) - unexpected} refuted, "
         if unexpected:
             line += f"{unexpected} unexpectedly proved, "
         line += f"{in_progress} in progress"
@@ -521,7 +518,7 @@ class RunResults:
             if count:
                 line += f", {count} {word}"
         if unchecked:
-            counts = [(sum(map(refuted, unchecked)), "disproved"), (sum(map(proved, unchecked)), "proved")]
+            counts = [(sum(map(refuted, unchecked)), "refuted"), (sum(map(proved, unchecked)), "proved")]
             line += f", {len(unchecked)} unchecked ({' and '.join(f'{n} {word}' for n, word in counts if n)})"
         return line
 

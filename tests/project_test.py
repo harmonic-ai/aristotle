@@ -4399,8 +4399,8 @@ async def test_a_wait_counts_the_properties_while_the_run_goes_on_and_not_once_i
     counts = _counts(frames)
     assert counts[:3] == [None, None, None]
     shown = [count for count in counts if count is not None]
-    assert shown[0] == "Properties: 0 proved · 0 disproved · 2 in progress"
-    assert shown[-1] == "Properties: 1 proved · 0 disproved · 1 in progress"
+    assert shown[0] == "Properties: 0 proved · 0 refuted · 2 in progress"
+    assert shown[-1] == "Properties: 1 proved · 0 refuted · 1 in progress"
     assert frames[counts.index(shown[0])][3:] == [shown[0], "MESSAGE: Summing up"]
     assert frames[-1][0].startswith("COMPLETE") and counts[-1] is None
     list_properties.assert_awaited_with("proj-wait", DeclarationType.PROPERTY)
@@ -4426,7 +4426,7 @@ async def test_a_property_count_that_fails_keeps_the_last_one_quietly_and_the_wa
     assert len(quiet) > 1 and all(quiet)
     counts = _counts(frames)
     first = next(index for index, count in enumerate(counts) if count is not None)
-    assert set(counts[first:-1]) == {"Properties: 0 proved · 0 disproved · 1 in progress"}
+    assert set(counts[first:-1]) == {"Properties: 0 proved · 0 refuted · 1 in progress"}
     assert "Could not count the project's properties: HTTP 502 after 5 attempts" in caplog.messages
     assert not [record for record in caplog.records if record.levelno >= logging.WARNING]
     assert caplog.messages[-1] == "Task complete!"
@@ -4457,7 +4457,7 @@ async def test_a_proof_an_earlier_run_left_unchecked_counts_as_unchecked_while_t
         )
 
     assert {count for count in _counts(frames) if count is not None} == {
-        "Properties: 1 proved · 0 disproved · 0 in progress · 2 unchecked"
+        "Properties: 1 proved · 0 refuted · 0 in progress · 2 unchecked"
     }
     # The earlier tasks have ended, so the first listing of them serves every count.
     assert list_properties.await_count > 1 and project.get_tasks.await_count == 1

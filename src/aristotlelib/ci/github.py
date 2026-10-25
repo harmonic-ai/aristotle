@@ -59,7 +59,7 @@ def _annotation(
         message = f"{result.name} {result.result_label}"
         if result.description:
             message += f": {result.description}"
-    elif result.failure_reason or result.declaration is None or (result.expect_disproved and result.failed):
+    elif result.failure_reason or result.declaration is None or (result.expect_refuted and result.failed):
         message = f"{result.name} {result.result_label}"
     elif result.refuted:
         message = result.description or f"{result.name} {result.label}"
@@ -369,7 +369,7 @@ def _summary_row(result: PropertyResult, workspace: Path | None) -> str:
     else:
         icon = "⬜"
     assuming = (
-        f"{'Holds, assuming' if result.passed and not result.expect_disproved else 'Assuming:'} {result.assumptions}"
+        f"{'Holds, assuming' if result.passed and not result.expect_refuted else 'Assuming:'} {result.assumptions}"
         if result.assumptions
         else ""
     )

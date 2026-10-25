@@ -13,8 +13,8 @@ from pathlib import Path
 import pytest
 
 from aristotlelib import local_file_utils, wildcard
-from aristotlelib.ci import scope
-from tests.ci.conftest import git, latin1_name, refusing_git, without_git
+from aristotlelib.ci import context, naming, scope
+from tests.ci.conftest import commit_bare_shaped, git, latin1_name, recording_git, refusing_git, without_git
 
 #: Both ways of resolving a run's files, for the behaviour they share.
 RESOLVERS = pytest.mark.parametrize(
@@ -831,6 +831,17 @@ def test_scope_says_git_is_not_installed_rather_than_that_there_is_no_repository
 
 
 @RESOLVERS
+def test_scope_says_git_is_not_installed_for_a_folder_without_a_git_folder(
+    tmp_path: Path, resolve, monkeypatch: pytest.MonkeyPatch
+):
+    """As a checkout made without git leaves it."""
+    monkeypatch.setenv("PATH", str(tmp_path / "no-git-here"))
+
+    with pytest.raises(scope.ScopeError, match="^git is not installed"):
+        resolve(tmp_path)
+
+
+@RESOLVERS
 def test_scope_passes_on_why_git_refuses_another_users_repository(
     git_repo: Path, resolve, monkeypatch: pytest.MonkeyPatch
 ):
@@ -886,6 +897,121 @@ def test_a_checkout_from_a_subdirectory_is_relative_to_it(git_repo: Path):
 
     assert result.upload_files == result.focus_files == [Path("driver.c"), Path("fifo.v")]
     assert result.prefix == "rtl/"
+
+
+@pytest.mark.parametrize(
+    "resolve",
+    [
+        lambda root: scope.resolve(root, scope.Scope.ALL),
+        lambda root: scope.resolve(root, scope.Scope.CHANGED),
+        scope.resolve_checkout,
+    ],
+    ids=["all", "changed", "checkout"],
+)
+def test_a_folder_shaped_like_a_bare_repository_is_listed_from_the_checkouts_repository(git_repo: Path, resolve):
+    hw = commit_bare_shaped(git_repo)
+
+    result = resolve(hw)
+
+    # Sorted as the result is: Windows paths compare ignoring case.
+    assert result.upload_files == sorted(map(Path, ["HEAD", "config", "objects/.keep", "refs/.keep", "top.v"]))
+    assert result.focus_files == [Path("top.v")]
+    assert result.prefix == "hw/"
+
+
+def test_every_git_command_runs_from_the_checkouts_top_with_both_settings(
+    git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    hw = commit_bare_shaped(git_repo)
+    (git_repo / ".gitignore").write_text("*.log\n")
+    (hw / "kept.log").write_text("tracked, then ignored\n")
+    git(git_repo, "add", "-f", ".gitignore", "hw/kept.log")
+    git(git_repo, "commit", "-qm", "a tracked file an ignore rule matches")
+    branch = subprocess.run(
+        ["git", "-C", str(git_repo), "symbolic-ref", "--short", "HEAD"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    git(tmp_path, "clone", "-q", "--bare", str(git_repo), "origin.git")
+    git(git_repo, "remote", "add", "origin", str(tmp_path / "origin.git"))
+    head = scope.head_commit(git_repo)
+    calls = recording_git(monkeypatch)
+
+    scope.resolve(hw, scope.Scope.CHANGED, base_ref=f"origin/{branch}")
+    scope.resolve(hw, scope.Scope.CHANGED, push_before=head)
+    with pytest.raises(scope.ScopeError, match="origin has no branch"):
+        scope.resolve(hw, scope.Scope.CHANGED, base_ref="origin/no-such-branch")
+    scope.warn_held_back(hw, scope.resolve_checkout(hw))
+    naming.default_name(hw, context.CIContext(context.CISystem.LOCAL, hw), "hw/", "ci")
+    local_file_utils.gitignored_files(hw, [Path("kept.log"), Path("top.v")])
+    local_file_utils.left_out_rules(hw, [Path("kept.log")])
+
+    expected = ["git", "-C", str(git_repo.resolve()), "-c", "safe.bareRepository=explicit", "-c", "core.fsmonitor="]
+    assert [argv for argv in calls if argv[: len(expected)] != expected] == []
+    words = {word for argv in calls for word in argv}
+    assert {"ls-files", "diff", "merge-base", "fetch", "cat-file", "ls-remote", "check-ignore", "status"} <= words
+
+
+def test_outside_a_repository_no_git_command_runs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    (tmp_path / "top.v").write_text("module top;\nendmodule\n")
+    calls = recording_git(monkeypatch)
+
+    with pytest.raises(scope.ScopeError, match="is not a git repository"):
+        scope.resolve(tmp_path, scope.Scope.ALL)
+    assert (scope.top_level(tmp_path), scope.head_commit(tmp_path)) == (None, None)
+    assert local_file_utils.gitignored_files(tmp_path, [Path("top.v")]) == set()
+    assert naming.default_name(tmp_path, context.CIContext(context.CISystem.LOCAL, tmp_path), "", "ci") == (
+        f"{tmp_path.name}: ci"
+    )
+    assert calls == []
+
+
+def test_a_linked_worktrees_folder_is_listed_from_the_worktree(
+    git_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    git(git_repo, "worktree", "add", "-q", str(tmp_path / "wt"))
+    calls = recording_git(monkeypatch)
+
+    result = scope.resolve_checkout(tmp_path / "wt" / "rtl")
+
+    assert result.upload_files == [Path("driver.c"), Path("fifo.v")]
+    assert result.prefix == "rtl/"
+    assert {argv[2] for argv in calls} == {str((tmp_path / "wt").resolve())}
+
+
+def test_a_submodules_folder_is_listed_from_the_submodule(
+    git_repo: Path, tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+):
+    library = tmp_path_factory.mktemp("library")
+    git(library, "init", "-q")
+    (library / "rtl").mkdir()
+    (library / "rtl" / "alu.v").write_text("module alu;\nendmodule\n")
+    git(library, "add", "-A")
+    git(library, "-c", "user.email=t@example.com", "-c", "user.name=T", "commit", "-qm", "alu")
+    git(git_repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(library), "lib")
+    git(git_repo, "commit", "-qm", "lib")
+    calls = recording_git(monkeypatch)
+
+    result = scope.resolve_checkout(git_repo / "lib" / "rtl")
+
+    assert result.upload_files == [Path("alu.v")]
+    assert result.prefix == "rtl/"
+    assert {argv[2] for argv in calls} == {str((git_repo / "lib").resolve())}
+
+
+def test_a_git_folder_git_passes_over_leaves_the_prefix_and_build_files_as_git_sees_them(git_repo: Path):
+    """An empty .git, which git looks past to the repository above it."""
+    (git_repo / "lakefile.lean").write_text("-- build\n")
+    (git_repo / "sub" / "hw").mkdir(parents=True)
+    (git_repo / "sub" / "hw" / "Spec.lean").write_text("theorem spec : True := trivial\n")
+    git(git_repo, "add", "-A")
+    git(git_repo, "commit", "-qm", "a Lean project")
+    (git_repo / "lakefile.lean").write_text("-- build, changed\n")
+    git(git_repo, "commit", "-qam", "only the build file")
+    (git_repo / "sub" / ".git").mkdir()
+
+    result = scope.resolve(git_repo / "sub" / "hw", scope.Scope.CHANGED)
+
+    assert result.focus_files == [Path("Spec.lean")]
+    assert result.prefix == "sub/hw/"
 
 
 @pytest.mark.parametrize(
@@ -1021,7 +1147,7 @@ def test_a_fetch_as_root_runs_as_the_checkout_owner(git_repo: Path, monkeypatch:
 
     monkeypatch.setattr(scope.os, "geteuid", lambda: 0, raising=False)
     real_stat = scope.os.stat
-    monkeypatch.setattr(scope.os, "stat", lambda p: os.stat_result((0o40755, 0, 0, 0, 1001, 121, 0, 0, 0, 0)))
+    monkeypatch.setattr(scope.os, "stat", lambda p, **kwargs: os.stat_result((0o40755, 0, 0, 0, 1001, 121, 0, 0, 0, 0)))
     monkeypatch.setattr(scope.subprocess, "run", run)
 
     with pytest.raises(scope.ScopeError):

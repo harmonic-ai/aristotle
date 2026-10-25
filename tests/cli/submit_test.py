@@ -24,7 +24,13 @@ from aristotlelib.api_request import AristotleAPIError
 from aristotlelib.cli.api_action import resume_hint
 from aristotlelib.cli.command.submit import SubmitAction
 from aristotlelib.cli.controller import main
-from aristotlelib.declaration import Declaration, DeclarationSource, DeclarationStatus, DeclarationType
+from aristotlelib.declaration import (
+    Declaration,
+    DeclarationEvidence,
+    DeclarationSource,
+    DeclarationStatus,
+    DeclarationType,
+)
 from aristotlelib.local_file_utils import LeanProjectError
 from aristotlelib.project import AgentQuestionsSetting, Project, ProjectStatus
 from aristotlelib.question import Question
@@ -57,7 +63,7 @@ def properties():
         yield mock
 
 
-def _property(name: str, status: DeclarationStatus) -> Declaration:
+def _property(name: str, status: DeclarationStatus, *, evidence: DeclarationEvidence | None = None) -> Declaration:
     return Declaration(
         project_id=PROJECT_ID,
         declaration_id=f"id-{name}",
@@ -65,6 +71,7 @@ def _property(name: str, status: DeclarationStatus) -> Declaration:
         source=DeclarationSource.USER,
         name=name,
         status=status,
+        evidence=evidence,
         filename="Spec/Property.lean",
         created_at=datetime(2026, 9, 1, 12, 0),
         last_updated=datetime(2026, 9, 1, 12, 0),
@@ -1184,8 +1191,8 @@ async def test_submit_json_prints_the_project_and_its_task(properties, capsys):
 @pytest.mark.parametrize(
     ("status", "code", "counts"),
     [
-        (TaskStatus.COMPLETE, 0, {"proved": 1, "negated": 1, "unchecked": 0}),
-        (TaskStatus.OUT_OF_BUDGET, 1, {"proved": 0, "negated": 0, "unchecked": 2}),
+        (TaskStatus.COMPLETE, 0, {"proved": 1, "refuted": 1, "unchecked": 0}),
+        (TaskStatus.OUT_OF_BUDGET, 1, {"proved": 0, "refuted": 0, "unchecked": 2}),
     ],
 )
 async def test_submit_wait_json_waits_quietly_and_prints_the_finished_run(
@@ -1213,9 +1220,9 @@ async def test_submit_wait_json_waits_quietly_and_prints_the_finished_run(
 
     async def listed(project_id: str, declaration_type: DeclarationType) -> list[Declaration]:
         assert task.status == status
-        fails = _property("Spec.Fails", DeclarationStatus.NEGATED).model_copy(
-            update={"artifact_paths": ["sim/cex.vcd"]}
-        )
+        fails = _property(
+            "Spec.Fails", DeclarationStatus.REFUTED, evidence=DeclarationEvidence.NEGATION_PROVED
+        ).model_copy(update={"artifact_paths": ["sim/cex.vcd"]})
         return [_property("Spec.Holds", DeclarationStatus.PROVED), fails]
 
     properties.side_effect = listed
@@ -1242,12 +1249,9 @@ async def test_submit_wait_json_waits_quietly_and_prints_the_finished_run(
     result = json.loads(capsys.readouterr().out)
     assert result["task"]["status"] == status.value
     assert result["result_path"] == str(archive)
-    disproved = counts["negated"]
     assert result["property_counts"] == {
-        "counterexample": 0,
         "in_progress": 0,
         "unresolved": 0,
-        "disproved": disproved,
         **counts,
     }
     checked = counts["unchecked"] == 0
@@ -1257,6 +1261,8 @@ async def test_submit_wait_json_waits_quietly_and_prints_the_finished_run(
             "name": "Spec.Holds",
             "status": 3,
             "failure_reason": None,
+            "evidence": None,
+            "evidence_message": None,
             "unchecked": not checked,
             "status_name": "PROVED",
             "failure_reason_name": None,
@@ -1270,13 +1276,15 @@ async def test_submit_wait_json_waits_quietly_and_prints_the_finished_run(
             "name": "Spec.Fails",
             "status": 2,
             "failure_reason": None,
+            "evidence": 2,
+            "evidence_message": None,
             "unchecked": not checked,
-            "status_name": "NEGATED",
+            "status_name": "REFUTED",
             "failure_reason_name": None,
             "source": 2,
             "source_name": "USER",
             "artifact_paths": ["sim/cex.vcd"],
-            "outcome": "disproved" if checked else "unchecked",
+            "outcome": "refuted" if checked else "unchecked",
         },
     ]
 
@@ -1587,7 +1595,10 @@ async def test_submit_wait_counts_the_properties_before_saying_where_it_saved_th
 
     async def listed(project_id: str, declaration_type: DeclarationType) -> list[Declaration]:
         assert task.status == TaskStatus.COMPLETE
-        return [_property("Spec.Holds", DeclarationStatus.PROVED), _property("Spec.Fails", DeclarationStatus.NEGATED)]
+        return [
+            _property("Spec.Holds", DeclarationStatus.PROVED),
+            _property("Spec.Fails", DeclarationStatus.REFUTED, evidence=DeclarationEvidence.NEGATION_PROVED),
+        ]
 
     properties.side_effect = listed
     with (
@@ -1601,11 +1612,11 @@ async def test_submit_wait_counts_the_properties_before_saying_where_it_saved_th
 
     saved = f"Saved the project's files to {archive}"
     if json_flag:
-        assert json.loads(capsys.readouterr().out)["property_counts"]["negated"] == 1
+        assert json.loads(capsys.readouterr().out)["property_counts"]["refuted"] == 1
         assert caplog.messages[-1] == saved
         assert not [message for message in caplog.messages if message.startswith("Properties:")]
     else:
-        assert caplog.messages[-2:] == ["Properties: 1 proved · 1 disproved · 0 in progress", saved]
+        assert caplog.messages[-2:] == ["Properties: 1 proved · 1 refuted · 0 in progress", saved]
 
 
 async def test_submit_wait_without_json_keeps_the_interactive_display():

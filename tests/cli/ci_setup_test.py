@@ -34,7 +34,7 @@ from aristotlelib.cli.ci_setup import (
     _without_attributes,
 )
 from aristotlelib.cli.command.ci import CIAction
-from aristotlelib.declaration import DeclarationStatus, DeclarationType
+from aristotlelib.declaration import DeclarationEvidence, DeclarationStatus, DeclarationType
 from aristotlelib.event import EventType
 from aristotlelib.exit_codes import (
     EXIT_INFRASTRUCTURE_ERROR,
@@ -1183,10 +1183,12 @@ def test_dry_run_before_setup_is_refused_before_anything_runs(repo: Path, capsys
     )
 
 
-async def test_each_property_notes_whether_it_was_already_proved_or_disproved(repo: Path, caplog):
+async def test_each_property_notes_whether_it_was_already_proved_or_refuted(repo: Path, caplog):
     declarations = [
         _proposal("holds", "It holds.", 1, status=DeclarationStatus.PROVED, source_file="fifo.v"),
-        _proposal("broken", "It is broken.", 2, status=DeclarationStatus.COUNTEREXAMPLE),
+        _proposal(
+            "broken", "It is broken.", 2, status=DeclarationStatus.REFUTED, evidence=DeclarationEvidence.COUNTEREXAMPLE
+        ),
         _proposal("open", "Not checked.", 3, status=DeclarationStatus.IN_PROGRESS),
     ]
 
@@ -1195,15 +1197,17 @@ async def test_each_property_notes_whether_it_was_already_proved_or_disproved(re
     assert code == EXIT_SUCCESS
     text = (repo / "aristotle.toml").read_text()
     assert "# Fifo.holds (fifo.v); proved when proposed\n" in text
-    assert "# Fifo.broken; disproved by counterexample when proposed, so CI fails on it as it stands\n" in text
+    assert "# Fifo.broken; refuted when proposed, so CI fails on it as it stands\n" in text
     assert "# Fifo.open\n" in text
-    assert "Aristotle already disproved broken, so `aristotle ci` fails on it as it stands." in caplog.text
+    assert "Aristotle already refuted broken, so `aristotle ci` fails on it as it stands." in caplog.text
 
 
 async def test_an_out_of_budget_setup_run_notes_its_verdicts_unchecked(repo: Path, caplog):
     declarations = [
         _proposal("holds", "It holds.", 1, status=DeclarationStatus.PROVED, source_file="fifo.v"),
-        _proposal("broken", "It is broken.", 2, status=DeclarationStatus.COUNTEREXAMPLE),
+        _proposal(
+            "broken", "It is broken.", 2, status=DeclarationStatus.REFUTED, evidence=DeclarationEvidence.COUNTEREXAMPLE
+        ),
     ]
 
     code, _ = await _setup([], declarations, task=_task(TaskStatus.OUT_OF_BUDGET))
@@ -1211,8 +1215,8 @@ async def test_an_out_of_budget_setup_run_notes_its_verdicts_unchecked(repo: Pat
     assert code == EXIT_SUCCESS
     text = (repo / "aristotle.toml").read_text()
     assert "# Fifo.holds (fifo.v); proved when proposed, unchecked\n" in text
-    assert "# Fifo.broken; disproved by counterexample when proposed, unchecked\n" in text
-    assert "already disproved" not in caplog.text
+    assert "# Fifo.broken; refuted when proposed, unchecked\n" in text
+    assert "already refuted" not in caplog.text
 
 
 async def test_an_unchecked_verdict_settles_no_expected_failure_or_deliberate_counterexample(repo: Path, caplog):
@@ -1221,7 +1225,8 @@ async def test_an_unchecked_verdict_settles_no_expected_failure_or_deliberate_co
             "wraps",
             "The count wraps at 16. Expected to fail: it saturates at 15.",
             1,
-            status=DeclarationStatus.COUNTEREXAMPLE,
+            status=DeclarationStatus.REFUTED,
+            evidence=DeclarationEvidence.COUNTEREXAMPLE,
         ),
         _proposal(
             "demo",
@@ -1237,28 +1242,29 @@ async def test_an_unchecked_verdict_settles_no_expected_failure_or_deliberate_co
     assert code == EXIT_SUCCESS
     text = (repo / "aristotle.toml").read_text()
     assert (
-        "# Fifo.wraps; disproved by counterexample when proposed, unchecked; Aristotle expects it to be disproved: it saturates at 15.\n"
+        "# Fifo.wraps; refuted when proposed, unchecked; Aristotle expects it to be refuted: it saturates at 15.\n"
         in text
     )
     assert (
         "# Fifo.demo; proved when proposed, unchecked; a deliberate counterexample, Aristotle says: reset is "
         "synchronous.\n" in text
     )
-    assert [p.expect_disproved for p in manifest.load(repo / "aristotle.toml").properties] == [False, True]
+    assert [p.expect_refuted for p in manifest.load(repo / "aristotle.toml").properties] == [False, True]
     assert (
-        "Aristotle expects wraps to be disproved, so `aristotle ci` would fail on it. A disproved property"
-        in caplog.text
+        "Aristotle expects wraps to be refuted, so `aristotle ci` would fail on it. A refuted property" in caplog.text
     )
-    assert 'Aristotle says demo shows a counterexample on purpose, so it is written with expect = "disproved"' in (
+    assert 'Aristotle says demo shows a counterexample on purpose, so it is written with expect = "refuted"' in (
         caplog.text
     )
-    assert "already disproved" not in caplog.text
+    assert "already refuted" not in caplog.text
 
 
 async def test_from_a_failed_run_notes_its_proofs_unchecked_and_keeps_its_refutations(repo: Path, caplog):
     declarations = [
         _proposal("holds", "It holds.", 1, status=DeclarationStatus.PROVED, source_file="fifo.v"),
-        _proposal("broken", "It is broken.", 2, status=DeclarationStatus.COUNTEREXAMPLE),
+        _proposal(
+            "broken", "It is broken.", 2, status=DeclarationStatus.REFUTED, evidence=DeclarationEvidence.COUNTEREXAMPLE
+        ),
     ]
     args, action = _parse(["setup", "--from", PROJECT_ID])
 
@@ -1274,8 +1280,8 @@ async def test_from_a_failed_run_notes_its_proofs_unchecked_and_keeps_its_refuta
     assert code == EXIT_SUCCESS
     text = (repo / "aristotle.toml").read_text()
     assert "# Fifo.holds (fifo.v); proved when proposed, unchecked\n" in text
-    assert "# Fifo.broken; disproved by counterexample when proposed, so CI fails on it as it stands\n" in text
-    assert "Aristotle already disproved broken, so `aristotle ci` fails on it as it stands." in caplog.text
+    assert "# Fifo.broken; refuted when proposed, so CI fails on it as it stands\n" in text
+    assert "Aristotle already refuted broken, so `aristotle ci` fails on it as it stands." in caplog.text
 
 
 async def test_from_a_project_whose_earlier_runs_cannot_be_listed_writes_nothing(repo: Path, caplog):
@@ -1576,20 +1582,20 @@ async def test_a_property_aristotle_expects_to_fail_is_marked_and_warned_about(r
     ]
     text = (repo / "aristotle.toml").read_text()
     assert (
-        "# Fifo.full_flag (fifo.v); Aristotle expects it to be disproved: full is registered, so it rises a cycle late.\n"
+        "# Fifo.full_flag (fifo.v); Aristotle expects it to be refuted: full is registered, so it rises a cycle late.\n"
     ) in text
     assert "# Fifo.failover (fifo.v)\n" in text
     assert (
-        "Aristotle expects full_flag to be disproved, so `aristotle ci` would fail on it. A disproved property means the code "
+        "Aristotle expects full_flag to be refuted, so `aristotle ci` would fail on it. A refuted property means the code "
         "or the property is wrong" in caplog.text
     )
-    assert [p.expect_disproved for p in manifest.load(repo / "aristotle.toml").properties] == [False, False]
+    assert [p.expect_refuted for p in manifest.load(repo / "aristotle.toml").properties] == [False, False]
 
 
 async def test_a_deliberate_counterexample_is_marked_unless_a_checked_proof_settles_it(repo: Path, caplog):
     shows = "A full FIFO takes no write. Deliberate counterexample: it overwrites."
     declarations = [
-        _proposal("demo", shows, 1, status=DeclarationStatus.NEGATED),
+        _proposal("demo", shows, 1, status=DeclarationStatus.REFUTED, evidence=DeclarationEvidence.NEGATION_PROVED),
         _proposal("fixed", shows, 2, status=DeclarationStatus.PROVED),
         _proposal("pending", shows, 3, status=DeclarationStatus.IN_PROGRESS),
     ]
@@ -1598,15 +1604,15 @@ async def test_a_deliberate_counterexample_is_marked_unless_a_checked_proof_sett
         code, _ = await _setup([], declarations)
 
     assert code == EXIT_SUCCESS
-    assert [p.expect_disproved for p in manifest.load(repo / "aristotle.toml").properties] == [True, False, True]
+    assert [p.expect_refuted for p in manifest.load(repo / "aristotle.toml").properties] == [True, False, True]
     text = (repo / "aristotle.toml").read_text()
-    assert "# Fifo.demo; disproved when proposed, a deliberate counterexample: it overwrites.\n" in text
+    assert "# Fifo.demo; refuted when proposed, a deliberate counterexample: it overwrites.\n" in text
     assert "# Fifo.fixed; proved when proposed\n" in text
     assert "# Fifo.pending; a deliberate counterexample, Aristotle says: it overwrites.\n" in text
-    assert 'unless it is marked expect = "disproved", and on a proved one that is.' in text.splitlines()[2]
-    assert "already disproved" not in caplog.text and "expects" not in caplog.text
+    assert 'unless it is marked expect = "refuted", and on a proved one that is.' in text.splitlines()[2]
+    assert "already refuted" not in caplog.text and "expects" not in caplog.text
     assert (
-        'Aristotle says demo, pending show counterexamples on purpose, so they are written with expect = "disproved"'
+        'Aristotle says demo, pending show counterexamples on purpose, so they are written with expect = "refuted"'
         in caplog.text
     )
     assert "Make sure each one is deliberate: if not, remove that line." in caplog.text
@@ -1630,7 +1636,7 @@ async def test_a_deliberate_counterexample_keeps_what_it_assumes(repo: Path):
 
     assert code == EXIT_SUCCESS
     [written] = manifest.load(repo / "aristotle.toml").properties
-    assert (written.statement, written.assumptions, written.expect_disproved) == ("Full is set.", "pop is low.", True)
+    assert (written.statement, written.assumptions, written.expect_refuted) == ("Full is set.", "pop is low.", True)
 
 
 async def test_a_counterexample_aristotle_also_expects_to_fail_is_not_marked(repo: Path, caplog):
@@ -1640,12 +1646,12 @@ async def test_a_counterexample_aristotle_also_expects_to_fail_is_not_marked(rep
         code, _ = await _setup([], [_proposal("full", description, 1, status=DeclarationStatus.IN_PROGRESS)])
 
     assert code == EXIT_SUCCESS
-    assert [p.expect_disproved for p in manifest.load(repo / "aristotle.toml").properties] == [False]
+    assert [p.expect_refuted for p in manifest.load(repo / "aristotle.toml").properties] == [False]
     assert (
-        "# Fifo.full; Aristotle expects it to be disproved: it is late; Aristotle also calls it a deliberate counterexample: "
+        "# Fifo.full; Aristotle expects it to be refuted: it is late; Aristotle also calls it a deliberate counterexample: "
         "a demo.\n" in (repo / "aristotle.toml").read_text()
     )
-    assert "Aristotle expects full to be disproved, so `aristotle ci` would fail on it." in caplog.text
+    assert "Aristotle expects full to be refuted, so `aristotle ci` would fail on it." in caplog.text
     assert "on purpose" not in caplog.text
 
 
@@ -1680,7 +1686,7 @@ async def test_what_a_property_assumes_goes_under_assumptions_for_either_kind(rt
         (manifest.Kind.NATURAL_LANGUAGE, "In module `fifo` of `rtl/fifo.v`, count resets to 0.", None),
     ]
     assert "  a_no_overflow (sva): fifo.a_no_overflow Assumes: push is held low while rst is high.\n" in caplog.text
-    assert "Aristotle expects bounded to be disproved, so `aristotle ci` would fail on it." in caplog.text
+    assert "Aristotle expects bounded to be refuted, so `aristotle ci` would fail on it." in caplog.text
 
 
 async def test_assumes_and_expected_to_fail_split_in_either_order(rtl: Path):
@@ -1712,8 +1718,8 @@ async def test_assumes_and_expected_to_fail_split_in_either_order(rtl: Path):
         ("full", "no pop."),
     ]
     text = (rtl / "aristotle.toml").read_text()
-    assert "Aristotle expects it to be disproved: count is 3 bits.\n" in text
-    assert "Aristotle expects it to be disproved: late.\n" in text
+    assert "Aristotle expects it to be refuted: count is 3 bits.\n" in text
+    assert "Aristotle expects it to be refuted: late.\n" in text
 
 
 class _FullDisk:

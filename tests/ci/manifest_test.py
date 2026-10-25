@@ -165,12 +165,18 @@ KINDS = "natural_language, sva, c_function_no_ub"
         ),
         pytest.param(
             with_property({**NL, "expect": "proved"}),
-            'requested_properties.p.expect: must be "disproved", the only expectation a property can state',
+            'requested_properties.p.expect: must be "refuted", the only expectation a property can state',
             id="expect-proved",
         ),
         pytest.param(
+            with_property({**NL, "expect": "disproved"}),
+            'requested_properties.p.expect: "disproved" was renamed to "refuted"; '
+            'replace expect = "disproved" with expect = "refuted"',
+            id="expect-old-spelling",
+        ),
+        pytest.param(
             with_property({**NL, "expect": True}),
-            'requested_properties.p.expect: must be "disproved", the only expectation a property can state',
+            'requested_properties.p.expect: must be "refuted", the only expectation a property can state',
             id="expect-not-a-string",
         ),
         pytest.param(
@@ -546,7 +552,7 @@ def test_every_kind_is_written_under_its_own_key():
         RequestedProperty("assertion", Kind.SVA, "top.u_fifo.assert_no_overflow"),
         RequestedProperty("push", Kind.C_FUNCTION_NO_UB, "fifo_push", property_result_id="r-1"),
         RequestedProperty("assumed", Kind.SVA, "top.assert_ack", assumptions='rst is "active high"\nfor one cycle'),
-        RequestedProperty("demo", Kind.NATURAL_LANGUAGE, "The FIFO drops a write when full.", expect_disproved=True),
+        RequestedProperty("demo", Kind.NATURAL_LANGUAGE, "The FIFO drops a write when full.", expect_refuted=True),
     ]
 
     parsed = _round_trip(manifest.render(properties, header=[]))

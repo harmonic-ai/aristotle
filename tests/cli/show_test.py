@@ -20,6 +20,7 @@ from aristotlelib.cli.command.show import ShowAction, broken_proofs_note, format
 from aristotlelib.cli.controller import main
 from aristotlelib.declaration import (
     Declaration,
+    DeclarationEvidence,
     DeclarationFailureReason,
     DeclarationSource,
     DeclarationStatus,
@@ -30,7 +31,7 @@ from aristotlelib.exit_codes import EXIT_INFRASTRUCTURE_ERROR
 from aristotlelib.project import Project, ProjectStatus
 from aristotlelib.question import Question
 from aristotlelib.shell import shell_hint
-from tests.cli.conftest import MockableProject, mockable_project
+from tests.cli.conftest import MockableProject, mockable_project, unknown_evidence_page
 from tests.conftest import fast_api_clock
 
 
@@ -48,7 +49,11 @@ def properties():
         yield mock
 
 
-def _property(status: DeclarationStatus) -> Declaration:
+READ_EVERY_PAGE = Declaration.list_all_for_project
+"""The real fetch, for a test to put back in place of the ``properties`` fixture's."""
+
+
+def _property(status: DeclarationStatus, *, evidence: DeclarationEvidence | None = None) -> Declaration:
     return Declaration(
         project_id="project-123",
         declaration_id=f"p-{status.name}",
@@ -56,6 +61,7 @@ def _property(status: DeclarationStatus) -> Declaration:
         source=DeclarationSource.AGENT,
         name=f"Spec.{status.name}",
         status=status,
+        evidence=evidence,
         filename="Spec/Property.lean",
         created_at=datetime.now(),
         last_updated=datetime.now(),
@@ -280,21 +286,21 @@ async def test_show_action_with_pagination_key():
 # --- property counts in the header ---
 
 
-def test_format_property_counts_counts_counterexamples_as_disproofs_and_says_how_many():
-    statuses = [DeclarationStatus.PROVED] * 4 + [
-        DeclarationStatus.NEGATED,
-        DeclarationStatus.COUNTEREXAMPLE,
-        DeclarationStatus.IN_PROGRESS,
-        DeclarationStatus.UNKNOWN,
-    ]
-
-    # A counterexample disproves the property with concrete inputs; UNKNOWN is not counted.
-    assert (
-        format_property_counts([_property(s) for s in statuses])
-        == "4 proved · 2 disproved (1 by counterexample) · 1 in progress"
+def test_format_property_counts_counts_each_refuted_property_once():
+    declarations = (
+        [_property(DeclarationStatus.PROVED)] * 4
+        + [
+            _property(DeclarationStatus.REFUTED, evidence=evidence)
+            for evidence in DeclarationEvidence
+            if evidence != DeclarationEvidence.UNKNOWN
+        ]
+        + [_property(DeclarationStatus.IN_PROGRESS), _property(DeclarationStatus.UNKNOWN)]
     )
-    two = [_property(DeclarationStatus.COUNTEREXAMPLE)] * 2
-    assert format_property_counts(two) == "0 proved · 2 disproved (2 by counterexample) · 0 in progress"
+
+    # Every evidence kind counts as one refuted property; UNKNOWN is not counted.
+    assert format_property_counts(declarations) == "4 proved · 3 refuted · 1 in progress"
+    two = [_property(DeclarationStatus.REFUTED, evidence=DeclarationEvidence.COUNTEREXAMPLE)] * 2
+    assert format_property_counts(two) == "0 proved · 2 refuted · 0 in progress"
 
 
 def _failed(reason: DeclarationFailureReason) -> Declaration:
@@ -333,7 +339,7 @@ async def test_show_follows_the_counts_with_the_broken_proofs_note(properties, c
         await action.run_action(action.parser.parse_args(["project-123", "--task", "task-789"]))
 
     assert caplog.messages[-2:] == [
-        "Properties: 1 proved · 0 disproved · 0 in progress · 1 unresolved",
+        "Properties: 1 proved · 0 refuted · 0 in progress · 1 unresolved",
         "The proof of 1 property no longer checks, so it isn't verified; re-run to re-prove it.",
     ]
 
@@ -341,13 +347,16 @@ async def test_show_follows_the_counts_with_the_broken_proofs_note(properties, c
 @pytest.mark.parametrize(
     ("task_status", "expected"),
     [
-        (TaskStatus.COMPLETE, "1 proved · 1 disproved · 0 in progress"),
-        (TaskStatus.CANCELED, "0 proved · 1 disproved · 0 in progress · 1 unchecked"),
-        (TaskStatus.OUT_OF_BUDGET, "0 proved · 0 disproved · 0 in progress · 2 unchecked"),
+        (TaskStatus.COMPLETE, "1 proved · 1 refuted · 0 in progress"),
+        (TaskStatus.CANCELED, "0 proved · 1 refuted · 0 in progress · 1 unchecked"),
+        (TaskStatus.OUT_OF_BUDGET, "0 proved · 0 refuted · 0 in progress · 2 unchecked"),
     ],
 )
 def test_format_property_counts_counts_what_aristotle_never_checked_as_unchecked(task_status, expected):
-    declarations = [_property(DeclarationStatus.PROVED), _property(DeclarationStatus.NEGATED)]
+    declarations = [
+        _property(DeclarationStatus.PROVED),
+        _property(DeclarationStatus.REFUTED, evidence=DeclarationEvidence.NEGATION_PROVED),
+    ]
     task = _completed_task()
     task.status = task_status
 
@@ -355,16 +364,18 @@ def test_format_property_counts_counts_what_aristotle_never_checked_as_unchecked
 
 
 def test_format_property_counts_mentions_failures_only_when_there_are_some():
-    assert format_property_counts([]) == "0 proved · 0 disproved · 0 in progress"
+    assert format_property_counts([]) == "0 proved · 0 refuted · 0 in progress"
     assert (
         format_property_counts([_property(DeclarationStatus.FAILED)])
-        == "0 proved · 0 disproved · 0 in progress · 1 unresolved"
+        == "0 proved · 0 refuted · 0 in progress · 1 unresolved"
     )
 
 
 async def test_show_action_heads_the_display_with_property_counts(properties, caplog):
     caplog.set_level(logging.INFO)
-    properties.return_value = [_property(DeclarationStatus.PROVED)] * 4 + [_property(DeclarationStatus.NEGATED)]
+    properties.return_value = [_property(DeclarationStatus.PROVED)] * 4 + [
+        _property(DeclarationStatus.REFUTED, evidence=DeclarationEvidence.NEGATION_PROVED)
+    ]
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers()
     action = ShowAction(subparsers)
@@ -381,13 +392,16 @@ async def test_show_action_heads_the_display_with_property_counts(properties, ca
 
     # The kind filter is server-side.
     properties.assert_called_once_with("project-123", declaration_type=DeclarationType.PROPERTY)
-    assert "4 proved · 1 disproved · 0 in progress" in caplog.text
+    assert "4 proved · 1 refuted · 0 in progress" in caplog.text
     mock_task.show.assert_called_once()
 
 
 async def test_show_counts_the_proofs_a_canceled_task_left_unchecked(properties, caplog):
     caplog.set_level(logging.INFO)
-    properties.return_value = [_property(DeclarationStatus.PROVED), _property(DeclarationStatus.NEGATED)]
+    properties.return_value = [
+        _property(DeclarationStatus.PROVED),
+        _property(DeclarationStatus.REFUTED, evidence=DeclarationEvidence.NEGATION_PROVED),
+    ]
     action = ShowAction(argparse.ArgumentParser().add_subparsers())
     action.add_action_arguments()
     task = _completed_task()
@@ -396,14 +410,14 @@ async def test_show_counts_the_proofs_a_canceled_task_left_unchecked(properties,
     with patch("aristotlelib.cli.command.show.Project.from_id", return_value=_project_with(task)):
         await action.run_action(action.parser.parse_args(["project-123"]))
 
-    assert "Properties: 0 proved · 1 disproved · 0 in progress · 1 unchecked" in caplog.messages
+    assert "Properties: 0 proved · 1 refuted · 0 in progress · 1 unchecked" in caplog.messages
 
 
 @pytest.mark.parametrize(
     ("first", "expected"),
     [
-        (TaskStatus.COMPLETE, "Properties: 1 proved · 1 disproved · 0 in progress"),
-        (TaskStatus.CANCELED, "Properties: 0 proved · 1 disproved · 0 in progress · 1 unchecked"),
+        (TaskStatus.COMPLETE, "Properties: 1 proved · 1 refuted · 0 in progress"),
+        (TaskStatus.CANCELED, "Properties: 0 proved · 1 refuted · 0 in progress · 1 unchecked"),
     ],
     ids=["set by a task that finished", "set by a cancelled task"],
 )
@@ -411,7 +425,10 @@ async def test_show_judges_the_verdicts_before_a_cancelled_follow_up_by_the_task
     properties, caplog, first: TaskStatus, expected: str
 ):
     caplog.set_level(logging.INFO)
-    properties.return_value = [_property(DeclarationStatus.PROVED), _property(DeclarationStatus.NEGATED)]
+    properties.return_value = [
+        _property(DeclarationStatus.PROVED),
+        _property(DeclarationStatus.REFUTED, evidence=DeclarationEvidence.NEGATION_PROVED),
+    ]
     action = ShowAction(argparse.ArgumentParser().add_subparsers())
     action.add_action_arguments()
     setter = _completed_task(task_id="task-first")
@@ -443,7 +460,7 @@ async def test_show_task_counts_by_the_latest_task_whose_end_the_properties_stan
     ):
         await action.run_action(action.parser.parse_args(["project-123", "--task", "task-old"]))
 
-    assert "Properties: 0 proved · 0 disproved · 0 in progress · 1 unchecked" in caplog.messages
+    assert "Properties: 0 proved · 0 refuted · 0 in progress · 1 unchecked" in caplog.messages
     older.show.assert_awaited_once()
 
 
@@ -483,7 +500,7 @@ async def test_show_action_with_specific_task_id_also_shows_counts(properties, c
         await action.run_action(args)
 
     properties.assert_called_once_with("project-123", declaration_type=DeclarationType.PROPERTY)
-    assert "0 proved · 0 disproved · 1 in progress · 1 unresolved" in caplog.text
+    assert "0 proved · 0 refuted · 1 in progress · 1 unresolved" in caplog.text
     mock_task.show.assert_called_once()
 
 
@@ -647,9 +664,9 @@ def _get_them(destination: str = SPACED) -> str:
 @pytest.mark.parametrize(
     ("status", "counts", "code"),
     [
-        (TaskStatus.COMPLETE, "1 proved · 1 disproved · 0 in progress", 0),
+        (TaskStatus.COMPLETE, "1 proved · 1 refuted · 0 in progress", 0),
         # The counts stand as the task's end left them checked.
-        (TaskStatus.OUT_OF_BUDGET, "0 proved · 0 disproved · 0 in progress · 2 unchecked", 1),
+        (TaskStatus.OUT_OF_BUDGET, "0 proved · 0 refuted · 0 in progress · 2 unchecked", 1),
     ],
     ids=["complete", "out of budget"],
 )
@@ -664,7 +681,10 @@ async def test_show_counts_the_properties_once_it_has_followed_a_running_task_to
 
     async def listed(project_id: str, declaration_type: DeclarationType) -> list[Declaration]:
         assert task.status == status
-        return [_property(DeclarationStatus.PROVED), _property(DeclarationStatus.NEGATED)]
+        return [
+            _property(DeclarationStatus.PROVED),
+            _property(DeclarationStatus.REFUTED, evidence=DeclarationEvidence.NEGATION_PROVED),
+        ]
 
     properties.side_effect = listed
     with (
@@ -718,7 +738,7 @@ async def test_a_followed_task_still_running_gets_the_counts_but_no_download_com
         assert await action.run_action(action.parser.parse_args(["project-123", "--task", "task-456"])) == 3
 
     from_id.assert_not_called()
-    assert caplog.messages[-1] == "Properties: 0 proved · 0 disproved · 1 in progress"
+    assert caplog.messages[-1] == "Properties: 0 proved · 0 refuted · 1 in progress"
 
 
 async def test_show_of_a_finished_task_does_not_say_how_to_get_the_files(caplog):
@@ -917,7 +937,7 @@ async def _show_json(argv: list[str], task: AgentTask | None, events=None, pagin
 
 
 async def test_json_prints_a_running_task_without_waiting_for_it(properties, capsys):
-    counterexample = _property(DeclarationStatus.COUNTEREXAMPLE).model_copy(
+    counterexample = _property(DeclarationStatus.REFUTED, evidence=DeclarationEvidence.COUNTEREXAMPLE).model_copy(
         update={"artifact_paths": ["sim/cex.vcd", "sim/cex_tb.sv"]}
     )
     properties.return_value = [_property(DeclarationStatus.PROVED), counterexample]
@@ -941,6 +961,8 @@ async def test_json_prints_a_running_task_without_waiting_for_it(properties, cap
             "name": "Spec.PROVED",
             "status": 3,
             "failure_reason": None,
+            "evidence": None,
+            "evidence_message": None,
             "unchecked": False,
             "status_name": "PROVED",
             "failure_reason_name": None,
@@ -950,17 +972,19 @@ async def test_json_prints_a_running_task_without_waiting_for_it(properties, cap
             "outcome": "proved",
         },
         {
-            "declaration_id": "p-COUNTEREXAMPLE",
-            "name": "Spec.COUNTEREXAMPLE",
-            "status": 5,
+            "declaration_id": "p-REFUTED",
+            "name": "Spec.REFUTED",
+            "status": 2,
             "failure_reason": None,
+            "evidence": 1,
+            "evidence_message": None,
             "unchecked": False,
-            "status_name": "COUNTEREXAMPLE",
+            "status_name": "REFUTED",
             "failure_reason_name": None,
             "source": 1,
             "source_name": "AGENT",
             "artifact_paths": ["sim/cex.vcd", "sim/cex_tb.sv"],
-            "outcome": "disproved",
+            "outcome": "refuted",
         },
     ]
 
@@ -1008,12 +1032,10 @@ async def test_json_for_an_idle_task_has_no_events_unless_a_limit_asks(capsys):
     assert snapshot["events"] == []
     assert snapshot["property_counts"] == {
         "proved": 0,
-        "negated": 0,
-        "counterexample": 0,
         "in_progress": 0,
         "unresolved": 0,
         "unchecked": 0,
-        "disproved": 0,
+        "refuted": 0,
     }
 
 
@@ -1104,7 +1126,7 @@ async def test_text_for_an_older_task_warns_when_the_latest_task_cannot_be_fetch
         assert await action.run_action(action.parser.parse_args(["project-123", "--task", "task-456"])) is None
 
     assert any("latest task couldn't be fetched, so the counts go by task task-456" in m for m in caplog.messages)
-    assert "Properties: 1 proved · 0 disproved · 0 in progress" in caplog.messages
+    assert "Properties: 1 proved · 0 refuted · 0 in progress" in caplog.messages
 
 
 async def test_json_with_a_task_of_another_project_prints_nothing_and_exits_4(capsys):
@@ -1730,6 +1752,38 @@ def test_show_json_exits_0_when_a_request_gets_a_429_or_times_out_twice_then_suc
     assert len(requests) == len(failures) + 2
 
 
+@pytest.mark.parametrize("json_flag", [[], ["--json"]], ids=["text", "--json"])
+def test_show_counts_a_refutation_whose_evidence_kind_this_version_does_not_know(
+    json_flag, properties, api_server, capsys, caplog
+):
+    caplog.set_level(logging.INFO)
+    properties.side_effect = READ_EVERY_PAGE
+
+    def serve(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/declarations"):
+            return unknown_evidence_page(RETRIED_ID)
+        if path.endswith("/tasks"):
+            return _finished_tasks()
+        if path.endswith("/events"):
+            return httpx.Response(200, json={"events": [], "pagination_key": None})
+        return _project_record()
+
+    api_server(*[serve] * 20)
+
+    with patch("sys.argv", ["aristotle", "show", RETRIED_ID, *json_flag]):
+        assert main() == 0
+
+    out, err = capsys.readouterr()
+    assert "Traceback" not in err
+    if json_flag:
+        snapshot = json.loads(out)
+        assert snapshot["property_counts"]["refuted"] == 1
+        assert [p["evidence"] for p in snapshot["properties"]] == [0]
+    else:
+        assert "Properties: 0 proved · 1 refuted · 0 in progress" in caplog.messages
+
+
 @pytest.mark.parametrize(
     ("failure", "code", "message"),
     [
@@ -2010,7 +2064,7 @@ async def test_a_non_interactive_show_prints_the_project_as_it_stands_once_the_w
     [
         ([DeclarationSource.USER, DeclarationSource.USER], None),
         ([DeclarationSource.AGENT, DeclarationSource.AGENT], None),
-        ([DeclarationSource.USER, DeclarationSource.AGENT], "You asked for 1: 1 proved · 0 disproved · 0 in progress"),
+        ([DeclarationSource.USER, DeclarationSource.AGENT], "You asked for 1: 1 proved · 0 refuted · 0 in progress"),
     ],
     ids=["all asked for", "all suggested", "some of each"],
 )
@@ -2023,7 +2077,7 @@ def test_the_counts_add_the_ones_you_asked_for_when_aristotle_suggested_others(s
     with caplog.at_level(logging.INFO):
         log_property_counts(properties, ())
 
-    assert caplog.messages == ["Properties: 2 proved · 0 disproved · 0 in progress", *([asked] if asked else [])]
+    assert caplog.messages == ["Properties: 2 proved · 0 refuted · 0 in progress", *([asked] if asked else [])]
 
 
 @pytest.mark.parametrize("flags", [["--non-interactive"], ["--wait", "--json"]], ids=" ".join)
@@ -2170,7 +2224,7 @@ async def test_the_counts_line_warns_when_the_tasks_that_set_them_cannot_be_list
         assert await action.run_action(action.parser.parse_args(["project-123"])) is None
 
     assert any("couldn't all be listed" in m and "may count as checked" in m for m in caplog.messages)
-    assert "Properties: 1 proved · 0 disproved · 0 in progress" in caplog.messages
+    assert "Properties: 1 proved · 0 refuted · 0 in progress" in caplog.messages
 
 
 async def test_a_resumed_wait_saves_the_files_before_it_reports_properties_it_couldnt_judge(

@@ -13,8 +13,10 @@ from aristotlelib.api_request import AristotleAPIError
 from aristotlelib.cli.api_action import fetch_tasks
 from aristotlelib.cli.command.properties import shown_names
 from aristotlelib.cli.command.property import PropertyAction, find_by_name
+from aristotlelib.cli.controller import main
 from aristotlelib.declaration import (
     Declaration,
+    DeclarationEvidence,
     DeclarationFailureReason,
     DeclarationSource,
     DeclarationStatus,
@@ -22,6 +24,7 @@ from aristotlelib.declaration import (
 )
 from aristotlelib.project import Project
 from aristotlelib.results import DeclarationRecord
+from tests.cli.conftest import UNKNOWN_EVIDENCE_NAME, unknown_evidence_page
 
 LIST_ALL = "aristotlelib.cli.command.property.Declaration.list_all_for_project"
 
@@ -86,6 +89,7 @@ async def test_exact_name_prints_the_full_record(capsys, monkeypatch):
     assert lines[0] == "Spec.Arbiter.NoDoubleGrant"
     assert "Kind:          property" in lines
     assert "Status:        PROVED" in lines
+    assert "Evidence:      -" in lines
     assert "Created by:    Aristotle" in lines
     assert "Source:        rtl/arbiter.sv:42" in lines
     assert "Anchor:        assign grant = req & ~busy;" in lines
@@ -97,7 +101,8 @@ async def test_exact_name_prints_the_full_record(capsys, monkeypatch):
     assert "UTC (1 hour ago)" in updated
     assert "Description:\n  The arbiter never grants two requesters at once.\n" in out
     # Lean code is printed verbatim.
-    assert out.endswith("Lean statement:\ntheorem NoDoubleGrant : ∀ t, ¬ (grant0 t ∧ grant1 t) := by\n  simp\n")
+    assert "Lean statement:\ntheorem NoDoubleGrant : ∀ t, ¬ (grant0 t ∧ grant1 t) := by\n  simp\n" in out
+    assert out.endswith("Artifacts:     -\n")
 
 
 async def test_the_web_link_follows_the_selected_deployment(capsys, monkeypatch):
@@ -240,7 +245,8 @@ async def test_missing_optional_fields_show_as_dashes(capsys):
     assert "Source:        -" in lines
     assert "Anchor:        -" in lines
     assert "Description:   -" in lines
-    assert out.endswith("Lean statement:\n-\n")
+    assert "Lean statement:\n-\n" in out
+    assert out.endswith("Artifacts:     -\n")
 
 
 async def test_definitions_and_failures_are_described_too(capsys):
@@ -366,7 +372,12 @@ async def test_two_properties_with_one_name_are_told_apart_by_id(capsys, caplog)
     caplog.set_level(logging.ERROR)
     twins = [
         _declaration("ring_peek_many", declaration_id="prop-ring-peek-many"),
-        _declaration("ring_peek_many", declaration_id="prop-ring-peek-many-2", status=DeclarationStatus.COUNTEREXAMPLE),
+        _declaration(
+            "ring_peek_many",
+            declaration_id="prop-ring-peek-many-2",
+            status=DeclarationStatus.REFUTED,
+            evidence=DeclarationEvidence.COUNTEREXAMPLE,
+        ),
     ]
 
     assert (await _run(["project-123", "ring_peek_many"], twins)).exit_code == 2
@@ -382,7 +393,8 @@ async def test_two_properties_with_one_name_are_told_apart_by_id(capsys, caplog)
 
     out = capsys.readouterr().out
     assert out.splitlines()[0] == "ring_peek_many"
-    assert "Status:        DISPROVED (counterexample)" in out
+    assert "Status:        REFUTED\n" in out
+    assert "Evidence:      COUNTEREXAMPLE" in out
     assert caplog.text == ""
 
 
@@ -432,24 +444,75 @@ async def test_other_api_errors_still_reach_the_generic_handler():
 
 async def test_the_record_lists_the_artifacts_and_the_command_that_downloads_them(capsys, caplog):
     caplog.set_level(logging.INFO)
+    message = "Refuted by a counterexample and a formal Lean proof of the negation (internal). See the VCD trace in Artifacts."
     linked = _declaration(
-        status=DeclarationStatus.NEGATED, artifact_paths=["sim/cex.vcd", "sim/cex_tb.sv", "sim/run_cex.sh"]
+        status=DeclarationStatus.REFUTED,
+        evidence=DeclarationEvidence.BOTH,
+        evidence_message=message,
+        artifact_paths=["sim/cex.vcd", "sim/cex_tb.sv", "sim/run_cex.sh"],
     )
 
     await _run(["project-123", "Spec.Arbiter.NoDoubleGrant"], [linked])
 
     lines = capsys.readouterr().out.splitlines()
-    generated = lines.index("Generated:     Spec/Property.lean")
-    assert lines[generated + 1 : generated + 5] == [
+    assert "Status:        REFUTED" in lines
+    assert "Evidence:      BOTH" in lines
+    assert "Generated:     Spec/Property.lean" in lines
+    evidence = lines.index("Refutation evidence:")
+    assert lines.index("Description:") < lines.index("Lean statement:") < evidence
+    assert lines[evidence + 1 :] == [
+        f"  {message}",
+        "",
         "Artifacts:     sim/cex.vcd",
         "               sim/cex_tb.sv",
         "               sim/run_cex.sh",
-        "Web:           https://aristotle.harmonic.fun/projects/project-123",
     ]
     assert caplog.messages == [
         "\nDownload them with:\n"
         "  aristotle download project-123 --artifact sim/cex.vcd --artifact sim/cex_tb.sv --artifact sim/run_cex.sh"
     ]
+
+
+@pytest.mark.parametrize(
+    ("kind", "status"),
+    [
+        (DeclarationType.PROPERTY, DeclarationStatus.PROVED),
+        (DeclarationType.PROPERTY, DeclarationStatus.FAILED),
+        (DeclarationType.PROPERTY, DeclarationStatus.IN_PROGRESS),
+        (DeclarationType.DEFINITION, DeclarationStatus.REFUTED),
+    ],
+)
+async def test_non_refuted_properties_and_definitions_do_not_show_evidence(kind, status, capsys):
+    message = "A stale refutation message."
+    declaration = _declaration(
+        declaration_type=kind, status=status, evidence=DeclarationEvidence.BOTH, evidence_message=message
+    )
+
+    await _run(["project-123", declaration.name], [declaration])
+
+    out = capsys.readouterr().out
+    assert "Evidence:      -" in out
+    assert "Refutation evidence:" not in out
+    assert message not in out
+
+
+@pytest.mark.parametrize("json_flag", [[], ["--json"]], ids=["text", "--json"])
+def test_an_evidence_kind_this_version_does_not_know_reads_as_unknown(json_flag, api_server, capsys):
+    project_id = "5f2b8c1e-3d4a-4b6c-8e9f-0a1b2c3d4e5f"
+    api_server(unknown_evidence_page(project_id))
+
+    with patch("sys.argv", ["aristotle", "property", project_id, UNKNOWN_EVIDENCE_NAME, *json_flag]):
+        assert main() == 0
+
+    out, err = capsys.readouterr()
+    assert "Traceback" not in err
+    if json_flag:
+        record = json.loads(out)
+        assert (record["status_name"], record["evidence"]) == ("REFUTED", 0)
+        assert DeclarationRecord.model_validate_json(out).evidence is DeclarationEvidence.UNKNOWN
+    else:
+        assert "Evidence:      UNKNOWN" in out.splitlines()
+        assert "Refuted by a kind of evidence added after this version." in out
 
 
 async def test_a_record_without_artifacts_shows_a_dash_and_no_command(capsys, caplog):
@@ -494,8 +557,17 @@ async def test_no_command_follows_when_this_system_can_save_none_of_them(capsys,
 
 
 async def test_json_carries_the_artifact_paths(capsys):
-    linked = _declaration(status=DeclarationStatus.NEGATED, artifact_paths=["sim/cex.vcd"])
+    message = "Refuted by a counterexample. See the VCD trace in Artifacts."
+    linked = _declaration(
+        status=DeclarationStatus.REFUTED,
+        evidence=DeclarationEvidence.COUNTEREXAMPLE,
+        evidence_message=message,
+        artifact_paths=["sim/cex.vcd"],
+    )
 
     await _run(["project-123", "Spec.Arbiter.NoDoubleGrant", "--json"], [linked])
 
-    assert json.loads(capsys.readouterr().out)["artifact_paths"] == ["sim/cex.vcd"]
+    record = json.loads(capsys.readouterr().out)
+    assert record["artifact_paths"] == ["sim/cex.vcd"]
+    assert record["evidence"] == DeclarationEvidence.COUNTEREXAMPLE
+    assert record["evidence_message"] == message

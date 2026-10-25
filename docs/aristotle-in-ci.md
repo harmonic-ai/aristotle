@@ -41,11 +41,11 @@ has Aristotle propose a first list for you to review.
 **2. Add one step to your pipeline.** One container image, the same one for every CI system.
 
 **3. Aristotle proves each property against the checkout.** It formalizes the property and
-attempts to prove it, or to disprove it when it does not hold.
+attempts to prove it, or to refute it when it does not hold.
 
 **4. Results come back as tests.** Each property is a test case named by its id. Proved is
-green. A disproved property is red, and the run's summary usually describes the counterexample
-Aristotle found; a property marked `expect = "disproved"` turns that around. Your CI renders it natively — no plugin, no new UI.
+green. A refuted property is red, and the run's summary usually describes the counterexample
+Aristotle found; a property marked `expect = "refuted"` turns that around. Your CI renders it natively — no plugin, no new UI.
 
 For an open-ended audit, where Aristotle works out what should hold instead of checking a list,
 see [`aristotle review`](#aristotle-review).
@@ -89,7 +89,7 @@ identifier = "fifo_push"
 | `identifier` | One name, with no spaces: the labelled concurrent SystemVerilog assertion that must hold (`sva`), or the C function that must have no undefined behavior (`c_function_no_ub`). An `sva` property names an assertion written `<label>: assert property (...)`, by its label, optionally after its module (`fifo.a_no_overflow`). An immediate assertion (`assert (...)`, `assert #0`, `assert final`) or an unlabelled one can't be named: state it as `natural_language`. |
 | `assumptions` | Optional. What the property is checked under, in plain language, such as an answer to one of Aristotle's questions. It goes to the run with the property, and the log, the JUnit report and the job summary show it with the verdict, as "holds, assuming …" for an ordinary pass. It's the only place for such answers on an `sva` property, whose statement is the assertion's name. |
 | `check.max_wall_time_seconds` | The time budget in whole seconds, from 1 to 604800 (a week). It applies when the `timeout` input, `--timeout` and `ARISTOTLE_TIMEOUT` are all unset; when this is unset too, the budget is 60 minutes. |
-| `expect` | Optional, and only `"disproved"`: a deliberate counterexample. A disproof of it passes, reported as `disproved, as expected`; a proof of it fails, as `unexpectedly proved: update the manifest`, since the counterexample is gone, usually because the bug was fixed. Without a checked verdict it has none, as any property. |
+| `expect` | Optional, and only `"refuted"`: a deliberate counterexample. A refutation of it passes, reported as `refuted, as expected`; a proof of it fails, as `unexpectedly proved: update the manifest`, since the counterexample is gone, usually because the bug was fixed. Without a checked verdict it has none, as any property. |
 | `repo_id`, `check.max_cost_dollars`, `check.enable_proof_repair`, `property_result_id` | Accepted but not yet enforced: a manifest may set them, and the log lists the ones it sets. `repo_id` and a property's `property_result_id` are non-empty strings, `max_cost_dollars` a positive number, and `enable_proof_repair` `true` or `false`. |
 
 The manifest is TOML 1.0, which the image's Python parses; syntax new in TOML 1.1, such as an
@@ -126,13 +126,13 @@ labelled SystemVerilog assertion already in the code is written as `sva`, naming
 when it says it is that assertion: its name ends with the label, or its description opens by
 saying the assertion holds. What a property holds under, such as an answer you gave, goes under
 its `assumptions`. Aristotle is asked to propose rather than prove, but it may check
-some as it goes; the comment says when a property was already proved or disproved, or when
-Aristotle expects it to be disproved, and the command warns about both, since `aristotle ci` would fail
+some as it goes; the comment says when a property was already proved or refuted, or when
+Aristotle expects it to be refuted, and the command warns about both, since `aristotle ci` would fail
 on them. A property Aristotle says shows its counterexample on purpose, as a demonstration does,
-is written with `expect = "disproved"` instead, unless a checked proof settles it, and the command
+is written with `expect = "refuted"` instead, unless a checked proof settles it, and the command
 names it so you can make sure it is deliberate. A verdict the run never checked is noted as unchecked instead: any from a setup run that
-ran out of budget, and a proof from one that failed or was cancelled. A disproof noted so draws
-no warning unless Aristotle also expects the property to be disproved, or calls it a deliberate
+ran out of budget, and a proof from one that failed or was cancelled. A refutation noted so draws
+no warning unless Aristotle also expects the property to be refuted, or calls it a deliberate
 counterexample. A property with both sentences isn't marked. Review and edit the file, check it
 with `aristotle ci --dry-run`, which starts no run, then commit it:
 
@@ -188,8 +188,8 @@ have been granted access to it.
 **Before the 3.0.0 release.** `:3` and `@v3` don't exist until 3.0.0 is released: the release
 candidates are tagged with their exact version, `3.0.0rc` and a number, and the repository's
 releases list them. Until then, pin the release candidate you were given: for example
-`ghcr.io/harmonic-ai/aristotle:3.0.0rc12` in the GitLab and Jenkins recipes, and
-`uses: harmonic-ai/aristotle@v3.0.0rc12` in the GitHub workflow. The image is private until
+`ghcr.io/harmonic-ai/aristotle:3.0.0rc13` in the GitLab and Jenkins recipes, and
+`uses: harmonic-ai/aristotle@v3.0.0rc13` in the GitHub workflow. The image is private until
 then too, so GitLab and Jenkins need a token that can read packages to pull it: in GitLab, a
 `DOCKER_AUTH_CONFIG` CI/CD variable for `ghcr.io`; in Jenkins, `registryUrl 'https://ghcr.io'` and
 `registryCredentialsId` on the `docker` agent. The Action builds its image on the runner, so a
@@ -414,12 +414,12 @@ A build log that reads like a test run, one line per property in the manifest:
 
 ```
 Aristotle — formal verification
-  2 proved, 1 disproved, 1 in progress
+  2 proved, 1 refuted, 1 in progress
 
   PASS  arbiter_one_grant
   PASS  fifo_push_no_ub
 
-  FAIL  [disproved] fifo_no_overflow
+  FAIL  [refuted] fifo_no_overflow
       rtl/async_fifo.v:118
       The write pointer never passes the read pointer: a write to a full FIFO is dropped.
       Artifacts:
@@ -440,7 +440,7 @@ Aristotle — formal verification
   Full run: https://aristotle.harmonic.fun/projects/<project-id>
 ```
 
-A property in the manifest is proved (pass), disproved, by counterexample too (fail), or left
+A property in the manifest is proved (pass), refuted (fail), or left
 without a verdict. It is in progress when the run finished without checking it, or the time budget
 ran out with the run left going. It is unresolved when the run ended short of it, by failing,
 running out of budget, being cancelled (as the step cancels it when the time budget runs out) or
@@ -448,11 +448,11 @@ finishing without completing the request (as when Aristotle stops it for questio
 proof no longer checks, so a re-run should re-prove it. The annotation and JUnit entry of a property still
 in progress say so, and why, before its statement. A run that stopped short of checked
 verdicts is an error in the JUnit report, with the reason: one Aristotle stopped for questions, one that
-ran out of budget or time, failed or was cancelled, and one that never started. A property with `expect = "disproved"`, a
-deliberate counterexample, turns that around: a disproof passes, as `disproved, as expected`, and a
-proof fails, as `unexpectedly proved: update the manifest`. A disproved property means the code or the
+ran out of budget or time, failed or was cancelled, and one that never started. A property with `expect = "refuted"`, a
+deliberate counterexample, turns that around: a refutation passes, as `refuted, as expected`, and a
+proof fails, as `unexpectedly proved: update the manifest`. A refuted property means the code or the
 property is wrong: fix the code, correct the property if it doesn't state what you want, or, if the
-counterexample is deliberate, mark it `expect = "disproved"`. Don't drop or weaken a correct property
+counterexample is deliberate, mark it `expect = "refuted"`. Don't drop or weaken a correct property
 to get a passing build. Under the default `fail-on`, a property without a verdict doesn't fail the
 build: the log names those properties and says the build still passes, and `fail-on: no-verdict`
 fails it on them, in progress, unresolved or unchecked.
@@ -464,14 +464,14 @@ If Verilog or C isn't enabled for the account, Aristotle leaves that code out of
 says so: the step asks Aristotle. It can't ask about Rust, so it names Rust as a possibility. Only
 `fail-on: never` lets such a run pass. Aristotle checks a
 run's results when the run finishes, so a run that runs out of budget, or hits the time budget,
-reports what it reached as unchecked: a proof or disproof it reported has no verdict, labelled
-`proved, unchecked` or `disproved, unchecked`, and the step fails with `3`: for a run the time
+reports what it reached as unchecked: a proof or refutation it reported has no verdict, labelled
+`proved, unchecked` or `refuted, unchecked`, and the step fails with `3`: for a run the time
 budget cut, whatever `fail-on` is, and for one that ran out of budget, unless `fail-on` is
-`never`. The JUnit report records the cut as an error, with its reason. The summary line counts the two apart, as in `3 unchecked (1 disproved and 2 proved)`, and
-an unchecked disproof's annotation comes before those of the other properties without a verdict, so
+`never`. The JUnit report records the cut as an error, with its reason. The summary line counts the two apart, as in `3 unchecked (1 refuted and 2 proved)`, and
+an unchecked refutation's annotation comes before those of the other properties without a verdict, so
 GitHub's limit of 10 annotations of each level per step drops those first. If it had no property under any of the
 manifest's ids, the log says that instead. A run that failed or was cancelled elsewhere also ends
-before that check, so a proof it reported is labelled `proved, unchecked` too, while a disproof
+before that check, so a proof it reported is labelled `proved, unchecked` too, while a refutation
 keeps its verdict, and the JUnit report records it as an error too.
 Properties Aristotle proposes on its own are listed as suggestions, in the log and in
 the GitHub job summary under "Suggested by Aristotle". They are never in the JUnit report or the
@@ -492,7 +492,7 @@ fails or takes over 10 seconds, the run goes ahead under the name of the directo
 the log says so. `--dry-run` prints the name a run would get.
 
 A failing row shows the property as Aristotle formalized it. When Aristotle links files to a
-disproved property, such as its counterexample's waveform (a VCD) or a testbench that reproduces
+refuted property, such as its counterexample's waveform (a VCD) or a testbench that reproduces
 it, the row lists them under `Artifacts`, with the `aristotle download --artifact` command that
 saves them into `aristotle-artifacts`, and so do the property's annotation and its JUnit failure.
 The command names only paths that read the same in every shell, so it pastes safely on any
@@ -511,7 +511,7 @@ you can see which commit turned a property red.
 
 Exit codes follow the [CLI's table](cli-reference.md#exit-codes), so a pipeline can tell a proof failure
 from an outage. `1` means the verdicts on the manifest's properties failed the build: a
-property that fails it (disproved, or proved while marked `expect = "disproved"`), a run that verified none of them, or with `--fail-on no-verdict` also a
+property that fails it (refuted, or proved while marked `expect = "refuted"`), a run that verified none of them, or with `--fail-on no-verdict` also a
 property without a verdict, one not registered included. It also means Aristotle stopped the run
 before finishing for decisions only you can make; the log prints the run's summary, which lists
 them. A run that failed or was cancelled elsewhere before it finished exits `3`, unless a property
@@ -559,7 +559,7 @@ without either the budget is 60 minutes. It is the whole step's: waiting for a f
 the run is submitted or in Aristotle's queue, counts toward it (see [Concurrent
 pipelines](#concurrent-pipelines)). A run that hits the budget after it started fails
 the step with `3` whatever `fail-on` is, and whatever it had reported by then: it hasn't finished,
-and Aristotle hadn't checked its results, so none counts as proved or disproved. A run that runs out
+and Aristotle hadn't checked its results, so none counts as proved or refuted. A run that runs out
 of Aristotle's own budget fails it with `3` too, unless `fail-on` is `never`, as it has ended. A run still queued when the budget runs out exits `6` instead,
 whatever `fail-on` is, as when no run slot frees up in time. A run that keeps hitting the budget
 needs more time: raise `timeout` (`--timeout`) or `check.max_wall_time_seconds`. `aristotle review`
@@ -642,7 +642,7 @@ of the files in scope, formalizes those properties, and checks them. Its propert
 run to run, so a test that passed on one commit may not exist on the next. That is why it is not
 the CI gate: it is advisory. `--fail-on` defaults to `never`, so once the run finishes the step
 exits `0` whatever the verdicts; `--fail-on failure` makes it gate on them. Its JUnit report
-records what happened whatever `--fail-on` is: a disproved property is a failure, and a run cut short,
+records what happened whatever `--fail-on` is: a refuted property is a failure, and a run cut short,
 failed, cancelled, never started or stopped for questions is an error, so to keep the step advisory, leave the report out
 of any publisher that marks a build unstable on them, as Jenkins's `junit` step does. Use it to
 explore a design, find properties worth adding to the manifest, or audit a change.
@@ -865,8 +865,8 @@ each other's results, so every later run proves every property again.
 
 **Can a property be advisory instead of blocking?**
 Not within one manifest. `fail-on` applies to all of the manifest's properties: `failure` (the
-default) fails the build on a property that fails it (disproved, or proved while marked
-`expect = "disproved"`), when no property got a verdict, or when
+default) fails the build on a property that fails it (refuted, or proved while marked
+`expect = "refuted"`), when no property got a verdict, or when
 Aristotle stopped the run for decisions only you can make, or with `3` when the run failed or
 was cancelled elsewhere before it finished, or ran out of budget or time before Aristotle
 checked its results; `no-verdict` also fails it when any property has no

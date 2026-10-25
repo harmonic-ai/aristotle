@@ -86,12 +86,10 @@ def render(results: RunResults, workspace: Path | None = None) -> str:
         lines.append("  No properties were registered for this run.")
 
     for result in results.passed:
-        lines.append(
-            f"  PASS  {result.name}  ({result.label})" if result.expect_disproved else f"  PASS  {result.name}"
-        )
+        lines.append(f"  PASS  {result.name}  ({result.label})" if result.expect_refuted else f"  PASS  {result.name}")
         if result.assumptions:
             # A deliberate counterexample doesn't hold; it is shown under them.
-            assuming = f"{'assuming' if result.expect_disproved else 'holds, assuming'} {result.assumptions}"
+            assuming = f"{'assuming' if result.expect_refuted else 'holds, assuming'} {result.assumptions}"
             lines.extend(f"        {line}" for line in _wrap_detail(assuming, width=90))
 
     for result in results.failed:

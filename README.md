@@ -17,7 +17,7 @@ aristotle submit "Prove this FIFO never overflows" --project-dir ./my-design --w
 The first command that needs a key offers to log in: it shows a code to approve in your browser, and keeps the key
 for next time. Aristotle works out the language from the files you upload. Each run spends your account's quota and
 takes tens of minutes, even for a small design. `--wait` follows the run, asks you Aristotle's questions as they come,
-and ends with a count such as `Properties: 2 proved · 1 disproved · 0 in progress`. Then it saves the result archive
+and ends with a count such as `Properties: 2 proved · 1 refuted · 0 in progress`. Then it saves the result archive
 in the current folder. To see what each property came to:
 
 ```bash
@@ -61,8 +61,8 @@ other ways to give a key.
 - **Project:** what you submit, with its files and conversation.
 - **Run:** one piece of work on a project. `submit` starts one, and a `continue` to an idle project another. The CLI
   calls a run a *task*.
-- **Property:** a claim Aristotle proves or disproves. The JSON calls it a *declaration*.
-- **Verdict:** proved or disproved. A property without one is in progress, unresolved or unchecked.
+- **Property:** a claim Aristotle proves or refutes. The JSON calls it a *declaration*.
+- **Verdict:** proved or refuted. A property without one is in progress, unresolved or unchecked.
 - **Manifest:** `aristotle.toml`, the properties `aristotle ci` checks.
 
 ## Verify a project
@@ -121,10 +121,16 @@ uploading again. Plain `download` saves the archive unchanged: extract it first 
 | Status | Meaning |
 |---|---|
 | `PROVED` | Aristotle proved it. |
-| `DISPROVED` | Aristotle proved it false, or broke it with concrete inputs: `DISPROVED (counterexample)`. The run's summary describes the failing case. |
+| `REFUTED` | The `EVIDENCE` column distinguishes a counterexample, a proof of the negation, or both. |
 | `IN PROGRESS` | No verdict yet. |
 | `UNRESOLVED` | The run stopped short of it, or its proof no longer checks. The reason follows. |
-| `(unchecked)` after a status | A proof or disproof Aristotle never checked, because the run ended first. It isn't a verdict yet. |
+| `(unchecked)` after a status | A proof or refutation Aristotle never checked, because the run ended first. It isn't a verdict yet. |
+
+Every refutation has `evidence`: `COUNTEREXAMPLE` (1), `NEGATION_PROVED` (2) or `BOTH` (3), or `UNKNOWN` (0) for a
+kind added after this version. `aristotle property` shows the kind separately and the agent's `evidence_message`
+before its artifacts. JSON preserves that message, including inline Markdown. Each refuted property counts once,
+including one with both kinds of evidence. Responses from older API deployments are normalized to this shape;
+inferred evidence does not create a message.
 
 To summarize or look up results, read them with `show`, `properties`, `property` or `download`, which start no run.
 Don't send a `continue` just to ask about them: on an idle project it starts a new run, which can spend hours checking

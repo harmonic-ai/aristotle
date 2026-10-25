@@ -8,9 +8,9 @@ import pytest
 from aristotlelib.ci import console
 from aristotlelib.ci.manifest import Kind, RequestedProperty
 from aristotlelib.ci.results import RunResults
-from aristotlelib.declaration import DeclarationFailureReason, DeclarationStatus
+from aristotlelib.declaration import DeclarationEvidence, DeclarationFailureReason, DeclarationStatus
 from aristotlelib.printable import escape_logged_text
-from tests.ci.conftest import expecting_disproved, make_declaration
+from tests.ci.conftest import expecting_refuted, make_declaration
 
 NO_OVERFLOW = RequestedProperty("no_overflow", Kind.NATURAL_LANGUAGE, "The FIFO never overflows.")
 
@@ -30,7 +30,7 @@ def test_a_run_that_stopped_is_skipped_with_its_reason():
     rendered = console.render(results)
 
     # A stopped run's property counts as in progress, and its own line names the reason.
-    assert "1 proved, 0 disproved, 1 in progress, 1 unresolved" in rendered
+    assert "1 proved, 0 refuted, 1 in progress, 1 unresolved" in rendered
     assert "  SKIP  Spec.Slow  (in progress)" in rendered
     assert "  SKIP  Spec.Unlucky  (unresolved (out of budget))" in rendered
     assert "FAIL" not in rendered
@@ -57,7 +57,7 @@ def test_a_cancelled_run_says_so_above_the_properties_it_reached_and_leaves_thei
 
     assert "PASS" not in rendered
     assert rendered.index("cancelled outside this job") < rendered.index("Spec.Done")
-    assert "a proof among them is unchecked, but a disproof counts" in " ".join(rendered.split())
+    assert "a proof among them is unchecked, but a refutation counts" in " ".join(rendered.split())
 
 
 def test_a_manifest_property_the_run_did_not_register_is_skipped_as_not_registered():
@@ -65,20 +65,23 @@ def test_a_manifest_property_the_run_did_not_register_is_skipped_as_not_register
 
     rendered = console.render(results)
 
-    assert "0 proved, 0 disproved, 0 in progress, 1 not registered" in rendered
+    assert "0 proved, 0 refuted, 0 in progress, 1 not registered" in rendered
     assert "  SKIP  no_overflow  (not registered)" in rendered
     assert "No properties were registered" not in rendered
 
 
 def test_a_manifest_property_is_reported_under_its_id_not_the_declarations_name():
     declaration = make_declaration(
-        "Spec.NoOverflow", DeclarationStatus.COUNTEREXAMPLE, description="Overflows at cycle 12."
+        "Spec.NoOverflow",
+        DeclarationStatus.REFUTED,
+        description="Overflows at cycle 12.",
+        evidence=DeclarationEvidence.COUNTEREXAMPLE,
     ).model_copy(update={"declaration_id": "no_overflow"})
     results = RunResults.from_declarations([declaration], duration_seconds=1.0, requested=[NO_OVERFLOW])
 
     rendered = console.render(results)
 
-    assert "  FAIL  [disproved by counterexample] no_overflow" in rendered
+    assert "  FAIL  [refuted] no_overflow" in rendered
     assert "      Overflows at cycle 12." in rendered
     assert "Spec.NoOverflow" not in rendered
 
@@ -87,7 +90,12 @@ def test_suggestions_are_listed_after_the_verdict_and_do_not_count_in_it():
     results = RunResults.from_declarations(
         [
             make_declaration("Spec.NoOverflow").model_copy(update={"declaration_id": "no_overflow"}),
-            make_declaration("Spec.Extra", DeclarationStatus.COUNTEREXAMPLE, description="Wraps at cycle 12."),
+            make_declaration(
+                "Spec.Extra",
+                DeclarationStatus.REFUTED,
+                description="Wraps at cycle 12.",
+                evidence=DeclarationEvidence.COUNTEREXAMPLE,
+            ),
             make_declaration("Spec.Idea", DeclarationStatus.IN_PROGRESS, description=None),
         ],
         duration_seconds=1.0,
@@ -96,18 +104,22 @@ def test_suggestions_are_listed_after_the_verdict_and_do_not_count_in_it():
 
     rendered = console.render(results)
 
-    assert "1 proved, 0 disproved, 0 in progress" in rendered
+    assert "1 proved, 0 refuted, 0 in progress" in rendered
     assert "FAIL" not in rendered
     assert "SKIP" not in rendered
     section = rendered.index("  Suggested by Aristotle, not part of the verdict:")
     assert rendered.index("  PASS  no_overflow") < section
-    assert rendered.index("  -     Spec.Extra  (disproved by counterexample)\n        Wraps at cycle 12.") > section
+    assert rendered.index("  -     Spec.Extra  (refuted)\n        Wraps at cycle 12.") > section
     assert rendered.index("  -     Spec.Idea  (in progress)") > section
 
 
 def test_an_open_ended_run_has_no_suggestions_section():
     results = RunResults.from_declarations(
-        [make_declaration("Spec.A"), make_declaration("Spec.B", DeclarationStatus.NEGATED)], duration_seconds=1.0
+        [
+            make_declaration("Spec.A"),
+            make_declaration("Spec.B", DeclarationStatus.REFUTED, evidence=DeclarationEvidence.NEGATION_PROVED),
+        ],
+        duration_seconds=1.0,
     )
 
     rendered = console.render(results)
@@ -135,17 +147,17 @@ def test_a_manifest_run_with_a_verdict_does_not_say_nothing_was_verified():
         (
             {"out_of_budget": True},
             "  The run ran out of budget before Aristotle checked its results. Properties below\n"
-            "  are those it reached, unchecked: none counts as proved or disproved.\n",
+            "  are those it reached, unchecked: none counts as proved or refuted.\n",
         ),
         (
             {"timed_out": True},
             "  The time budget ran out before Aristotle checked the run's results. Properties\n"
-            "  below are those it reached, unchecked: none counts as proved or disproved.\n",
+            "  below are those it reached, unchecked: none counts as proved or refuted.\n",
         ),
     ],
     ids=["out of budget", "out of time"],
 )
-def test_a_cut_short_run_reports_its_proofs_and_disproofs_as_unchecked(cut: dict[str, bool], note: str):
+def test_a_cut_short_run_reports_its_proofs_and_refutations_as_unchecked(cut: dict[str, bool], note: str):
     no_underflow = RequestedProperty("no_underflow", Kind.NATURAL_LANGUAGE, "The FIFO never underflows.")
     results = RunResults.from_declarations(
         [
@@ -153,7 +165,10 @@ def test_a_cut_short_run_reports_its_proofs_and_disproofs_as_unchecked(cut: dict
                 update={"declaration_id": "no_overflow"}
             ),
             make_declaration(
-                "Spec.NoUnderflow", DeclarationStatus.COUNTEREXAMPLE, description="Underflows at cycle 3."
+                "Spec.NoUnderflow",
+                DeclarationStatus.REFUTED,
+                description="Underflows at cycle 3.",
+                evidence=DeclarationEvidence.COUNTEREXAMPLE,
             ).model_copy(update={"declaration_id": "no_underflow"}),
             make_declaration("Spec.Extra", description=None),
         ],
@@ -164,10 +179,10 @@ def test_a_cut_short_run_reports_its_proofs_and_disproofs_as_unchecked(cut: dict
 
     rendered = console.render(results)
 
-    assert "  0 proved, 0 disproved, 0 in progress, 2 unchecked (1 disproved and 1 proved)\n" in rendered
+    assert "  0 proved, 0 refuted, 0 in progress, 2 unchecked (1 refuted and 1 proved)\n" in rendered
     assert note in rendered
     assert "  SKIP  [proved, unchecked] no_overflow\n      Never overflows.\n" in rendered
-    assert "  SKIP  [disproved by counterexample, unchecked] no_underflow\n      Underflows at cycle 3.\n" in rendered
+    assert "  SKIP  [refuted, unchecked] no_underflow\n      Underflows at cycle 3.\n" in rendered
     assert "  -     Spec.Extra  (proved, unchecked)\n" in rendered
     assert "PASS" not in rendered and "FAIL" not in rendered
     assert "was verified" not in rendered
@@ -253,11 +268,15 @@ def test_text_from_the_run_cannot_act_as_a_logging_or_workflow_command(caplog, m
         [
             make_declaration(
                 "Spec.NoOverflow",
-                DeclarationStatus.COUNTEREXAMPLE,
+                DeclarationStatus.REFUTED,
                 description="Fails: ##vso[task.complete result=Succeeded]",
+                evidence=DeclarationEvidence.COUNTEREXAMPLE,
             ).model_copy(update={"declaration_id": "no_overflow"}),
             make_declaration(
-                "Spec.Extra", DeclarationStatus.COUNTEREXAMPLE, description="Wraps: ##teamcity[buildStatus text='ok']"
+                "Spec.Extra",
+                DeclarationStatus.REFUTED,
+                description="Wraps: ##teamcity[buildStatus text='ok']",
+                evidence=DeclarationEvidence.COUNTEREXAMPLE,
             ),
         ],
         duration_seconds=1.0,
@@ -282,7 +301,10 @@ def test_a_refuted_propertys_run_summary_is_printed_after_the_results():
     results = RunResults.from_declarations(
         [
             make_declaration(
-                "Spec.NoOverflow", DeclarationStatus.COUNTEREXAMPLE, description="Never overflows."
+                "Spec.NoOverflow",
+                DeclarationStatus.REFUTED,
+                description="Never overflows.",
+                evidence=DeclarationEvidence.COUNTEREXAMPLE,
             ).model_copy(update={"declaration_id": "no_overflow"})
         ],
         duration_seconds=1.0,
@@ -319,12 +341,16 @@ ASSUMED = RequestedProperty(
     ("status", "line"),
     [
         (DeclarationStatus.PROVED, "  PASS  no_overflow\n        holds, assuming push is low while full.\n"),
-        (DeclarationStatus.NEGATED, "      Assuming: push is low while full.\n"),
+        (DeclarationStatus.REFUTED, "      Assuming: push is low while full.\n"),
     ],
-    ids=["proved", "disproved"],
+    ids=["proved", "refuted"],
 )
 def test_a_verdict_under_assumptions_says_so(status: DeclarationStatus, line: str):
-    declaration = make_declaration("Spec.NoOverflow", status).model_copy(update={"declaration_id": "no_overflow"})
+    declaration = make_declaration(
+        "Spec.NoOverflow",
+        status,
+        evidence=DeclarationEvidence.NEGATION_PROVED if status == DeclarationStatus.REFUTED else None,
+    ).model_copy(update={"declaration_id": "no_overflow"})
 
     rendered = console.render(RunResults.from_declarations([declaration], duration_seconds=1.0, requested=[ASSUMED]))
 
@@ -332,26 +358,30 @@ def test_a_verdict_under_assumptions_says_so(status: DeclarationStatus, line: st
 
 
 def test_an_expected_failure_passes_with_its_label_and_an_unexpected_proof_fails_with_its_own():
-    rendered = console.render(expecting_disproved(DeclarationStatus.NEGATED, DeclarationStatus.PROVED))
+    rendered = console.render(expecting_refuted(DeclarationStatus.REFUTED, DeclarationStatus.PROVED))
 
     assert "  1 proved, 0 failed" not in rendered
-    assert "  0 proved, 1 disproved as expected, 0 disproved, 1 unexpectedly proved, 0 in progress\n" in rendered
-    assert "  PASS  demo0  (disproved, as expected)\n" in rendered
+    assert "  0 proved, 1 refuted as expected, 0 refuted, 1 unexpectedly proved, 0 in progress\n" in rendered
+    assert "  PASS  demo0  (refuted, as expected)\n" in rendered
     assert "  FAIL  [unexpectedly proved: update the manifest] demo1\n" in rendered
 
 
 def _deliberate_under_an_assumption(status: DeclarationStatus) -> RunResults:
-    declaration = make_declaration("Spec.Demo", status).model_copy(update={"declaration_id": "demo"})
+    declaration = make_declaration(
+        "Spec.Demo",
+        status,
+        evidence=DeclarationEvidence.NEGATION_PROVED if status == DeclarationStatus.REFUTED else None,
+    ).model_copy(update={"declaration_id": "demo"})
     requested = RequestedProperty(
-        "demo", Kind.NATURAL_LANGUAGE, "A full FIFO takes no write.", assumptions="pop is low.", expect_disproved=True
+        "demo", Kind.NATURAL_LANGUAGE, "A full FIFO takes no write.", assumptions="pop is low.", expect_refuted=True
     )
     return RunResults.from_declarations([declaration], duration_seconds=1.0, requested=[requested])
 
 
 def test_a_deliberate_counterexample_under_an_assumption_is_not_said_to_hold():
-    rendered = console.render(_deliberate_under_an_assumption(DeclarationStatus.NEGATED))
+    rendered = console.render(_deliberate_under_an_assumption(DeclarationStatus.REFUTED))
 
-    assert "  PASS  demo  (disproved, as expected)\n        assuming pop is low.\n" in rendered
+    assert "  PASS  demo  (refuted, as expected)\n        assuming pop is low.\n" in rendered
     assert "holds" not in rendered
 
 
@@ -359,17 +389,22 @@ ARTIFACTS = ["sim/cex.vcd", "sim/cex_tb.sv"]
 
 
 def _linked(status: DeclarationStatus, **run) -> RunResults:
-    declaration = make_declaration("Spec.NoOverflow", status, description="Overflows at cycle 12.")
+    declaration = make_declaration(
+        "Spec.NoOverflow",
+        status,
+        description="Overflows at cycle 12.",
+        evidence=DeclarationEvidence.COUNTEREXAMPLE if status == DeclarationStatus.REFUTED else None,
+    )
     return RunResults.from_declarations(
         [declaration.model_copy(update={"artifact_paths": ARTIFACTS})], duration_seconds=1.0, **run
     )
 
 
-def test_a_disproved_propertys_row_names_its_artifacts_and_the_command_that_downloads_them():
-    rendered = console.render(_linked(DeclarationStatus.COUNTEREXAMPLE))
+def test_a_refuted_propertys_row_names_its_artifacts_and_the_command_that_downloads_them():
+    rendered = console.render(_linked(DeclarationStatus.REFUTED))
 
     assert (
-        "  FAIL  [disproved by counterexample] Spec.NoOverflow\n"
+        "  FAIL  [refuted] Spec.NoOverflow\n"
         "      Overflows at cycle 12.\n"
         "      Artifacts:\n"
         "        sim/cex.vcd\n"
@@ -379,8 +414,13 @@ def test_a_disproved_propertys_row_names_its_artifacts_and_the_command_that_down
     ) in rendered
 
 
-def test_a_disproved_propertys_row_lists_a_path_a_shell_would_read_otherwise_but_leaves_it_out_of_the_command():
-    declaration = make_declaration("Spec.NoOverflow", DeclarationStatus.NEGATED, description="Overflows.")
+def test_a_refuted_propertys_row_lists_a_path_a_shell_would_read_otherwise_but_leaves_it_out_of_the_command():
+    declaration = make_declaration(
+        "Spec.NoOverflow",
+        DeclarationStatus.REFUTED,
+        description="Overflows.",
+        evidence=DeclarationEvidence.NEGATION_PROVED,
+    )
     linked = declaration.model_copy(update={"artifact_paths": ["sim/cex.vcd", "sim/cex&calc.exe&rem .log"]})
 
     rendered = console.render(RunResults.from_declarations([linked], duration_seconds=1.0))
@@ -394,30 +434,35 @@ def test_a_disproved_propertys_row_lists_a_path_a_shell_would_read_otherwise_but
     ) in rendered
 
 
-def test_a_disproved_property_without_artifacts_reads_as_it_did():
-    declaration = make_declaration("Spec.NoOverflow", DeclarationStatus.NEGATED, description="Overflows at cycle 12.")
+def test_a_refuted_property_without_artifacts_reads_as_it_did():
+    declaration = make_declaration(
+        "Spec.NoOverflow",
+        DeclarationStatus.REFUTED,
+        description="Overflows at cycle 12.",
+        evidence=DeclarationEvidence.NEGATION_PROVED,
+    )
 
     rendered = console.render(RunResults.from_declarations([declaration], duration_seconds=1.0))
 
-    assert rendered.endswith("\n  FAIL  [disproved] Spec.NoOverflow\n      Overflows at cycle 12.\n")
+    assert rendered.endswith("\n  FAIL  [refuted] Spec.NoOverflow\n      Overflows at cycle 12.\n")
 
 
 @pytest.mark.parametrize(
     ("status", "run"),
-    [(DeclarationStatus.PROVED, {}), (DeclarationStatus.NEGATED, {"out_of_budget": True})],
-    ids=["a proof", "an unchecked disproof"],
+    [(DeclarationStatus.PROVED, {}), (DeclarationStatus.REFUTED, {"out_of_budget": True})],
+    ids=["a proof", "an unchecked refutation"],
 )
-def test_only_a_property_that_fails_as_disproved_lists_its_artifacts(status: DeclarationStatus, run: dict):
+def test_only_a_property_that_fails_as_refuted_lists_its_artifacts(status: DeclarationStatus, run: dict):
     assert "Artifacts" not in console.render(_linked(status, **run))
 
 
 def test_a_deliberate_counterexample_that_passes_lists_no_artifacts():
-    declaration = make_declaration("Spec.Demo", DeclarationStatus.NEGATED).model_copy(
-        update={"declaration_id": "demo", "artifact_paths": ARTIFACTS}
-    )
-    requested = RequestedProperty("demo", Kind.NATURAL_LANGUAGE, "A full FIFO takes no write.", expect_disproved=True)
+    declaration = make_declaration(
+        "Spec.Demo", DeclarationStatus.REFUTED, evidence=DeclarationEvidence.NEGATION_PROVED
+    ).model_copy(update={"declaration_id": "demo", "artifact_paths": ARTIFACTS})
+    requested = RequestedProperty("demo", Kind.NATURAL_LANGUAGE, "A full FIFO takes no write.", expect_refuted=True)
 
     rendered = console.render(RunResults.from_declarations([declaration], duration_seconds=1.0, requested=[requested]))
 
-    assert "  PASS  demo  (disproved, as expected)" in rendered
+    assert "  PASS  demo  (refuted, as expected)" in rendered
     assert "Artifacts" not in rendered

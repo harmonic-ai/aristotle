@@ -19,6 +19,9 @@ MAX_PAGE_SIZE = 100
 _PAGE_INTERVAL = 0.5
 """Seconds from the start of one page to the start of the next when reading every page: at most two a second."""
 
+_API_RESPONSE: dict[str, Any] = {"api_response": True}
+"""Validation context of a declaration read from the API, the only one whose evidence may be ``UNKNOWN``."""
+
 # Only complete `;`-terminated entities are decoded, as on the web (decodeHTMLStrict); html.unescape alone
 # also applies HTML's legacy prefix rules, turning `&not_ready` and `&notready;` into `¬_ready` and `¬ready;`.
 _HTML_ENTITY = re.compile(r"&(#[0-9]+|#[xX][0-9a-fA-F]+|[A-Za-z][A-Za-z0-9]*);")
@@ -55,11 +58,19 @@ class DeclarationSource(SafeIntEnum):
 class DeclarationStatus(SafeIntEnum):
     UNKNOWN = 0
     IN_PROGRESS = 1
-    NEGATED = 2
+    REFUTED = 2
     PROVED = 3
     REMOVED = 4
-    COUNTEREXAMPLE = 5
     FAILED = 6
+
+
+class DeclarationEvidence(SafeIntEnum):
+    """How a refuted property was shown not to hold."""
+
+    UNKNOWN = 0
+    COUNTEREXAMPLE = 1
+    NEGATION_PROVED = 2
+    BOTH = 3
 
 
 class DeclarationFailureReason(SafeIntEnum):
@@ -84,6 +95,10 @@ class Declaration(pydantic.BaseModel):
     status: DeclarationStatus
     failure_reason: DeclarationFailureReason | None = None
     """Set only when :attr:`status` is ``FAILED``; null otherwise."""
+    evidence: DeclarationEvidence | None = None
+    """Required for REFUTED; nullable for other statuses."""
+    evidence_message: str | None = None
+    """The agent's explanation, preserved as received; it may contain inline Markdown."""
     filename: str
     """Path of the artifact Aristotle generated, usually a Lean file."""
     source_file: str | None = None
@@ -99,6 +114,21 @@ class Declaration(pydantic.BaseModel):
     """Paths in the project of the files Aristotle linked to it, such as a counterexample's trace; a null reads as []."""
     created_at: UTCDatetime
     last_updated: UTCDatetime
+
+    @pydantic.model_validator(mode="after")
+    def _refutation_has_evidence(self) -> "Declaration":
+        if self.status == DeclarationStatus.REFUTED and self.evidence is None:
+            raise ValueError("A refuted declaration requires evidence")
+        return self
+
+    @pydantic.field_validator("evidence")
+    @classmethod
+    def _known_evidence(
+        cls, evidence: DeclarationEvidence | None, info: pydantic.ValidationInfo
+    ) -> DeclarationEvidence | None:
+        if evidence == DeclarationEvidence.UNKNOWN and info.context is not _API_RESPONSE:
+            raise ValueError("Evidence must be COUNTEREXAMPLE, NEGATION_PROVED or BOTH")
+        return evidence
 
     @pydantic.computed_field  # type: ignore[prop-decorator]
     @property
@@ -199,7 +229,19 @@ class Declaration(pydantic.BaseModel):
             params["declaration_type"] = declaration_type.value
         response = await client.get(f"/project/{project_uuid}/declarations", params=params)
         response_data = response.json()
-        declarations: list[Declaration] = [cls.model_validate(d) for d in response_data["declarations"]]
+        declarations: list[Declaration] = []
+        for data in response_data["declarations"]:
+            # Older API nodes return 2 for a negation proof and 5 for a counterexample, without evidence.
+            if data.get("status") in (2, 5):
+                evidence = data.get("evidence")
+                if evidence is None:
+                    evidence = (
+                        DeclarationEvidence.NEGATION_PROVED
+                        if data["status"] == 2
+                        else DeclarationEvidence.COUNTEREXAMPLE
+                    )
+                data = {**data, "status": DeclarationStatus.REFUTED, "evidence": evidence}
+            declarations.append(cls.model_validate(data, context=_API_RESPONSE))
         new_pagination_key = response_data.get("pagination_key")
         if new_pagination_key is not None and not isinstance(new_pagination_key, str):
             raise TypeError("pagination_key must be a string or None")

@@ -44,8 +44,8 @@ _TOP_LEVEL_KEYS = ("repo_id", "check", "requested_properties")
 _CHECK_KEYS = ("enable_proof_repair", "max_wall_time_seconds", "max_cost_dollars")
 _PROPERTY_KEYS = ("kind", "property", "identifier", "assumptions", "expect", "property_result_id")
 
-EXPECT_DISPROVED = "disproved"
-"""The one value of a property's ``expect``: a deliberate counterexample, which passes while disproved."""
+EXPECT_REFUTED = "refuted"
+"""The one value of a property's ``expect``: a deliberate counterexample, which passes while refuted."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -59,8 +59,8 @@ class RequestedProperty:
     property_result_id: str | None = None
     assumptions: str | None = None
     """What the property is checked under, such as answers agreed with Aristotle; sent to the run with it."""
-    expect_disproved: bool = False
-    """``expect = "disproved"``: the property passes while it is disproved, and fails once it is proved."""
+    expect_refuted: bool = False
+    """``expect = "refuted"``: the property passes while it is refuted, and fails once it is proved."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -232,8 +232,12 @@ def _property(property_id: str, entry: dict[str, Any], name: str, problems: list
     property_result_id = _optional_string(entry, "property_result_id", f"{name}.property_result_id", problems)
     assumptions = _optional_string(entry, "assumptions", f"{name}.assumptions", problems)
     expect = entry.get("expect")
-    if expect is not None and expect != EXPECT_DISPROVED:
-        problems.append(f'{name}.expect: must be "{EXPECT_DISPROVED}", the only expectation a property can state')
+    if expect == "disproved":
+        problems.append(
+            f'{name}.expect: "disproved" was renamed to "refuted"; replace expect = "disproved" with expect = "refuted"'
+        )
+    elif expect is not None and expect != EXPECT_REFUTED:
+        problems.append(f'{name}.expect: must be "{EXPECT_REFUTED}", the only expectation a property can state')
 
     raw_kind = entry.get("kind")
     kinds = ", ".join(str(kind) for kind in Kind)
@@ -270,7 +274,7 @@ def _property(property_id: str, entry: dict[str, Any], name: str, problems: list
         statement=statement.strip(),
         property_result_id=property_result_id,
         assumptions=None if assumptions is None else assumptions.strip(),
-        expect_disproved=expect == EXPECT_DISPROVED,
+        expect_refuted=expect == EXPECT_REFUTED,
     )
 
 
@@ -345,8 +349,8 @@ def render(
         lines.append(f"{STATEMENT_KEYS[requested.kind]} = {_toml_string(requested.statement)}")
         if requested.assumptions is not None:
             lines.append(f"assumptions = {_toml_string(requested.assumptions)}")
-        if requested.expect_disproved:
-            lines.append(f"expect = {_toml_string(EXPECT_DISPROVED)}")
+        if requested.expect_refuted:
+            lines.append(f"expect = {_toml_string(EXPECT_REFUTED)}")
         if requested.property_result_id is not None:
             lines.append(f"property_result_id = {_toml_string(requested.property_result_id)}")
     return "\n".join(lines) + "\n"

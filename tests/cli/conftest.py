@@ -83,6 +83,28 @@ def mockable_project(
     return project
 
 
+UNKNOWN_EVIDENCE_NAME = "Spec.FifoNeverOverflows"
+
+
+def unknown_evidence_page(project_id: str) -> httpx.Response:
+    """A declarations page whose one property, UNKNOWN_EVIDENCE_NAME, is refuted with evidence 4, a kind this version
+    doesn't know."""
+    declaration = {
+        "project_id": project_id,
+        "declaration_id": "fifo-never-overflows",
+        "declaration_type": 1,
+        "source": 2,
+        "name": UNKNOWN_EVIDENCE_NAME,
+        "status": 2,
+        "evidence": 4,
+        "evidence_message": "Refuted by a kind of evidence added after this version.",
+        "filename": "Spec/Property.lean",
+        "created_at": "2026-10-20T10:00:00",
+        "last_updated": "2026-10-20T11:00:00",
+    }
+    return httpx.Response(200, json={"declarations": [declaration], "pagination_key": None})
+
+
 APPROVED_KEY = "key-approved-in-the-browser"
 """The key the fake device login hands out, which no output may show."""
 DEVICE_CODE = "device-code-only-the-cli-holds"

@@ -9,15 +9,22 @@ import pytest
 from aristotlelib.ci import github, results
 from aristotlelib.ci.manifest import Kind, RequestedProperty
 from aristotlelib.ci.results import RunResults
-from aristotlelib.declaration import DeclarationFailureReason, DeclarationStatus
-from tests.ci.conftest import expecting_disproved, make_declaration
+from aristotlelib.declaration import DeclarationEvidence, DeclarationFailureReason, DeclarationStatus
+from tests.ci.conftest import expecting_refuted, make_declaration
 
 NO_OVERFLOW = RequestedProperty("no_overflow", Kind.NATURAL_LANGUAGE, "The FIFO never overflows.")
 
 
 def test_a_failing_property_produces_an_error_annotation(capsys, tmp_path: Path):
     results = RunResults.from_declarations(
-        [make_declaration("Spec.NoOverflow", DeclarationStatus.COUNTEREXAMPLE, description="Overflows at cycle 12.")],
+        [
+            make_declaration(
+                "Spec.NoOverflow",
+                DeclarationStatus.REFUTED,
+                description="Overflows at cycle 12.",
+                evidence=DeclarationEvidence.COUNTEREXAMPLE,
+            )
+        ],
         duration_seconds=1.0,
     )
 
@@ -55,8 +62,9 @@ def test_newlines_and_reserved_characters_are_escaped(capsys, tmp_path: Path):
         [
             make_declaration(
                 "Spec.Multi",
-                DeclarationStatus.NEGATED,
+                DeclarationStatus.REFUTED,
                 description="First line\nSecond line with 100% and, a comma",
+                evidence=DeclarationEvidence.NEGATION_PROVED,
             )
         ],
         duration_seconds=1.0,
@@ -73,7 +81,14 @@ def test_newlines_and_reserved_characters_are_escaped(capsys, tmp_path: Path):
 
 def test_control_characters_in_an_annotation_are_escaped(capsys, tmp_path: Path):
     results = RunResults.from_declarations(
-        [make_declaration("Spec.Ctl", DeclarationStatus.NEGATED, description="red\x1b[31m\r\nnext\rcr\x85nel")],
+        [
+            make_declaration(
+                "Spec.Ctl",
+                DeclarationStatus.REFUTED,
+                description="red\x1b[31m\r\nnext\rcr\x85nel",
+                evidence=DeclarationEvidence.NEGATION_PROVED,
+            )
+        ],
         duration_seconds=1.0,
     )
 
@@ -100,7 +115,10 @@ def test_annotations_stay_within_the_runners_cap_of_ten_per_level(
     capsys, tmp_path: Path, failed: int, unresolved: int, errors: int, notices: int, further: int
 ):
     results = RunResults.from_declarations(
-        [make_declaration(f"Spec.F{i}", DeclarationStatus.NEGATED) for i in range(failed)]
+        [
+            make_declaration(f"Spec.F{i}", DeclarationStatus.REFUTED, evidence=DeclarationEvidence.NEGATION_PROVED)
+            for i in range(failed)
+        ]
         + [make_declaration(f"Spec.U{i}", DeclarationStatus.IN_PROGRESS) for i in range(unresolved)],
         duration_seconds=1.0,
     )
@@ -120,7 +138,11 @@ def test_annotations_stay_within_the_runners_cap_of_ten_per_level(
 def test_the_annotation_includes_the_file_when_one_resolves(capsys, tmp_path: Path):
     (tmp_path / "fifo.v").write_text("module fifo;\nendmodule\n")
     results = RunResults.from_declarations(
-        [make_declaration("Spec.A", DeclarationStatus.NEGATED, filename="fifo.v")],
+        [
+            make_declaration(
+                "Spec.A", DeclarationStatus.REFUTED, filename="fifo.v", evidence=DeclarationEvidence.NEGATION_PROVED
+            )
+        ],
         duration_seconds=1.0,
     )
 
@@ -137,10 +159,11 @@ def test_the_annotation_points_at_the_source_line(capsys, tmp_path: Path):
         [
             make_declaration(
                 "Spec.A",
-                DeclarationStatus.COUNTEREXAMPLE,
+                DeclarationStatus.REFUTED,
                 filename="Spec/Counter.lean",
                 source_file="rtl/counter.sv",
                 source_line=2,
+                evidence=DeclarationEvidence.COUNTEREXAMPLE,
             )
         ],
         duration_seconds=1.0,
@@ -167,7 +190,7 @@ def test_the_summary_renders_a_row_per_property():
     results = RunResults.from_declarations(
         [
             make_declaration("Spec.Good", DeclarationStatus.PROVED),
-            make_declaration("Spec.Bad", DeclarationStatus.COUNTEREXAMPLE),
+            make_declaration("Spec.Bad", DeclarationStatus.REFUTED, evidence=DeclarationEvidence.COUNTEREXAMPLE),
             make_declaration("Spec.Slow", DeclarationStatus.IN_PROGRESS),
         ],
         duration_seconds=1.0,
@@ -176,9 +199,9 @@ def test_the_summary_renders_a_row_per_property():
 
     summary = github.build_summary(results)
 
-    assert "1 proved, 1 disproved, 1 in progress" in summary
+    assert "1 proved, 1 refuted, 1 in progress" in summary
     assert "`Spec.Good`" in summary
-    assert "disproved by counterexample" in summary
+    assert "refuted" in summary
     assert "https://aristotle.harmonic.fun/projects/abc" in summary
 
 
@@ -194,7 +217,7 @@ def test_the_summary_says_why_a_stopped_run_has_no_verdict():
 
     summary = github.build_summary(results)
 
-    assert "0 proved, 0 disproved, 0 in progress, 1 unresolved" in summary
+    assert "0 proved, 0 refuted, 0 in progress, 1 unresolved" in summary
     assert "unresolved (out of budget)" in summary
 
 
@@ -236,8 +259,8 @@ def test_the_summary_of_a_failed_run_says_its_proofs_are_unchecked():
 
     summary = github.build_summary(results)
 
-    assert "0 proved, 0 disproved, 0 in progress, 1 unchecked (1 proved)" in summary
-    assert "a proof among them is unchecked, but a disproof counts" in summary
+    assert "0 proved, 0 refuted, 0 in progress, 1 unchecked (1 proved)" in summary
+    assert "a proof among them is unchecked, but a refutation counts" in summary
 
 
 def test_the_summary_says_a_run_left_going_goes_on_and_how_to_report_on_it():
@@ -425,9 +448,9 @@ def test_the_summary_cautions_that_a_cut_short_runs_results_are_unchecked(cut: d
 
     summary = github.build_summary(results)
 
-    assert "**0 proved, 0 disproved, 0 in progress, 1 unchecked (1 proved)**" in summary
+    assert "**0 proved, 0 refuted, 0 in progress, 1 unchecked (1 proved)**" in summary
     assert (
-        f"> [!CAUTION]\n> {reason} Properties below are those it reached, unchecked: none counts as proved or disproved.\n"
+        f"> [!CAUTION]\n> {reason} Properties below are those it reached, unchecked: none counts as proved or refuted.\n"
     ) in summary
     assert "| ⬜ | `no_overflow` | proved, unchecked | Holds. |" in summary
     assert "language enabled" not in summary
@@ -444,11 +467,16 @@ def test_the_summary_says_when_a_run_was_cut_short_before_it_registered_a_proper
     assert "unchecked" not in summary
 
 
-def test_a_cut_short_runs_proof_and_disproof_are_notices_with_their_claims(capsys, tmp_path: Path):
+def test_a_cut_short_runs_proof_and_refutation_are_notices_with_their_claims(capsys, tmp_path: Path):
     results = RunResults.from_declarations(
         [
             make_declaration("Spec.Good", description="Holds."),
-            make_declaration("Spec.Bad", DeclarationStatus.COUNTEREXAMPLE, description="Fails at cycle 3."),
+            make_declaration(
+                "Spec.Bad",
+                DeclarationStatus.REFUTED,
+                description="Fails at cycle 3.",
+                evidence=DeclarationEvidence.COUNTEREXAMPLE,
+            ),
         ],
         duration_seconds=1.0,
         out_of_budget=True,
@@ -458,7 +486,7 @@ def test_a_cut_short_runs_proof_and_disproof_are_notices_with_their_claims(capsy
 
     lines = capsys.readouterr().out.splitlines()
     assert [line.split(" ", 1)[0] for line in lines] == ["::notice", "::notice"]
-    assert lines[0].endswith("::Spec.Bad disproved by counterexample, unchecked: Fails at cycle 3.")
+    assert lines[0].endswith("::Spec.Bad refuted, unchecked: Fails at cycle 3.")
     assert lines[1].endswith("::Spec.Good proved, unchecked: Holds.")
 
 
@@ -524,7 +552,15 @@ def test_an_annotation_from_a_subproject_names_the_file_from_the_repository_top(
     (tmp_path / "rtl").mkdir()
     (tmp_path / "rtl" / "counter.sv").write_text("module counter;\nendmodule\n")
     results = RunResults.from_declarations(
-        [make_declaration("Spec.A", DeclarationStatus.COUNTEREXAMPLE, source_file="rtl/counter.sv", source_line=2)],
+        [
+            make_declaration(
+                "Spec.A",
+                DeclarationStatus.REFUTED,
+                source_file="rtl/counter.sv",
+                source_line=2,
+                evidence=DeclarationEvidence.COUNTEREXAMPLE,
+            )
+        ],
         duration_seconds=1.0,
         path_prefix="hw/",
     )
@@ -547,7 +583,7 @@ def test_the_summary_row_of_an_unregistered_manifest_property_shows_the_request(
 
     summary = github.build_summary(results)
 
-    assert "0 proved, 0 disproved, 0 in progress, 1 not registered" in summary
+    assert "0 proved, 0 refuted, 0 in progress, 1 not registered" in summary
     assert "| ⬜ | `no_overflow` | not registered | The FIFO never overflows. |" in summary.splitlines()
     assert "No properties were registered" not in summary
 
@@ -557,10 +593,11 @@ def test_a_manifest_property_is_reported_under_its_id_not_the_declarations_name(
     (tmp_path / "rtl" / "fifo.sv").write_text("module fifo;\nendmodule\n")
     declaration = make_declaration(
         "Spec.NoOverflow",
-        DeclarationStatus.COUNTEREXAMPLE,
+        DeclarationStatus.REFUTED,
         description="Overflows at cycle 12.",
         source_file="rtl/fifo.sv",
         source_line=2,
+        evidence=DeclarationEvidence.COUNTEREXAMPLE,
     ).model_copy(update={"declaration_id": "no_overflow"})
     results = RunResults.from_declarations([declaration], duration_seconds=1.0, requested=[NO_OVERFLOW])
 
@@ -569,7 +606,7 @@ def test_a_manifest_property_is_reported_under_its_id_not_the_declarations_name(
 
     out = capsys.readouterr().out
     assert out == "::error title=Aristotle%3A no_overflow,file=rtl/fifo.sv,line=2::Overflows at cycle 12.\n"
-    assert "| ❌ | `no_overflow`<br>`rtl/fifo.sv:2` | disproved by counterexample | Overflows at cycle 12. |" in summary
+    assert "| ❌ | `no_overflow`<br>`rtl/fifo.sv:2` | refuted | Overflows at cycle 12. |" in summary
     assert "Spec.NoOverflow" not in summary
 
 
@@ -577,7 +614,12 @@ def test_suggestions_get_their_own_summary_table_and_no_annotations(capsys, tmp_
     results = RunResults.from_declarations(
         [
             make_declaration("Spec.NoOverflow").model_copy(update={"declaration_id": "no_overflow"}),
-            make_declaration("Spec.Extra", DeclarationStatus.COUNTEREXAMPLE, description="Wraps at cycle 12."),
+            make_declaration(
+                "Spec.Extra",
+                DeclarationStatus.REFUTED,
+                description="Wraps at cycle 12.",
+                evidence=DeclarationEvidence.COUNTEREXAMPLE,
+            ),
             make_declaration("Spec.Idea", DeclarationStatus.IN_PROGRESS),
         ],
         duration_seconds=1.0,
@@ -588,16 +630,20 @@ def test_suggestions_get_their_own_summary_table_and_no_annotations(capsys, tmp_
     lines = github.build_summary(results).splitlines()
 
     assert capsys.readouterr().out == ""
-    assert "**1 proved, 0 disproved, 0 in progress**" in lines
+    assert "**1 proved, 0 refuted, 0 in progress**" in lines
     heading = lines.index("### Suggested by Aristotle")
     assert lines.index("| ✅ | `no_overflow` | proved | The example property holds. |") < heading
-    assert lines.index("| ❌ | `Spec.Extra` | disproved by counterexample | Wraps at cycle 12. |") > heading
+    assert lines.index("| ❌ | `Spec.Extra` | refuted | Wraps at cycle 12. |") > heading
     assert lines.index("| ⬜ | `Spec.Idea` | in progress | The example property holds. |") > heading
 
 
 def test_an_open_ended_summary_has_no_suggestions_table():
     results = RunResults.from_declarations(
-        [make_declaration("Spec.A"), make_declaration("Spec.B", DeclarationStatus.NEGATED)], duration_seconds=1.0
+        [
+            make_declaration("Spec.A"),
+            make_declaration("Spec.B", DeclarationStatus.REFUTED, evidence=DeclarationEvidence.NEGATION_PROVED),
+        ],
+        duration_seconds=1.0,
     )
 
     summary = github.build_summary(results)
@@ -655,21 +701,26 @@ def test_a_property_in_progress_says_so_and_why_before_its_statement(run, reason
     assert notice.endswith(f"::Spec.Underflow in progress. {reason} The counter never underflows.")
 
 
-def test_the_notice_cap_keeps_an_unchecked_disproof_ahead_of_unchecked_proofs(capsys, tmp_path: Path):
+def test_the_notice_cap_keeps_an_unchecked_refutation_ahead_of_unchecked_proofs(capsys, tmp_path: Path):
     proofs = [make_declaration(f"Spec.Proved{i:02}") for i in range(12)]
-    disproof = make_declaration("Spec.Zz", DeclarationStatus.NEGATED, description="Overflows at cycle 9.")
-    results = RunResults.from_declarations([*proofs, disproof], duration_seconds=1.0, out_of_budget=True)
+    refutation = make_declaration(
+        "Spec.Zz",
+        DeclarationStatus.REFUTED,
+        description="Overflows at cycle 9.",
+        evidence=DeclarationEvidence.NEGATION_PROVED,
+    )
+    results = RunResults.from_declarations([*proofs, refutation], duration_seconds=1.0, out_of_budget=True)
 
     github.write_annotations(results, tmp_path)
 
     notices = [line for line in capsys.readouterr().out.splitlines() if line.startswith("::notice")]
-    assert "Spec.Zz disproved, unchecked" in notices[0]
+    assert "Spec.Zz refuted, unchecked" in notices[0]
     assert len(notices) == github.MAX_ANNOTATIONS_PER_LEVEL
 
 
 def test_a_stopped_run_is_one_error_annotation_pointing_at_the_log(capsys, tmp_path: Path):
     results = RunResults.from_declarations(
-        [make_declaration("Spec.F", DeclarationStatus.NEGATED)],
+        [make_declaration("Spec.F", DeclarationStatus.REFUTED, evidence=DeclarationEvidence.NEGATION_PROVED)],
         duration_seconds=1.0,
         stopped_summary="Which reset polarity is intended?\n- 100% high",
     )
@@ -704,10 +755,11 @@ def _refuted(summary: str | None) -> RunResults:
         [
             make_declaration(
                 "Spec.NoOverflow",
-                DeclarationStatus.NEGATED,
+                DeclarationStatus.REFUTED,
                 description="Holds.",
                 source_file="rtl/fifo.v",
                 source_line=3,
+                evidence=DeclarationEvidence.NEGATION_PROVED,
             ).model_copy(update={"declaration_id": "no_overflow"})
         ],
         duration_seconds=1.0,
@@ -954,7 +1006,7 @@ def test_the_summary_says_what_a_verdict_assumes_in_its_cell():
 
 
 def test_an_expected_failure_is_not_annotated_and_an_unexpected_proof_is_an_error(capsys, tmp_path: Path):
-    results = expecting_disproved(DeclarationStatus.NEGATED, DeclarationStatus.PROVED)
+    results = expecting_refuted(DeclarationStatus.REFUTED, DeclarationStatus.PROVED)
 
     github.write_annotations(results, tmp_path)
     summary = github.build_summary(results)
@@ -962,14 +1014,18 @@ def test_an_expected_failure_is_not_annotated_and_an_unexpected_proof_is_an_erro
     out = capsys.readouterr().out
     assert out.count("::error") == 1 and "::notice" not in out
     assert "demo1 unexpectedly proved: update the manifest" in out
-    assert "| ✅ | `demo0` | disproved, as expected |" in summary
+    assert "| ✅ | `demo0` | refuted, as expected |" in summary
     assert "| ❌ | `demo1` | unexpectedly proved: update the manifest |" in summary
 
 
 def _deliberate_under_an_assumption(status: DeclarationStatus) -> RunResults:
-    declaration = make_declaration("Spec.Demo", status).model_copy(update={"declaration_id": "demo"})
+    declaration = make_declaration(
+        "Spec.Demo",
+        status,
+        evidence=DeclarationEvidence.NEGATION_PROVED if status == DeclarationStatus.REFUTED else None,
+    ).model_copy(update={"declaration_id": "demo"})
     requested = RequestedProperty(
-        "demo", Kind.NATURAL_LANGUAGE, "A full FIFO takes no write.", assumptions="pop is low.", expect_disproved=True
+        "demo", Kind.NATURAL_LANGUAGE, "A full FIFO takes no write.", assumptions="pop is low.", expect_refuted=True
     )
     return RunResults.from_declarations([declaration], duration_seconds=1.0, requested=[requested])
 
@@ -977,7 +1033,7 @@ def _deliberate_under_an_assumption(status: DeclarationStatus) -> RunResults:
 @pytest.mark.parametrize(
     ("status", "row"),
     [
-        (DeclarationStatus.NEGATED, "| ✅ | `demo` | disproved, as expected | "),
+        (DeclarationStatus.REFUTED, "| ✅ | `demo` | refuted, as expected | "),
         (DeclarationStatus.PROVED, "| ❌ | `demo` | unexpectedly proved: update the manifest | "),
     ],
 )
@@ -988,14 +1044,19 @@ def test_a_deliberate_counterexample_under_an_assumption_is_never_said_to_hold(s
 
 
 def _linked_failure(artifact_paths: list[str], summary: str | None = None) -> RunResults:
-    declaration = make_declaration("Spec.NoOverflow", DeclarationStatus.COUNTEREXAMPLE, description="Overflows.")
+    declaration = make_declaration(
+        "Spec.NoOverflow",
+        DeclarationStatus.REFUTED,
+        description="Overflows.",
+        evidence=DeclarationEvidence.COUNTEREXAMPLE,
+    )
     results = RunResults.from_declarations(
         [declaration.model_copy(update={"artifact_paths": artifact_paths})], duration_seconds=1.0
     )
     return dataclasses.replace(results, run_summary=summary)
 
 
-def test_a_disproved_propertys_annotation_names_its_artifacts_and_the_download_command(capsys, tmp_path: Path):
+def test_a_refuted_propertys_annotation_names_its_artifacts_and_the_download_command(capsys, tmp_path: Path):
     github.write_annotations(_linked_failure(["sim/cex.vcd", "sim/cex_tb.sv"], "It overflows."), tmp_path)
 
     [annotation] = capsys.readouterr().out.strip().splitlines()
@@ -1005,7 +1066,7 @@ def test_a_disproved_propertys_annotation_names_its_artifacts_and_the_download_c
     )
 
 
-def test_a_disproved_propertys_annotation_without_artifacts_reads_as_it_did(capsys, tmp_path: Path):
+def test_a_refuted_propertys_annotation_without_artifacts_reads_as_it_did(capsys, tmp_path: Path):
     github.write_annotations(_linked_failure([]), tmp_path)
 
     [annotation] = capsys.readouterr().out.strip().splitlines()

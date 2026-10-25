@@ -20,6 +20,7 @@ from aristotlelib.cli.command.continue_ import ContinueAction
 from aristotlelib.cli.controller import main
 from aristotlelib.declaration import (
     Declaration,
+    DeclarationEvidence,
     DeclarationFailureReason,
     DeclarationSource,
     DeclarationStatus,
@@ -37,7 +38,13 @@ def properties():
         yield mock
 
 
-def _property(name: str, status: DeclarationStatus, reason: DeclarationFailureReason | None = None) -> Declaration:
+def _property(
+    name: str,
+    status: DeclarationStatus,
+    reason: DeclarationFailureReason | None = None,
+    *,
+    evidence: DeclarationEvidence | None = None,
+) -> Declaration:
     return Declaration(
         project_id="project-123",
         declaration_id=f"id-{name}",
@@ -45,6 +52,7 @@ def _property(name: str, status: DeclarationStatus, reason: DeclarationFailureRe
         source=DeclarationSource.USER,
         name=name,
         status=status,
+        evidence=evidence,
         failure_reason=reason,
         filename="Spec/Property.lean",
         lean_code="theorem t : True := trivial",
@@ -678,6 +686,8 @@ async def test_continue_json_prints_the_task_and_the_projects_properties(propert
             "name": "Spec.Holds",
             "status": 3,
             "failure_reason": None,
+            "evidence": None,
+            "evidence_message": None,
             "unchecked": False,
             "status_name": "PROVED",
             "failure_reason_name": None,
@@ -691,6 +701,8 @@ async def test_continue_json_prints_the_task_and_the_projects_properties(propert
             "name": "Spec.Unfinished",
             "status": 6,
             "failure_reason": 1,
+            "evidence": None,
+            "evidence_message": None,
             "unchecked": False,
             "status_name": "FAILED",
             "failure_reason_name": "OUT_OF_BUDGET",
@@ -722,7 +734,7 @@ async def test_continue_wait_json_waits_quietly_and_prints_the_finished_task(pro
 
     async def listed(project_id: str, declaration_type: DeclarationType) -> list[Declaration]:
         assert task.status == TaskStatus.COMPLETE_WITH_ERRORS
-        return [_property("Spec.Fails", DeclarationStatus.COUNTEREXAMPLE)]
+        return [_property("Spec.Fails", DeclarationStatus.REFUTED, evidence=DeclarationEvidence.COUNTEREXAMPLE)]
 
     properties.side_effect = listed
     mock_project.has_files = True
@@ -741,8 +753,8 @@ async def test_continue_wait_json_waits_quietly_and_prints_the_finished_task(pro
     ]
     result = json.loads(capsys.readouterr().out)
     assert result["task"]["status"] == "COMPLETE_WITH_ERRORS"
-    assert result["property_counts"]["counterexample"] == 1
-    assert [p["status"] for p in result["properties"]] == [5]
+    assert result["property_counts"]["refuted"] == 1
+    assert [p["status"] for p in result["properties"]] == [2]
 
 
 async def test_continue_json_properties_are_null_when_they_cannot_be_fetched(properties, capsys):
@@ -865,7 +877,7 @@ async def test_continue_wait_ends_with_the_property_counts_and_how_to_get_the_fi
     assert code == 0
     assert from_id.await_count == 2
     assert caplog.messages[-3:] == [
-        "Properties: 1 proved · 0 disproved · 0 in progress · 1 unresolved",
+        "Properties: 1 proved · 0 refuted · 0 in progress · 1 unresolved",
         "The proof of 1 property no longer checks, so it isn't verified; re-run to re-prove it.",
         DOWNLOAD_HINT,
     ]
@@ -879,7 +891,7 @@ async def test_continue_wait_counts_the_proofs_a_task_out_of_budget_left_uncheck
     code, _ = await _continue_and_wait([], TaskStatus.OUT_OF_BUDGET)
 
     assert code == 1
-    assert "Properties: 0 proved · 0 disproved · 0 in progress · 1 unchecked" in caplog.messages
+    assert "Properties: 0 proved · 0 refuted · 0 in progress · 1 unchecked" in caplog.messages
 
 
 @pytest.mark.parametrize(
@@ -895,7 +907,7 @@ async def test_continue_wait_names_no_download_while_the_task_runs_or_when_there
 
     await _continue_and_wait([], status, has_files=has_files)
 
-    assert caplog.messages[-1] == "Properties: 1 proved · 0 disproved · 0 in progress"
+    assert caplog.messages[-1] == "Properties: 1 proved · 0 refuted · 0 in progress"
 
 
 async def test_continue_wait_json_says_how_to_get_the_files_on_stderr_only(properties, caplog, capsys):

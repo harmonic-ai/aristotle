@@ -9,6 +9,7 @@ import pytest
 
 from aristotlelib.declaration import (
     Declaration,
+    DeclarationEvidence,
     DeclarationFailureReason,
     DeclarationSource,
     DeclarationStatus,
@@ -27,6 +28,7 @@ def make_declaration(
     source_line: int | None = None,
     source_anchor: str | None = None,
     failure_reason: DeclarationFailureReason | None = None,
+    evidence: DeclarationEvidence | None = None,
 ) -> Declaration:
     """Build a Declaration without needing a server response."""
     return Declaration(
@@ -37,6 +39,7 @@ def make_declaration(
         name=name,
         status=status,
         failure_reason=failure_reason,
+        evidence=evidence,
         filename=filename,
         source_file=source_file,
         source_line=source_line,
@@ -70,6 +73,35 @@ def git_repo(tmp_path: Path) -> Path:
     return tmp_path
 
 
+def commit_bare_shaped(repo: Path, name: str = "hw") -> Path:
+    """Commit the folder ``name``, which git run inside it reads as a bare repository whose config only says it is one,
+    holding top.v; its HEAD is spelled as git takes one and local_file_utils.is_git_dir() doesn't."""
+    folder = repo / name
+    for marker in ("objects", "refs"):
+        (folder / marker).mkdir(parents=True)
+        (folder / marker / ".keep").write_text("")
+    (folder / "HEAD").write_text("ref:refs/heads/main\n")
+    (folder / "config").write_text("[core]\n\tbare = true\n")
+    (folder / "top.v").write_text("module top;\nendmodule\n")
+    git(repo, "add", name)
+    git(repo, "commit", "-qm", f"{name}, shaped like a bare repository")
+    return folder
+
+
+def recording_git(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+    """The command line of every git command run from now on, as subprocess.run() gets it."""
+    calls: list[list[str]] = []
+    real_run = subprocess.run
+
+    def run(argv, *args, **kwargs):
+        if argv[0] == "git":
+            calls.append(list(argv))
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    return calls
+
+
 def without_git(monkeypatch: pytest.MonkeyPatch, repo: Path) -> None:
     def run(argv, **kwargs):
         raise FileNotFoundError(argv[0])
@@ -98,17 +130,21 @@ def latin1_name(directory: Path, content: str = "module cafe;\nendmodule\n") -> 
     return name
 
 
-def expecting_disproved(*statuses: DeclarationStatus):
-    """RunResults of a manifest run whose properties the manifest all expects disproved, left with ``statuses``."""
+def expecting_refuted(*statuses: DeclarationStatus):
+    """RunResults of a manifest run whose properties the manifest all expects refuted, left with ``statuses``."""
     from aristotlelib.ci.manifest import Kind, RequestedProperty
     from aristotlelib.ci.results import RunResults
 
     declarations = [
-        make_declaration(f"Spec.Demo{i}", status).model_copy(update={"declaration_id": f"demo{i}"})
+        make_declaration(
+            f"Spec.Demo{i}",
+            status,
+            evidence=DeclarationEvidence.NEGATION_PROVED if status == DeclarationStatus.REFUTED else None,
+        ).model_copy(update={"declaration_id": f"demo{i}"})
         for i, status in enumerate(statuses)
     ]
     requested = [
-        RequestedProperty(f"demo{i}", Kind.NATURAL_LANGUAGE, "A full FIFO takes no write.", expect_disproved=True)
+        RequestedProperty(f"demo{i}", Kind.NATURAL_LANGUAGE, "A full FIFO takes no write.", expect_refuted=True)
         for i in range(len(statuses))
     ]
     return RunResults.from_declarations(declarations, duration_seconds=1.0, requested=requested)

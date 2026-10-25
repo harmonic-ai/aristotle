@@ -39,7 +39,7 @@ from aristotlelib.local_file_utils import (
     should_skip_input_file,
     upload_too_large,
 )
-from tests.ci.conftest import git
+from tests.ci.conftest import commit_bare_shaped, git
 from tests.conftest import fstat_on_another_device, hard_link, swapped_for_a_link
 
 SECRET_FILE_EXAMPLES = {
@@ -1079,6 +1079,34 @@ def test_a_subfolder_of_a_git_work_tree_gets_the_repositorys_gitignore(tmp_path)
     assert ignored == {Path("wave.vcd"), Path("build/out.sv")}
 
 
+def test_a_folder_git_ignores_whose_git_folder_git_passes_over_gets_its_own_gitignore_alone(tmp_path):
+    """An empty .git, which git looks past to the repository above it."""
+    repo = _repository(tmp_path)
+    (repo / ".gitignore").write_text("sub/\n")
+    files = _write(repo / "sub", "Main.lean", "run.log")
+    (repo / "sub" / ".gitignore").write_text("*.log\n")
+    (repo / "sub" / ".git").mkdir()
+
+    assert gitignored_files(repo / "sub", files) == {Path("run.log")}
+    assert local_file_utils.left_out_rules(repo / "sub", [Path("run.log")]) == {Path("run.log"): "sub/.gitignore"}
+
+
+def test_a_folder_shaped_like_a_bare_repository_gets_the_checkouts_gitignore(tmp_path, caplog):
+    repo = _repository(tmp_path)
+    git(repo, "config", "user.email", "test@example.com")
+    git(repo, "config", "user.name", "Test")
+    (repo / ".gitignore").write_text("*.log\n")
+    hw = commit_bare_shaped(repo)
+    (hw / "kept.log").write_text("tracked, then ignored\n")
+    git(repo, "add", "-f", "hw/kept.log")
+
+    with caplog.at_level(logging.WARNING, logger="aristotle"):
+        ignored = gitignored_files(hw, [*_write(hw, "run.log"), Path("kept.log"), Path("top.v")])
+
+    assert ignored == {Path("run.log"), Path("kept.log")}
+    assert "  kept.log  (.gitignore:1: *.log)" in caplog.messages[0]
+
+
 def test_a_tracked_file_that_a_gitignore_rule_matches_is_ignored_and_named(tmp_path, caplog):
     repo = _repository(tmp_path)
     files = _write(repo, "notes.log", "top.sv")
@@ -1489,3 +1517,26 @@ def test_the_repository_found_is_the_one_git_finds_under_git_ceiling_directories
 )
 def test_a_ceiling_entry_is_absolute_where_git_takes_it_so(entry, on_windows, elsewhere):
     assert local_file_utils._is_absolute(entry) == (on_windows if os.name == "nt" else elsewhere)
+
+
+@pytest.mark.parametrize("across", ["", "1"], ids=["", "GIT_DISCOVERY_ACROSS_FILESYSTEM"])
+def test_the_repository_search_stays_on_the_folders_file_system_as_git_does(tmp_path, monkeypatch, across):
+    outer = tmp_path.resolve() / "outer"
+    mount = outer / "mnt"
+    (mount / "proj").mkdir(parents=True)
+    _repository(outer)
+    real_stat = os.stat
+
+    def stat(path, *args, **kwargs):
+        result = real_stat(path, *args, **kwargs)
+        if os.fspath(path) == str(mount) or os.fspath(path).startswith(str(mount) + os.sep):
+            return os.stat_result((*result[:2], result.st_dev + 1, *result[3:]))
+        return result
+
+    monkeypatch.setattr(os, "stat", stat)
+    monkeypatch.setenv("GIT_DISCOVERY_ACROSS_FILESYSTEM", across)
+
+    found = local_file_utils.enclosing_repository(mount / "proj")
+
+    # git for Windows has no device numbers to compare.
+    assert found == (outer if across or os.name == "nt" else None)
