@@ -1,6 +1,6 @@
 ---
 name: aristotle
-description: Formally verify code with Harmonic's Aristotle through the `aristotle` CLI. Submits a project, answers its questions, reports which properties were proved or refuted, and keeps an existing `aristotle.toml`, the properties `aristotle ci` checks, in step with the code. Use when the user asks to prove, formally verify or find a counterexample to a property of Verilog/SystemVerilog, C, Rust or Lean code, mentions Aristotle or `aristotle.toml`, or changes code or a spec that an `aristotle.toml` covers.
+description: Formally verify code with Harmonic's Aristotle through the `aristotle` CLI. Submits a project, answers its questions, reports which properties were proved or refuted, and keeps an existing `aristotle.toml`, the properties `aristotle ci` checks, in step with the code. Use when the user asks to prove, formally verify or find a counterexample to a property of Verilog/SystemVerilog, C or Rust code, mentions Aristotle or `aristotle.toml`, or changes code or a spec that an `aristotle.toml` covers.
 ---
 
 # Aristotle
@@ -12,14 +12,13 @@ commands are for POSIX shells; in Windows PowerShell, read [references/windows.m
 ## Before the first command
 
 1. Run `aristotle --version`. It must print `aristotlelib 3.` followed by the rest of the version.
-   - aristotlelib 3.0.0 isn't on PyPI yet. If the command isn't found, or prints `aristotlelib 2.` or older, ask the
-     user to install the exact release candidate (`3.0.0rc` and a number) Harmonic gave them, the way Harmonic told
-     them: a wheel file, with `uv tool install --force ./aristotlelib-<version>-py3-none-any.whl`, or a private index,
-     with `uv tool install --force --index <their index URL> "aristotlelib==<version>"`. Never install a bare
-     `aristotlelib`, or a range such as `aristotlelib>=3`: PyPI has only 2.x, and pip and uv skip a release candidate
-     that isn't named exactly. Until the user has 3.x, follow [Older CLIs](#older-clis).
-   - Output that doesn't start with `aristotlelib` comes from another `aristotle` on `PATH`: run Aristotle's by its
-     full path, such as `"$(uv tool dir --bin)/aristotle"`, or ask the user to fix `PATH`.
+   - If the command isn't found, or prints `aristotlelib 2.` or older, ask the user to install it with
+     `uv tool install "aristotlelib>=3"`. If uv says an executable named `aristotle` already exists, it's usually an
+     older aristotlelib that pip installed: ask the user before adding `--force`. Until the user has 3.x, follow
+     [Older CLIs](#older-clis).
+   - Output that doesn't start with `aristotlelib`, or a version older than 3 after that install, comes from another
+     `aristotle` on `PATH`: run Aristotle's by its full path, such as `"$(uv tool dir --bin)/aristotle"`, or ask the
+     user to fix `PATH`.
    - A command or flag below that the CLI rejects means the CLI is older than this skill. Check
      `aristotle <command> --help`, which has every flag's detail, and work with what it offers.
 2. Check access with `aristotle list --limit 1 --json`. Exit 5 means there is no API key, or Aristotle
@@ -407,11 +406,11 @@ Then check it:
       reports say disproved. List refutations with `--status DISPROVED`, since `--status REFUTED` exits 2. Results
       have no `evidence` or `evidence_message`, and from current servers a counterexample reads `NEGATED` too, so
       take how a property was refuted from `task.output_summary`.
-    - `aristotle.toml` takes `expect = "disproved"` and refuses `expect = "refuted"`, and later versions refuse
+    - `aristotle.toml` takes `expect = "disproved"` and refuses `expect = "refuted"`, and 3.0.0 refuses
       `"disproved"`. Change the value together with the version the CI job pins.
 
-  To upgrade, ask the user to install the exact file or version Harmonic gives them, as under
-  [Before the first command](#before-the-first-command).
+  To upgrade, ask the user to run `uv tool install "aristotlelib>=3"`: `uv tool upgrade` keeps a release candidate
+  where it is.
 - **2.x** has no `--json`, `--non-interactive`, `questions`, `properties`, `login` or `aristotle.toml`, and exits 0 on
   most errors, so don't trust the exit code; its questions can't be answered. Until the user upgrades, start the run
   with `aristotle submit "$(cat <out>/prompt.md)" --project-dir <dir>`, which returns once stderr shows

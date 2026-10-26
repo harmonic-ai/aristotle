@@ -175,8 +175,8 @@ class SubmitAction(APIAction):
             "--project-dir",
             type=project_dir_argument,
             help=(
-                "A directory holding everything Aristotle will need. Lean is available on every account; "
-                "Verilog, C and Rust are available on accounts where they're enabled. Files git ignores (unless "
+                "A directory holding everything Aristotle will need. Verilog and C are available on every account, "
+                "and Rust on accounts where it's enabled. Files git ignores (unless "
                 "--include-ignored), files named like credentials or kept in a folder that holds them, result archives "
                 "an earlier run saved and files whose names aren't UTF-8 are left out, and the rest goes up as one "
                 "compressed archive of at most 100 MB. An aristotle.f there is read as a Verilog filelist, and every "

@@ -30,10 +30,8 @@ VERILOG_REMOVED_MESSAGE = (
     'out the sources, includes and macros itself:\n  aristotle submit "<prompt>" --project-dir rtl'
 )
 FORMALIZE_REMOVED_MESSAGE = (
-    "`aristotle formalize` has been removed. Copy the file into a new directory and submit that; "
-    "`--project-dir` uploads everything in it:\n"
-    '  mkdir formalize-paper && cp paper.tex formalize-paper/ && aristotle submit "Formalize paper.tex" '
-    "--project-dir formalize-paper"
+    "`aristotle formalize` has been removed. Aristotle verifies Verilog, C and Rust code: submit the folder that "
+    'holds it, with the property to prove in the prompt:\n  aristotle submit "<prompt>" --project-dir <folder>'
 )
 RETIRED_COMMANDS = {
     "ask": ASK_REPLACED_MESSAGE,

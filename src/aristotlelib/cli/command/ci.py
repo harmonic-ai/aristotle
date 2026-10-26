@@ -1404,19 +1404,18 @@ def _not_registered_warning(run_results: results.RunResults) -> str:
 
 
 def _language_causes(access: dict[str, bool | None]) -> tuple[list[str], list[str]]:
-    """Causes in the account's languages: those Aristotle says are not enabled, and those it can't say about."""
+    """Causes in the account's languages: those Aristotle says are not enabled, and those it gives no way to ask about."""
     off = [
         f"{language} is not enabled for this account, so Aristotle left it out"
         for language, on in access.items()
         if on is False
     ]
+    # Aristotle has no way to ask about Rust, so that cause is only possible, never confirmed. Verilog and C are on for
+    # every account, so a check that didn't answer names neither.
     unknown = [
-        f"{language} may not be enabled for this account, which would leave it out"
-        if language in runner.LANGUAGE_ACCESS_ENDPOINTS
-        # Aristotle has no way to ask about Rust, so this cause is only possible, never confirmed.
-        else f"{language} is left out if this account can't verify it, which Aristotle gives no way to check"
+        f"{language} is left out if this account can't verify it, which Aristotle gives no way to check"
         for language, on in access.items()
-        if on is None
+        if on is None and language not in runner.LANGUAGE_ACCESS_ENDPOINTS
     ]
     return off, unknown
 

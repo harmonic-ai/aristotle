@@ -617,16 +617,12 @@ async def test_a_run_that_verified_no_manifest_property_fails_and_names_the_like
             "Likely causes: Verilog is not enabled for this account, so Aristotle left it out; or Aristotle "
             "registered nothing under the manifest's ids.",
         ),
-        (
-            {"Verilog": None},
-            "Likely causes: Aristotle registered nothing under the manifest's ids; or Verilog may not be enabled for "
-            "this account, which would leave it out.",
-        ),
+        ({"Verilog": None}, "Likely cause: Aristotle registered nothing under the manifest's ids."),
         ({"Verilog": True}, "Likely cause: Aristotle registered nothing under the manifest's ids."),
     ],
     ids=["off", "unknown", "on"],
 )
-async def test_a_language_is_a_cause_where_aristotle_says_it_is_off_or_cannot_say(
+async def test_a_language_is_a_cause_only_where_aristotle_says_it_is_off(
     action: CIAction, repo: Path, caplog, access: dict[str, bool | None], causes: str
 ):
     with caplog.at_level(logging.ERROR, logger="aristotle"):
@@ -941,9 +937,8 @@ URL = _project().web_url()
         (
             None,
             {"Verilog": None},
-            "The time budget ran out with no property under any of the manifest's ids. Likely causes: the run needs "
-            "longer than the time budget, so raise --timeout; or Verilog may not be enabled for this account, which "
-            f"would leave it out. Waiting for a free slot counts toward --timeout. See how far it got at {URL}",
+            "The time budget ran out with no property under any of the manifest's ids. See how far it got at "
+            f"{URL}, and raise --timeout if it needs longer. Waiting for a free slot counts toward --timeout.",
         ),
         (
             TaskStatus.OUT_OF_BUDGET,

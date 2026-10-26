@@ -58,9 +58,9 @@ outputs:
     description: "Path to the JUnit report that was written."
 
 runs:
-  # Built on the runner; once published, `image: docker://ghcr.io/harmonic-ai/aristotle:3` skips the build.
+  # This release's image, which the release pushes before it moves the `v3` tag.
   using: "docker"
-  image: "Dockerfile"
+  image: "docker://ghcr.io/harmonic-ai/aristotle:3.0.0"
   # The image has no entrypoint (GitLab and Jenkins start it with their own shell), so it is named here.
   entrypoint: "aristotle"
   args:

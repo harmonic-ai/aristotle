@@ -4,10 +4,9 @@ All notable changes to `aristotlelib`, the Aristotle Python SDK and `aristotle` 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [3.0.0] - Unreleased
+## [3.0.0] - 2026-10-27
 
-The release candidates `3.0.0rc1`, `3.0.0rc2` and so on are pre-releases: they are not published to PyPI, and
-this section describes 3.0.0 as it will ship.
+The release candidates `3.0.0rc1`, `3.0.0rc2` and so on were pre-releases, not published to PyPI.
 
 Continuation uploads now preserve paths relative to the current directory, or an explicit `--project-dir` root
 (`project_dir=` in `Project.ask`). Earlier releases flattened uploaded filenames. Select downloaded files beneath
@@ -60,11 +59,11 @@ Ask mode is removed from the CLI and the SDK.
 
 #### `aristotle formalize`
 
-Removed. Copy the file into a directory of its own and submit that directory:
+Removed. Aristotle verifies Verilog, C and Rust code: submit the folder that holds it, with the property to prove in
+the prompt:
 
 ```bash
-mkdir formalize-paper && cp paper.tex formalize-paper/
-aristotle submit "Formalize paper.tex" --project-dir formalize-paper --wait
+aristotle submit "<prompt>" --project-dir <folder> --wait
 ```
 
 #### SDK behavior
@@ -111,9 +110,10 @@ From 2.1.0, skip this section.
 Update scripts and manifests from 3.0.0rc12 or earlier for the refutation contract:
 
 - Use `DeclarationStatus.REFUTED` (2); `NEGATED` and `COUNTEREXAMPLE` (5) are removed. `FAILED` stays 6.
-  Each refutation requires `DeclarationEvidence.COUNTEREXAMPLE` (1), `NEGATION_PROVED` (2) or `BOTH` (3).
-  Python-created declarations require explicit evidence. The SDK infers missing evidence only when reading old API
-  responses and preserves `evidence_message` as received.
+  Each refutation requires `DeclarationEvidence.COUNTEREXAMPLE` (1), `NEGATION_PROVED` (2) or `BOTH` (3), except that
+  one read from a server with a kind this version doesn't know has `UNKNOWN` (0), and still counts as refuted.
+  Python-created declarations require explicit evidence of a known kind. The SDK infers missing evidence only when
+  reading old API responses and preserves `evidence_message` as received.
 - Use `properties --status REFUTED`; `NEGATED`, `COUNTEREXAMPLE` and `DISPROVED` filters are removed.
 - Read `refuted` outcomes and counts. `PropertyCounts` has only `proved`, `refuted`, `in_progress`, `unresolved`
   and `unchecked`; remove uses of `negated`, `counterexample` and `disproved` counters.
@@ -168,6 +168,9 @@ The result models, all new in 3.0.0, follow: `PropertyCounts.in_progress` and `.
 The plugin `aristotle@harmonic` now installs the skill from the release's tag. A Claude Code install from before that
 stops loading after `claude plugin marketplace update harmonic`, until `claude plugin update aristotle@harmonic`
 follows, so run both.
+
+The GitHub Action pulls the release's published image, where a release candidate's Action built the image on the
+runner. That image is built for x86-64 only, so a job on an Arm runner needs an x86-64 runner or x86-64 emulation.
 
 ### Added
 
@@ -243,16 +246,22 @@ follows, so run both.
   long to fit loses the namespace it shares with another listed name, then its middle, as far as it stays distinct
   from the other listed names, and `aristotle property` takes it as shown.
   `aristotle property <project-id> <name>` shows one property in full: its statement, status, source location and
-  the Lean it was formalized as. `aristotle show` adds a line counting the project's properties. (#129, #197)
+  the Lean it was formalized as. `aristotle show` adds a line counting the project's properties.
+  A refuted property names its evidence, how Aristotle refuted it: `COUNTEREXAMPLE`, `NEGATION_PROVED` for a proof of
+  its negation, or `BOTH`. `properties` shows it in an `EVIDENCE` column, and `property` adds Aristotle's message
+  about it. `--json` gives it as `evidence`, 1 to 3, with `evidence_message`, and in Python `Declaration.evidence` is an
+  `aristotlelib.declaration.DeclarationEvidence`, which a refuted `Declaration` you create must give. An evidence kind
+  this version doesn't know, such as one a later server adds, reads as `UNKNOWN`, 0, and the property still counts as
+  refuted. (#129, #197, #314, #342)
 - Answering Aristotle's questions. At a terminal, `submit --wait`, `continue --wait` and `show` present the
   questions as they arrive, one set at a time, with a review screen before anything is sent.
   `aristotle questions <project-id>` lists a task's questions and offers to answer the pending ones. (#130)
 - `--json` on `list`, `tasks`, `show`, `submit`, `continue`, `cancel`, `rename`, `download`, `questions`, `properties`
   and `property`. The result goes to stdout as JSON and everything else to stderr. A listing is an object that names
   what it lists beside the next page's `pagination_key`, and timestamps carry their `+00:00`. The shapes are the SDK's
-  pydantic models, in `aristotlelib.results` and the record classes. Each numeric code has its name beside it, such as
-  `status_name`: `PROVED` beside a property's `status` 3, and `failure_reason_name`, `event_type_name`,
-  `declaration_type_name` and `source_name`. (#137, #245)
+  pydantic models, in `aristotlelib.results` and the record classes. Each numeric code but `evidence` has its name
+  beside it, such as `status_name`: `PROVED` beside a property's `status` 3, and `failure_reason_name`,
+  `event_type_name`, `declaration_type_name` and `source_name`. (#137, #245)
 - `submit --json`, `continue --json` and `show --json` say which properties hold: `property_counts` counts them by
   verdict, and `properties` gives each one's `declaration_id`, `name`, `status` and `failure_reason`, as they stand
   after any wait. `continue --json` prints `{"project_id", "project", "task", "web_url", "property_counts",
@@ -300,8 +309,8 @@ follows, so run both.
   `check.max_wall_time_seconds` sets the budget, else 60 minutes. `--dry-run` validates the manifest and shows the
   upload without submitting anything. Every flag that takes a value can also be set with an `ARISTOTLE_*` environment
   variable. It runs from the image `ghcr.io/harmonic-ai/aristotle:3` or as the GitHub Action
-  `harmonic-ai/aristotle@v3`. It verifies Verilog, C and Rust, which are available on accounts where they're
-  enabled. A run that never left the queue exits 6, whatever `--fail-on` is. (#119, #148, #184)
+  `harmonic-ai/aristotle@v3`. It verifies Verilog and C on every account, and Rust on accounts where it's enabled. A
+  run that never left the queue exits 6, whatever `--fail-on` is. (#119, #148, #184)
 - `aristotle ci setup` writes `aristotle.toml`: at a terminal, Aristotle reads the repository, asks its questions and
   proposes properties, and the command writes them for you to review and commit, noting any it already proved or
   refuted. It never replaces an existing manifest without `--force`, and `--from <project>` (or `ARISTOTLE_FROM`)
@@ -518,7 +527,7 @@ follows, so run both.
   `--no-questions` turns questions off for a batch run, for a new task. 2.1.0 and 3.0.0rc1 to rc4 turned them off
   unless the command waited. `aristotle ci` and `aristotle review` still turn them off, and `aristotle ci setup`
   still turns them on. (#187)
-- The copy offers Lean on every account, and Verilog, C and Rust on accounts where they're enabled. (#135)
+- The copy offers Verilog and C on every account, and Rust on accounts where it's enabled. (#135, #346)
 - Links point at the current web app pages (`/keys`, `/docs`, `/projects/<id>`) instead of the retired
   `/dashboard` ones. (#122)
 - Ctrl-C during a wait exits 130 without a traceback and says the task is still running. (#130, #136)
@@ -948,18 +957,15 @@ follows, so run both.
 
 For beta users: these entries fix problems only a 3.0.0 release candidate had, which a user of 2.1.0 never met.
 
+- `aristotle ci` and `aristotle review` name Verilog or C as a cause of a run that verified nothing only when Aristotle
+  says the account doesn't have it. Both are on for every account, so they no longer name one as a possibility when
+  Aristotle doesn't answer. (#346)
 - `aristotle ci`, `aristotle review` and `submit --project-dir` run git from the top of the checkout, the nearest folder
   at or above the one they read that holds a `.git`, with `safe.bareRepository=explicit` and with `core.fsmonitor` off.
   They ran git in that folder, so a committed folder that git reads as a bare repository, one holding `HEAD`,
   `objects/` and `refs/`, was the repository git used, with its `config`'s settings: `--directory` on it failed with
   `this operation must be run in a work tree` or found no tracked files, and `submit` applied only that folder's
   `.gitignore`. (#340)
-- Refutations use one `REFUTED` status and count once, with `COUNTEREXAMPLE`, `NEGATION_PROVED` or `BOTH` evidence
-  on each property. Text output lists the evidence kind separately, and `aristotle property` includes the agent's
-  message before its artifacts. JSON preserves the message as received. `FAILED` keeps its wire value 6.
-- An evidence kind this version doesn't know, such as one a later server adds, reads as `UNKNOWN`, as an unknown
-  status does. The `EVIDENCE` column and `aristotle property` show `UNKNOWN`, JSON gives `0`, and `show` still counts
-  the property. A `Declaration` created in Python with an unknown kind is still refused. (#342)
 - Following the skill or the setup guide, a coding agent with no key asks the user which way to log in before it
   starts a login, so a headless session, such as `claude -p` or `codex exec`, ends with the question. It started a
   login in the background, showed the code in a message that `claude -p` doesn't print, and waited 10 minutes for the

@@ -68,6 +68,14 @@ def test_only_a_pre_release_ships_the_beta_package_page():
     assert project["readme"] != "README-beta.md" or Version(project["version"]).is_prerelease
 
 
+def test_the_action_runs_the_image_its_release_pushes():
+    """A release pushes its exact version's image before it moves `v3`, so an Action pinned to a release keeps its CLI."""
+    action = (REPO / "action.yml").read_text(encoding="utf-8")
+    images = re.findall(r"^\s*image:\s*\"?([^\"\s]+)", action, re.MULTILINE)
+
+    assert images == [f"docker://ghcr.io/harmonic-ai/aristotle:{_project()['version']}"]
+
+
 def test_the_image_build_copies_the_package_page():
     copies = [
         line.split()[1:-1]

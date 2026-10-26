@@ -33,13 +33,8 @@ uv tool install "aristotlelib>=3"
 "$(uv tool dir --bin)/aristotle" --version
 ```
 
-- aristotlelib 3.0.0 isn't on PyPI yet, so that install finds no version to install. Harmonic gives each beta user an
-  exact release candidate, as a wheel file or on a private package index. **User step, then wait:** ask the user to
-  install it as Harmonic told them: `uv tool install --force ./aristotlelib-<version>-py3-none-any.whl` from the
-  folder that holds the file, or `uv tool install --force --index <their index URL> "aristotlelib==<version>"`. Don't
-  ask for the index URL in the conversation, since it can carry a credential.
-- If uv says an executable named `aristotle` already exists, another program has that name. Ask the user before
-  replacing it.
+- If uv says an executable named `aristotle` already exists, another program has that name, usually an older
+  aristotlelib that pip installed. Ask the user before replacing it with `--force`.
 - If the bare `aristotle --version` still doesn't print `aristotlelib 3.` after the install, but
   `"$(uv tool dir --bin)/aristotle" --version` does, use that full path for the rest of this guide, the login
   command included. That covers a bare command that isn't found, another program named `aristotle`,
@@ -47,11 +42,6 @@ uv tool install "aristotlelib>=3"
   alone: in the report, ask the user to run `uv tool update-shell` and open a new terminal, or to fix `PATH`.
 
 ## 2. Install the skill
-
-The harmonic-ai/aristotle repository isn't public yet, so these commands work only for GitHub accounts that have been
-granted access to it. They fetch it over HTTPS. **User step,** for an account that reaches GitHub only over SSH: the
-user runs `git config --global url."git@github.com:harmonic-ai/".insteadOf https://github.com/harmonic-ai/`, which
-changes their global git configuration.
 
 **Claude Code:**
 
@@ -66,8 +56,7 @@ claude plugin list
 older side up to date:
 
 - an older skill: `claude plugin marketplace update harmonic`, then `claude plugin update aristotle@harmonic`;
-- an older CLI: `uv tool install "aristotlelib>=<the skill's version>"`. aristotlelib 3.0.0 isn't on PyPI yet, so
-  until then the user installs the newer release candidate Harmonic gave them, as in step 1.
+- an older CLI: `uv tool install "aristotlelib>=<the skill's version>"`.
 
 **User step:** run `/reload-plugins`, so that the skill loads in this session. After `claude plugin update`, Claude Code
 needs a restart instead, which ends this session: list it in the report.
@@ -92,7 +81,7 @@ Codex's sandbox blocks the network without asking, so `aristotle` retries and th
 release:
 
 ```bash
-src=$(mktemp -d) && git clone --depth 1 --branch v3.0.0rc13 https://github.com/harmonic-ai/aristotle.git "$src" &&
+src=$(mktemp -d) && git clone --depth 1 --branch v3.0.0 https://github.com/harmonic-ai/aristotle.git "$src" &&
   mkdir -p ~/.agents/skills && rm -rf ~/.agents/skills/aristotle &&
   cp -R "$src/skills/aristotle" ~/.agents/skills/
 ```
@@ -101,7 +90,7 @@ In PowerShell on Windows:
 
 ```powershell
 $src = Join-Path ([IO.Path]::GetTempPath()) ([IO.Path]::GetRandomFileName())
-git clone --depth 1 --branch v3.0.0rc13 https://github.com/harmonic-ai/aristotle.git $src
+git clone --depth 1 --branch v3.0.0 https://github.com/harmonic-ai/aristotle.git $src
 if (Test-Path "$src\skills\aristotle") {
   New-Item -ItemType Directory -Force "$HOME\.agents\skills" | Out-Null
   Remove-Item -Recurse -Force "$HOME\.agents\skills\aristotle" -ErrorAction SilentlyContinue

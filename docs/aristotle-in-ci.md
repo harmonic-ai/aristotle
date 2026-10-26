@@ -4,7 +4,7 @@
 
 Aristotle proves the properties your team lists in `aristotle.toml` about your Verilog, C, and
 Rust — on every pull request that could affect them, reported the same way your unit tests are.
-Verilog, C and Rust are available on accounts where they're enabled.
+Verilog and C are available on every account, and Rust on accounts where it's enabled.
 
 No new dashboard to check. No specialist to schedule. If a change breaks a property your
 team cares about, the build goes red and the engineer who wrote the change finds out on
@@ -181,21 +181,9 @@ API key.
 ## Get started
 
 The GitLab and Jenkins recipes below pull the image `ghcr.io/harmonic-ai/aristotle:3`, which
-each release publishes. The GitHub Action builds the image on the runner itself, but this
-repository is not public yet, so `harmonic-ai/aristotle@v3` resolves only in workflows that
-have been granted access to it.
-
-**Before the 3.0.0 release.** `:3` and `@v3` don't exist until 3.0.0 is released: the release
-candidates are tagged with their exact version, `3.0.0rc` and a number, and the repository's
-releases list them. Until then, pin the release candidate you were given: for example
-`ghcr.io/harmonic-ai/aristotle:3.0.0rc13` in the GitLab and Jenkins recipes, and
-`uses: harmonic-ai/aristotle@v3.0.0rc13` in the GitHub workflow. The image is private until
-then too, so GitLab and Jenkins need a token that can read packages to pull it: in GitLab, a
-`DOCKER_AUTH_CONFIG` CI/CD variable for `ghcr.io`; in Jenkins, `registryUrl 'https://ghcr.io'` and
-`registryCredentialsId` on the `docker` agent. The Action builds its image on the runner, so a
-GitHub job needs neither. Name an exact release candidate rather than a range, and move to `:3`
-and `@v3` once 3.0.0 is out.
-<!-- End of the beta paragraph. -->
+each release publishes. The GitHub Action runs the same image at its own release's version, so
+`harmonic-ai/aristotle@v3` runs the newest 3.x release and `@v3.0.0` stays on 3.0.0. The image is
+built for x86-64 (`linux/amd64`) only, so a runner on Arm needs x86-64 emulation to run it.
 
 Until Aristotle can re-check results it has already established, every `aristotle ci` run is a
 full proving run of every property in the manifest, with the time and cost that implies. That is
@@ -251,6 +239,14 @@ budget from the manifest's `max_wall_time_seconds`, while `review` fails on `nev
 60 minutes, and both cancel their run when the budget runs out, except that `ci --project` leaves the run it
 reports on going. It passes no other option, such as `--allow-untracked` (see
 [Generated sources and shared folders](#generated-sources-and-shared-folders)).
+
+The report goes to the `junit` path, `aristotle-results.xml` by default. Give it relative to the
+top of the workspace, where the checkout is, not to `working-directory`: a subproject's report
+needs the folder in its path, as in `junit: hw/fifo/aristotle-results.xml`.
+The action runs in a container, and only what it writes in the workspace stays for later steps:
+a path elsewhere, such as in `${{ runner.temp }}`, is written inside the container and gone when
+the step ends. Once the report is written, the step sets its `junit` output to the path as
+given, which a later step can read as `${{ steps.<id>.outputs.junit }}` to publish the report.
 
 Each job is a run of its own, and both count against your account's limit of projects in
 progress. Side by side, one would wait for the other out of its own time budget, and could run
@@ -353,7 +349,11 @@ docker run --rm -v "$PWD:/workspace" -w /workspace \
   ghcr.io/harmonic-ai/aristotle:3 aristotle ci
 ```
 
-To run the step in an image of your own instead, install `aristotlelib` and git in it. For a
+To run the step in an image of your own instead, install git in it, and the CLI with pip:
+`pip install "aristotlelib>=3"`, as the published image does, starting from the official
+`python:3.12-slim`. A distribution's own Python, such as Debian 12's or Ubuntu 24.04's, refuses
+a pip install outside a virtual environment: install the CLI in one, and put its `bin` folder
+on `PATH`. For a
 Jenkins job, also install `ps` and `kill`, which Jenkins runs in the container to stop a step:
 without them, aborting the build leaves its run going. Debian has both in `procps`, which slim
 images leave out. git refuses a checkout the job's user doesn't own, as when `docker run -v`
@@ -460,8 +460,8 @@ One the run has no property under, because Aristotle registered none or withdrew
 without a verdict too, as `not registered`, or `not registered, run cut short` when the run ended before
 registering it: ran out of budget or time, failed or was cancelled. A run that verifies none of the manifest's properties fails
 the build, even under the default `fail-on`, and the log names the likely causes and links the run.
-If Verilog or C isn't enabled for the account, Aristotle leaves that code out of the run, and the log
-says so: the step asks Aristotle. It can't ask about Rust, so it names Rust as a possibility. Only
+If Rust isn't enabled for the account, Aristotle leaves that code out of the run. The step can't ask
+Aristotle whether it is, so the log names Rust as a possible cause. Only
 `fail-on: never` lets such a run pass. Aristotle checks a
 run's results when the run finishes, so a run that runs out of budget, or hits the time budget,
 reports what it reached as unchecked: a proof or refutation it reported has no verdict, labelled

@@ -1196,11 +1196,11 @@ async def test_a_dry_run_leaves_out_database_cloud_cluster_and_terraform_credent
     [
         ({"Verilog": True}, ""),
         ({"Verilog": False}, " Likely cause: Verilog is not enabled for this account, so Aristotle left it out."),
-        ({"Verilog": None}, " Likely cause: Verilog may not be enabled for this account, which would leave it out."),
+        ({"Verilog": None}, ""),
     ],
     ids=["on", "off", "unknown"],
 )
-async def test_a_run_with_no_properties_warns_naming_a_language_only_where_aristotle_says_it_is_off_or_cannot_say(
+async def test_a_run_with_no_properties_warns_naming_a_language_only_where_aristotle_says_it_is_off(
     action: ReviewAction, repo: Path, caplog, access: dict[str, bool | None], causes: str
 ):
     with caplog.at_level(logging.WARNING, logger="aristotle"):

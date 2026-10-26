@@ -98,12 +98,6 @@ def test_a_retired_command_after_the_api_key_still_prints_its_replacement(api_ke
     assert FORMALIZE_REMOVED_MESSAGE in capsys.readouterr().err
 
 
-def test_formalize_replacement_copies_and_submits_only_after_setup():
-    command = FORMALIZE_REMOVED_MESSAGE.splitlines()[-1]
-    assert " mv " not in command and "cp paper.tex" in command
-    assert command.strip().startswith("mkdir ") and command.count("&&") == 2
-
-
 @pytest.mark.parametrize(
     ("argv", "used"),
     [

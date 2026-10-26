@@ -998,7 +998,7 @@ class Project(AristotleObject):
 
         Args:
             prompt: Tells Aristotle what to do.
-            project_dir: Path to the directory with any supplementary files, e.g. a Lean project.
+            project_dir: Path to the directory with any supplementary files, e.g. a Verilog, C or Rust project.
             agent_questions_setting: Whether the agent can ask questions. By default it can, and waits up to 15
                 minutes for each answer; DISABLED turns questions off.
             name: The project's name, as for create().
