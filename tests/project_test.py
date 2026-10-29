@@ -30,7 +30,7 @@ import httpx
 import pytest
 
 from aristotlelib import api_request, local_file_utils
-from aristotlelib.agent_task import ENDED_BADLY, AgentTask, TaskStatus, ending_notice
+from aristotlelib.agent_task import ENDED_BADLY, AgentTask, BudgetFailureReason, TaskStatus, ending_notice
 from aristotlelib.api_request import AristotleAPIError, AristotleNotFoundError, set_api_key
 from aristotlelib.cli.question_flow import DEFAULT_DEADLINE_SECONDS, FlowResult, pending_footer, read_stdin_line
 from aristotlelib.declaration import Declaration, DeclarationSource, DeclarationStatus, DeclarationType
@@ -54,7 +54,15 @@ from aristotlelib.project import (
 )
 from aristotlelib.question import Question
 from tests.ci.conftest import git, latin1_name
-from tests.conftest import fast_api_clock, fstat_on_another_device, hard_link, swapped_for_a_link
+from tests.conftest import (
+    BILLING_PAGE,
+    BUY_CREDITS,
+    OUT_OF_CREDITS,
+    fast_api_clock,
+    fstat_on_another_device,
+    hard_link,
+    swapped_for_a_link,
+)
 
 
 async def test_project_from_id():
@@ -4163,6 +4171,23 @@ async def test_an_incomplete_run_points_at_its_summary_not_at_the_prompt(caplog)
 
 
 @pytest.mark.parametrize(
+    ("status", "messages"),
+    [("COMPLETE_WITH_ERRORS", []), ("COMPLETE", ["Task complete!"]), ("OUT_OF_BUDGET", ["Task ran out of budget."])],
+)
+async def test_a_caller_that_says_how_an_incomplete_run_ended_gets_only_the_other_endings(status, messages, caplog):
+    """As ci setup, whose run proposes properties without proving them."""
+    client = _streaming_client([_plain_event("event-1", "Stopping")], end_status=status)
+    with (
+        patch("aristotlelib.api_request.AristotleRequestClient", return_value=client),
+        patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
+        caplog.at_level(logging.INFO, logger="aristotle"),
+    ):
+        await _waiting_task().wait_for_completion(interactive=False, resumable=False, _incomplete_ending=False)
+
+    assert caplog.messages == messages
+
+
+@pytest.mark.parametrize(
     ("status", "level", "message"),
     [
         (
@@ -4279,6 +4304,101 @@ def test_a_task_someone_else_owns_gets_no_command_to_resume_it(status):
 
 def test_a_task_that_ended_well_or_is_going_gets_no_notice():
     assert all(ending_notice(status, "proj-1") is None for status in TaskStatus if status not in ENDED_BADLY)
+
+
+@pytest.mark.parametrize(
+    ("reason", "ending", "when"),
+    [
+        (
+            BudgetFailureReason.OUT_OF_CREDITS,
+            "Task stopped: your organization ran out of credits.",
+            f"Once an organization admin buys credits at {BILLING_PAGE}, resume it",
+        ),
+        (
+            BudgetFailureReason.TRIAL_CREDIT_CONCURRENCY_LIMIT,
+            "Task stopped: free credits allow one active project per organization.",
+            "Once no other project of your organization is running, or an organization admin buys credits at "
+            f"{BILLING_PAGE}, resume it",
+        ),
+        (
+            BudgetFailureReason.BILLING_UNAVAILABLE,
+            "Task stopped: Aristotle couldn't check your organization's credits.",
+            "In a few minutes, resume it",
+        ),
+        (BudgetFailureReason.UNKNOWN, "Task stopped by billing. Its summary says why.", "Resume it"),
+    ],
+    ids=["out of credits", "free credits' one project", "credits unreadable", "a reason this version doesn't know"],
+)
+def test_a_task_billing_stopped_says_so_and_when_to_resume_it(reason: BudgetFailureReason, ending: str, when: str):
+    assert ending_notice(TaskStatus.OUT_OF_BUDGET, "proj-1", reason=reason) == (
+        f"{ending} {when} on the same project with:\n  aristotle continue proj-1 Continue --wait"
+    )
+    assert ending_notice(TaskStatus.OUT_OF_BUDGET, "proj-1", read_only=True, reason=reason) == ending
+
+
+OWNER_MESSAGE = (
+    "This run stopped because your organization does not have enough Credits left. Buy credits, then send a "
+    "follow-up. A follow-up needs at least 1.00 Credit."
+)
+"""What Aristotle's summary of a task billing stopped for credits says to its owner."""
+
+
+async def test_a_wait_on_a_task_billing_stopped_prints_aristotles_message_then_when_to_resume_it(caplog):
+    client = _streaming_client([_plain_event("event-1", "Stopping")])
+    refresh = client.get.side_effect
+
+    def stopped(path):
+        response = refresh(path)
+        if client.stream_ended:
+            ended = {"status": "OUT_OF_BUDGET", "budget_failure_reason": 1, "output_summary": OWNER_MESSAGE}
+            response.json.return_value = {**response.json.return_value, **ended}
+        return response
+
+    client.get = AsyncMock(side_effect=stopped)
+    with (
+        patch("aristotlelib.api_request.AristotleRequestClient", return_value=client),
+        patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
+        caplog.at_level(logging.INFO, logger="aristotle"),
+    ):
+        await _waiting_task().wait_for_completion(interactive=False)
+
+    assert caplog.messages[-2:] == [
+        OWNER_MESSAGE,
+        "Task stopped: your organization ran out of credits. Once an organization admin buys credits at "
+        f"{BILLING_PAGE}, resume it on the same project with:\n  aristotle continue proj-wait Continue --wait",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("sent", "reason", "name"),
+    [
+        (1, BudgetFailureReason.OUT_OF_CREDITS, "OUT_OF_CREDITS"),
+        (None, None, None),
+        (9, BudgetFailureReason.UNKNOWN, "UNKNOWN"),
+    ],
+    ids=["out of credits", "none", "a reason this version doesn't know"],
+)
+def test_a_tasks_billing_stop_reads_as_a_code_and_prints_with_its_name(sent, reason, name, caplog):
+    task = AgentTask.model_validate(
+        {
+            "project_id": "proj-1",
+            "agent_task_id": "task-1",
+            "status": "OUT_OF_BUDGET",
+            "budget_failure_reason": sent,
+            "created_at": "2026-10-27T12:00:00",
+            "last_updated_at": "2026-10-27T13:00:00",
+            "file_name": None,
+            "description": None,
+            "output_summary": None,
+        }
+    )
+
+    assert task.budget_failure_reason == reason
+    dumped = task.model_dump(mode="json")
+    assert (dumped["budget_failure_reason"], dumped["budget_failure_reason_name"]) == (
+        None if reason is None else reason.value,
+        name,
+    )
 
 
 async def test_a_wait_writes_no_escape_codes_when_stdout_is_not_a_terminal(capsys):
@@ -5235,6 +5355,140 @@ async def test_a_placeholder_no_record_ever_claims_is_shown_without_a_timeout_cl
     screens = "\n".join("\n".join(call.args[0]) for call in shown.call_args_list)
     assert "Aristotle asked: Which clock?" in screens
     assert "timed out" not in screens
+
+
+def _question_record(response: str | None = None, ignored: bool = False) -> dict:
+    """The question event-q1 asked, as the questions listing sends it."""
+    return {
+        "question_id": "q-1",
+        "event_id": "event-q1",
+        "project_id": "proj-wait",
+        "agent_run_id": "task-wait-q",
+        "content": "Which width?",
+        "suggestions": ["8", "16"],
+        "response": response,
+        "created_at": "2024-01-01T00:01:00",
+        "updated_at": "2024-01-01T00:02:00",
+        "blocking_since": None,
+        "ever_awaited": True,
+        "answered_at": "2024-01-01T00:02:00" if response is not None else None,
+        "ignored_at": "2024-01-01T00:16:00" if ignored else None,
+    }
+
+
+def _showing_client(events: list[dict], questions: list[dict] | Exception) -> AsyncMock:
+    """A client that pages ``events``, given oldest first, newest first as the server does, and lists ``questions``,
+    or raises it."""
+    client = AsyncMock()
+
+    def get(path, params=None):
+        if path.endswith("/questions") and isinstance(questions, Exception):
+            raise questions
+        response = Mock()
+        response.json.return_value = (
+            questions if path.endswith("/questions") else {"events": events[::-1], "pagination_key": None}
+        )
+        return response
+
+    client.get = AsyncMock(side_effect=get)
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=None)
+    return client
+
+
+async def _shown_events(task: AgentTask, client: AsyncMock, caplog) -> list[str]:
+    """What task.show() logs for its events through ``client``, after its status."""
+    with (
+        patch("aristotlelib.api_request.AristotleRequestClient", return_value=client),
+        caplog.at_level(logging.INFO, logger="aristotle"),
+    ):
+        await task.show(num_events=10)
+    return caplog.messages[1:]
+
+
+def _listings(client: AsyncMock) -> int:
+    return sum(call.args[0].endswith("/questions") for call in client.get.await_args_list)
+
+
+@pytest.mark.parametrize(
+    ("record", "status", "read_only", "says"),
+    [
+        (_question_record(response="16"), TaskStatus.COMPLETE, False, "You answered: 16"),
+        (_question_record(response="16"), TaskStatus.COMPLETE, True, "The project's owner answered: 16"),
+        (_question_record(ignored=True), TaskStatus.COMPLETE, False, "The question was closed without an answer."),
+        (_question_record(), TaskStatus.COMPLETE, False, "The run has ended, so no answer can reach Aristotle now."),
+        (
+            _question_record(),
+            TaskStatus.IN_PROGRESS,
+            False,
+            "Waiting for an answer; answer with: aristotle questions proj-wait",
+        ),
+        (
+            _question_record(),
+            TaskStatus.IN_PROGRESS,
+            True,
+            "Waiting for an answer; only the project's owner can answer.",
+        ),
+    ],
+    ids=[
+        "answered",
+        "answered on a shared project",
+        "closed",
+        "open once the run ended",
+        "waiting",
+        "waiting on a shared project",
+    ],
+)
+async def test_show_prints_a_question_as_listed_with_what_became_of_it(record, status, read_only, says, caplog):
+    task = _waiting_task().model_copy(update={"status": status, "read_only": read_only})
+    client = _showing_client([_plain_event("event-1", "Summing up"), _question_event("event-q1")], [record])
+
+    shown = await _shown_events(task, client, caplog)
+
+    assert shown == ["MESSAGE: Summing up", f"Aristotle asked: Which width?\n{says}"]
+    assert _listings(client) == 1
+
+
+async def test_show_lists_no_questions_when_each_question_event_carries_its_answer(caplog):
+    answered = _question_event("event-legacy", content="Which width?") | {"explanation": "16"}
+    client = _showing_client([_plain_event("event-1", "Summing up"), answered], [])
+
+    shown = await _shown_events(_waiting_task(), client, caplog)
+
+    assert shown == ["MESSAGE: Summing up", "Aristotle asked: Which width?\nYou answered: 16"]
+    assert _listings(client) == 0
+
+
+@pytest.mark.parametrize("status_code", [404, 405])
+async def test_show_still_says_a_question_on_a_server_without_the_questions_listing_timed_out(status_code, caplog):
+    client = _showing_client(
+        [_question_event("event-old", content="Which width?")],
+        AristotleAPIError("not found", status_code=status_code),
+    )
+
+    shown = await _shown_events(_waiting_task(), client, caplog)
+
+    assert shown == [
+        "Aristotle asked: Which width?\nAristotle timed out waiting for a response and went with its best guess."
+    ]
+
+
+@pytest.mark.parametrize(
+    "listing",
+    [[], AristotleAPIError("Server error", status_code=500)],
+    ids=["no record claims it", "the listing fails"],
+)
+async def test_show_says_no_question_it_cannot_settle_timed_out(listing, caplog):
+    client = _showing_client(
+        [_question_event("event-q1"), _question_event("event-legacy", status=2, content="Which depth?")], listing
+    )
+
+    shown = await _shown_events(_waiting_task(), client, caplog)
+
+    asked = ["Aristotle asked: Asked a question", "Aristotle asked: Which depth?"]
+    assert shown[-2:] == asked
+    assert shown[:-2] == ([] if listing == [] else ["Could not list the task's questions: Server error"])
+    assert "timed out" not in caplog.text
 
 
 async def test_a_failed_task_refresh_on_a_quiet_stream_does_not_end_the_wait(monkeypatch, caplog):
@@ -7005,6 +7259,20 @@ async def test_ask_that_no_attempt_got_through_says_the_prompt_was_not_sent(api_
     )
 
 
+async def test_a_create_or_an_ask_refused_for_credits_keeps_billings_code(api_server):
+    api_server(*[httpx.Response(402, json={"detail": OUT_OF_CREDITS})] * 2)
+
+    with pytest.raises(api_request.AristotleNotProcessedError) as created:
+        await Project.create(prompt="Prove it")
+    with pytest.raises(api_request.AristotleNotProcessedError) as asked:
+        await _listed(CREATED_ID, "Prove it").ask("Go on")
+
+    refusal = f"{OUT_OF_CREDITS['message']} {BUY_CREDITS}"
+    assert str(created.value) == f"{refusal} No run was started, so it is safe to submit it again."
+    assert str(asked.value) == f"{refusal} The prompt was not sent, so it is safe to send it again."
+    assert {(e.value.status_code, e.value.error_code) for e in (created, asked)} == {(402, "OUT_OF_CREDITS")}
+
+
 @pytest.mark.usefixtures("frozen_api_clock")
 @pytest.mark.parametrize("refusal", ["connect error", "per-second 429"])
 async def test_ask_whose_check_that_the_project_is_idle_failed_says_the_prompt_was_not_sent(
@@ -7116,3 +7384,54 @@ async def test_a_cancel_refused_for_a_finished_task_says_it_has_finished(api_ser
     assert info.value.status_code == 404
     assert str(info.value) == f"Task {task.agent_task_id} has already finished (COMPLETE), so it can't be cancelled."
     assert task.status == TaskStatus.COMPLETE
+
+
+TIMED_OUT = [lambda request: httpx.ReadTimeout("")] * api_request.RETRY_ATTEMPTS
+UNAVAILABLE = [lambda request: httpx.Response(503, json={"detail": "Service Unavailable"})] * api_request.RETRY_ATTEMPTS
+
+
+@pytest.mark.parametrize("failures", [TIMED_OUT, UNAVAILABLE], ids=["timed out", "server error"])
+async def test_a_cancel_that_fails_counts_as_done_when_the_task_then_reads_cancelled(failures, api_server):
+    requests = api_server(*failures, _task_in("CANCELED"))
+    task = AgentTask.model_validate(TASK)
+
+    await task.cancel()
+
+    assert [r.method for r in requests] == ["POST"] * api_request.RETRY_ATTEMPTS + ["GET"]
+    assert task.status == TaskStatus.CANCELED
+
+
+@pytest.mark.usefixtures("frozen_api_clock")
+@pytest.mark.parametrize("status", ["IN_PROGRESS", "COMPLETE"])
+async def test_a_cancel_that_fails_raises_its_failure_when_the_task_then_reads_otherwise(status, api_server):
+    api_server(*TIMED_OUT, _task_in(status))
+    task = AgentTask.model_validate(TASK)
+
+    with pytest.raises(api_request.AristotleAPIError) as info:
+        await task.cancel()
+
+    assert str(info.value) == "ReadTimeout on POST /task/task-1/cancel after 5 attempts over 0 s"
+    assert task.status == TaskStatus[status]
+
+
+@pytest.mark.usefixtures("frozen_api_clock")
+async def test_a_cancel_that_fails_raises_its_failure_when_the_task_cannot_then_be_read(api_server, caplog):
+    api_server(*TIMED_OUT, *UNAVAILABLE)
+    task = AgentTask.model_validate(TASK)
+
+    with pytest.raises(api_request.AristotleAPIError) as info:
+        await task.cancel()
+
+    assert str(info.value) == "ReadTimeout on POST /task/task-1/cancel after 5 attempts over 0 s"
+    assert caplog.messages[-1].startswith("Could not refresh the task status: GET /task/task-1 after 5 attempts")
+    assert task.status == TaskStatus.QUEUED
+
+
+async def test_a_task_last_read_cancelled_counts_as_cancelled_when_it_cannot_be_read_again(api_server, caplog):
+    api_server(*TIMED_OUT, *UNAVAILABLE)
+    task = AgentTask.model_validate({**TASK, "status": "CANCELED"})
+
+    await task.cancel()
+
+    assert caplog.messages[-1].startswith("Could not refresh the task status: GET /task/task-1 after 5 attempts")
+    assert task.status == TaskStatus.CANCELED

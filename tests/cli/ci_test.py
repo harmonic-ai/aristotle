@@ -20,8 +20,13 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 
 from aristotlelib import local_file_utils
-from aristotlelib.agent_task import AgentTask, TaskStatus
-from aristotlelib.api_request import AristotleAPIError, AristotleNotFoundError, AristotleOutcomeUnknownError
+from aristotlelib.agent_task import AgentTask, BudgetFailureReason, TaskStatus
+from aristotlelib.api_request import (
+    AristotleAPIError,
+    AristotleNotFoundError,
+    AristotleNotProcessedError,
+    AristotleOutcomeUnknownError,
+)
 from aristotlelib.ci import github, manifest, results, runner, scope
 from aristotlelib.ci.record import RunRecord
 from aristotlelib.cli.api_action import APIAction
@@ -55,7 +60,15 @@ from aristotlelib.printable import escape_logged_text
 from aristotlelib.project import Project, ProjectStatus
 from aristotlelib.verilog import bundle, filelist
 from tests.ci.conftest import commit_bare_shaped, git, latin1_name, make_declaration
-from tests.conftest import NEEDS_INT_DIGIT_LIMIT, NEVER_READ, UNREACHABLE_HOST, WILDCARD_FOLDERS
+from tests.conftest import (
+    BILLING_PAGE,
+    BUY_CREDITS,
+    NEEDS_INT_DIGIT_LIMIT,
+    NEVER_READ,
+    OUT_OF_CREDITS,
+    UNREACHABLE_HOST,
+    WILDCARD_FOLDERS,
+)
 
 CI_VARIABLE_PREFIXES = ("GITHUB_", "GITLAB_", "CI_", "BUILDKITE", "CIRCLE", "BUILD_", "SYSTEM_", "JENKINS_")
 
@@ -184,15 +197,19 @@ async def _run(
     stopped_summary: str | None = None,
     summary: str | Exception | None = None,
     access: dict[str, bool | None] | None = None,
+    budget_failure_reason: BudgetFailureReason | None = None,
 ) -> Run:
     """Preflight then run, as run() does, with the network patched out; a final status of None is a timeout.
 
-    ``summary`` is what fetching the run's summary returns, or raises. ``access`` is what the account's language
-    check answers; by default every language it asks about is enabled.
+    ``summary`` is what fetching the run's summary returns, or raises, and ``budget_failure_reason`` why billing
+    stopped the run, which the same fetch returns. ``access`` is what the account's language check answers; by
+    default every language it asks about is enabled.
     """
     args = action.parser.parse_args(argv)
     fetch_summary = (
-        AsyncMock(side_effect=summary) if isinstance(summary, Exception) else AsyncMock(return_value=summary)
+        AsyncMock(side_effect=summary)
+        if isinstance(summary, Exception)
+        else AsyncMock(return_value=(summary, budget_failure_reason))
     )
     language_access = AsyncMock(
         side_effect=lambda languages: dict.fromkeys(languages, True) if access is None else access
@@ -561,17 +578,23 @@ async def test_a_manifest_id_the_run_registered_nothing_under_has_no_verdict(
 
 
 @pytest.mark.parametrize(
-    ("final_status", "stopped_summary", "stop"),
+    ("final_status", "stopped_summary", "reason", "stop"),
     [
-        (TaskStatus.OUT_OF_BUDGET, None, "it ran out of budget"),
-        (TaskStatus.FAILED, None, "it failed due to an internal error"),
-        (TaskStatus.CANCELED, None, "it was cancelled outside this job"),
-        (TaskStatus.COMPLETE_WITH_ERRORS, "Which reset?", "Aristotle stopped it for decisions only you can make"),
+        (TaskStatus.OUT_OF_BUDGET, None, None, "it ran out of budget"),
+        (TaskStatus.OUT_OF_BUDGET, None, BudgetFailureReason.OUT_OF_CREDITS, "billing stopped it"),
+        (TaskStatus.FAILED, None, None, "it failed due to an internal error"),
+        (TaskStatus.CANCELED, None, None, "it was cancelled outside this job"),
+        (
+            TaskStatus.COMPLETE_WITH_ERRORS,
+            "Which reset?",
+            None,
+            "Aristotle stopped it for decisions only you can make",
+        ),
     ],
-    ids=["out of budget", "failed", "cancelled", "stopped for questions"],
+    ids=["out of budget", "billing stopped", "failed", "cancelled", "stopped for questions"],
 )
 async def test_a_manifest_id_a_stopped_run_has_nothing_under_is_reported_with_when_it_stopped(
-    action: CIAction, repo: Path, tmp_path: Path, caplog, final_status, stopped_summary, stop
+    action: CIAction, repo: Path, tmp_path: Path, caplog, final_status, stopped_summary, reason, stop
 ):
     with caplog.at_level(logging.WARNING, logger="aristotle"):
         await _run(
@@ -580,6 +603,7 @@ async def test_a_manifest_id_a_stopped_run_has_nothing_under_is_reported_with_wh
             [_declaration("write_when_full")],
             final_status=final_status,
             stopped_summary=stopped_summary,
+            budget_failure_reason=reason,
         )
 
     warning = (
@@ -1897,6 +1921,271 @@ async def test_from_the_file_systems_root_a_link_outside_the_checkout_still_take
     assert set(_testcases(real)) == set(IDS)
 
 
+DIRECTORY_LINK = (
+    "--directory {directory} is reached through {link}, a link in the checkout, which could lead the run out of it. "
+    "Remove the link, or pass --directory a path with no link in the checkout."
+)
+OUTSIDE_WORKSPACE = (
+    "The current folder resolves to {current}, outside the workspace the CI system names, {workspace}: a link in the "
+    "checkout may have led the step out of it. Run the step in the workspace, and name the folder to check with "
+    "--directory."
+)
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink") or os.name == "nt", reason="POSIX symlinks")
+@pytest.mark.parametrize(
+    ("link", "target", "directory", "start"),
+    [
+        ("hw", "other-job", "hw", "repo"),
+        ("hw", "missing", "hw", "repo"),
+        ("hw", "repo/hw", "hw", "repo"),
+        ("ip", "other-job", "ip/rtl", "repo"),
+        ("hw", "other-job", "out/../hw", "repo"),
+        ("hw", "other-job", "fifo.v/../hw", "repo"),
+        ("hw", "other-job", "repo/hw", "."),
+    ],
+    ids=[
+        "to another folder",
+        "dangling",
+        "a loop",
+        "part-way down",
+        "after a missing folder and ..",
+        "after a file and ..",
+        "from a folder in no repository",
+    ],
+)
+async def test_a_directory_reached_through_a_link_in_the_checkout_exits_2_before_the_manifest_is_read(
+    action: CIAction,
+    repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog,
+    link: str,
+    target: str,
+    directory: str,
+    start: str,
+):
+    (tmp_path / "other-job" / "rtl").mkdir(parents=True)
+    (tmp_path / "other-job" / "rtl" / manifest.MANIFEST_NAME).write_text(MANIFEST)
+    (tmp_path / "other-job" / manifest.MANIFEST_NAME).write_text(MANIFEST)
+    _commit_link(repo, link, tmp_path / target)
+    monkeypatch.chdir(tmp_path / start)
+
+    with caplog.at_level(logging.INFO, logger="aristotle"):
+        assert action.preflight(action.parser.parse_args(["--directory", directory])) == EXIT_USAGE_ERROR
+
+    assert caplog.messages[-1] == DIRECTORY_LINK.format(directory=Path(directory), link=repo.resolve() / link)
+    assert "Checking" not in caplog.text
+
+
+@pytest.mark.parametrize("directory", ["fifo", "out/../fifo"])
+async def test_a_directory_with_no_link_in_the_checkout_runs(
+    action: CIAction, repo: Path, monkeypatch: pytest.MonkeyPatch, directory: str
+):
+    (repo / "fifo").mkdir()
+    (repo / "fifo" / manifest.MANIFEST_NAME).write_text(MANIFEST)
+    monkeypatch.chdir(repo)
+
+    assert action.preflight(action.parser.parse_args(["--directory", directory])) is None
+    assert action._root == (repo / "fifo").resolve()
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink") or os.name == "nt", reason="POSIX symlinks")
+@pytest.mark.parametrize(
+    ("start", "outer"),
+    [("repo", False), (".", False), ("repo", True)],
+    ids=["from the checkout", "from the folder above it", "in a repository above it"],
+)
+async def test_a_checkout_reached_through_a_link_above_its_top_runs(
+    action: CIAction, repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, start: str, outer: bool
+):
+    if outer:
+        git(tmp_path, "init", "-q")
+    (tmp_path / "mnt").symlink_to(repo, target_is_directory=True)
+    monkeypatch.chdir(tmp_path / start)
+
+    assert action.preflight(action.parser.parse_args(["--directory", str(tmp_path / "mnt")])) is None
+    assert action._root == repo.resolve()
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink") or os.name == "nt", reason="POSIX symlinks")
+async def test_a_repository_above_a_git_ceiling_is_not_the_checkout(
+    action: CIAction, repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """As git, which finds the current folder in no repository."""
+    git(tmp_path, "init", "-q")
+    (tmp_path / "ws").mkdir()
+    (tmp_path / "ws" / "mnt").symlink_to(repo, target_is_directory=True)
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    monkeypatch.chdir(tmp_path / "ws")
+
+    assert action.preflight(action.parser.parse_args(["--directory", str(tmp_path / "ws" / "mnt")])) is None
+    assert action._root == repo.resolve()
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink") or os.name == "nt", reason="POSIX symlinks")
+@pytest.mark.parametrize("directory", ["../hw", "{repo}/hw"], ids=["relative", "absolute"])
+async def test_from_a_mount_point_in_the_checkout_a_directory_reached_through_a_link_in_it_exits_2(
+    action: CIAction, repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog, directory: str
+):
+    """git stops at the mount point and finds no repository, but the link is still in the checkout."""
+    (tmp_path / "other-job").mkdir()
+    (tmp_path / "other-job" / manifest.MANIFEST_NAME).write_text(MANIFEST)
+    _commit_link(repo, "hw", tmp_path / "other-job")
+    mount = repo.resolve() / "build"
+    mount.mkdir()
+    monkeypatch.setattr(local_file_utils, "_device", lambda folder: int(mount in (folder, *folder.parents)))
+    monkeypatch.chdir(mount)
+    directory = directory.format(repo=repo.resolve())
+
+    with caplog.at_level(logging.ERROR, logger="aristotle"):
+        assert action.preflight(action.parser.parse_args(["--directory", directory])) == EXIT_USAGE_ERROR
+
+    assert caplog.messages == [DIRECTORY_LINK.format(directory=Path(directory), link=repo.resolve() / "hw")]
+
+
+@pytest.mark.parametrize(
+    ("system", "workspace"),
+    [
+        ("GITHUB_ACTIONS", "GITHUB_WORKSPACE"),
+        ("GITLAB_CI", "CI_PROJECT_DIR"),
+        ("JENKINS_URL", "WORKSPACE"),
+        ("BUILDKITE", "BUILDKITE_BUILD_CHECKOUT_PATH"),
+    ],
+)
+async def test_in_ci_a_current_folder_outside_the_workspace_exits_2_naming_both(
+    action: CIAction,
+    repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog,
+    system: str,
+    workspace: str,
+):
+    """As where Jenkins's dir() enters a folder the checkout links to."""
+    other = tmp_path / "other-job"
+    other.mkdir()
+    (other / manifest.MANIFEST_NAME).write_text(MANIFEST)
+    monkeypatch.setenv(system, "true")
+    monkeypatch.setenv(workspace, str(repo))
+    monkeypatch.chdir(other)
+
+    with caplog.at_level(logging.INFO, logger="aristotle"):
+        assert action.preflight(action.parser.parse_args(["--directory", "."])) == EXIT_USAGE_ERROR
+
+    assert caplog.messages[-1] == OUTSIDE_WORKSPACE.format(current=other.resolve(), workspace=repo.resolve())
+    assert "Checking" not in caplog.text
+
+
+async def test_in_ci_a_current_folder_in_the_workspace_runs(
+    action: CIAction, repo: Path, monkeypatch: pytest.MonkeyPatch
+):
+    (repo / "rtl").mkdir()
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(repo))
+    monkeypatch.chdir(repo / "rtl")
+
+    assert action.preflight(action.parser.parse_args([])) is None
+    assert action._root == repo.resolve()
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink") or os.name == "nt", reason="POSIX symlinks")
+async def test_in_ci_a_workspace_named_through_a_link_runs_from_inside_it(
+    action: CIAction, repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    (tmp_path / "mnt").symlink_to(tmp_path, target_is_directory=True)
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path / "mnt" / "repo"))
+    monkeypatch.chdir(repo)
+
+    assert action.preflight(action.parser.parse_args([])) is None
+    assert action._root == repo.resolve()
+
+
+async def test_in_ci_a_workspace_named_in_another_case_runs_on_a_disk_that_ignores_case(
+    action: CIAction, repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    if not (tmp_path / "REPO").is_dir():
+        pytest.skip("needs a case-insensitive disk")
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path / "REPO"))
+    monkeypatch.chdir(repo)
+
+    assert action.preflight(action.parser.parse_args([])) is None
+
+
+async def test_in_ci_a_workspace_that_is_no_folder_here_is_a_warning(
+    action: CIAction, repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog
+):
+    """As in a container that mounts the checkout elsewhere."""
+    named = tmp_path / "builds" / "pipeline"
+    monkeypatch.setenv("BUILDKITE", "true")
+    monkeypatch.setenv("BUILDKITE_BUILD_CHECKOUT_PATH", str(named))
+    monkeypatch.chdir(repo)
+
+    with caplog.at_level(logging.WARNING, logger="aristotle"):
+        assert action.preflight(action.parser.parse_args(["--directory", "."])) is None
+
+    assert caplog.messages == [
+        f"The current folder resolves to {repo.resolve()}, outside the workspace the CI system names, "
+        f"{named.resolve()}. That isn't a folder here, as in a container that mounts the checkout elsewhere, so the "
+        "step goes on."
+    ]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="directory junctions are Windows'")
+async def test_a_directory_reached_through_a_junction_in_the_checkout_exits_2(
+    action: CIAction, repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog
+):
+    import _winapi
+
+    (tmp_path / "other-job").mkdir()
+    (tmp_path / "other-job" / manifest.MANIFEST_NAME).write_text(MANIFEST)
+    _winapi.CreateJunction(str(tmp_path / "other-job"), str(repo / "hw"))
+    monkeypatch.chdir(repo)
+
+    with caplog.at_level(logging.ERROR, logger="aristotle"):
+        assert action.preflight(action.parser.parse_args(["--directory", "hw"])) == EXIT_USAGE_ERROR
+
+    assert caplog.messages == [DIRECTORY_LINK.format(directory="hw", link=Path.cwd() / "hw")]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="directory junctions are Windows'")
+async def test_a_checkout_entered_through_a_junction_above_its_top_runs(
+    action: CIAction, repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Windows keeps the junction in the current folder's path."""
+    import _winapi
+
+    _winapi.CreateJunction(str(repo), str(tmp_path / "mnt"))
+    monkeypatch.chdir(tmp_path / "mnt")
+
+    assert action.preflight(action.parser.parse_args(["--directory", "."])) is None
+    assert action._root == repo.resolve()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="directory junctions are Windows'")
+async def test_a_dot_dot_after_a_junction_outside_the_checkout_is_taken_as_text(
+    action: CIAction, repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog
+):
+    """As Path.resolve() takes it on Windows, where the folder before ``..`` drops out unfollowed."""
+    import _winapi
+
+    (tmp_path / "other-job").mkdir()
+    (tmp_path / "other-job" / manifest.MANIFEST_NAME).write_text(MANIFEST)
+    _winapi.CreateJunction(str(tmp_path / "other-job"), str(repo / "hw"))
+    (tmp_path / "elsewhere" / "b").mkdir(parents=True)
+    _winapi.CreateJunction(str(tmp_path / "elsewhere" / "b"), str(tmp_path / "b"))
+    monkeypatch.chdir(tmp_path / "b")
+
+    with caplog.at_level(logging.ERROR, logger="aristotle"):
+        assert action.preflight(action.parser.parse_args(["--directory", "..\\repo\\hw"])) == EXIT_USAGE_ERROR
+
+    assert caplog.messages == [
+        DIRECTORY_LINK.format(directory=Path("..\\repo\\hw"), link=Path.cwd().parent / "repo" / "hw")
+    ]
+
+
 @pytest.mark.parametrize(
     ("filelist", "announced", "not_announced"),
     [
@@ -2291,7 +2580,7 @@ def _run_whole(action: CIAction, argv: list[str], declarations: list[Declaration
         patch("aristotlelib.cli.api_action.get_api_key", return_value="test-key"),
         patch("aristotlelib.cli.command.ci.runner.submit", AsyncMock(return_value=_project())),
         patch("aristotlelib.cli.command.ci.runner.wait_for_completion", AsyncMock(return_value=TaskStatus.COMPLETE)),
-        patch("aristotlelib.cli.command.ci.runner.fetch_summary", AsyncMock(return_value=None)),
+        patch("aristotlelib.cli.command.ci.runner.fetch_summary", AsyncMock(return_value=(None, None))),
         patch("aristotlelib.cli.command.ci.runner.language_access", AsyncMock(return_value={})),
         patch.object(Project, "get_declarations", AsyncMock(return_value=declarations or [])),
     ):
@@ -2319,6 +2608,7 @@ def test_on_github_a_refused_project_is_an_annotation(
     """--project's refusal ends ci before it reports a run, so it is one too."""
     monkeypatch.setenv("GITHUB_ACTIONS", "true")
     monkeypatch.setenv("GITHUB_WORKSPACE", str(repo))
+    monkeypatch.chdir(repo)
     listed = [Mock(spec=AgentTask, status=TaskStatus.COMPLETE)] * 2
     with (
         patch.object(Project, "_resolve", AsyncMock(return_value=("test-123", None))),
@@ -2372,6 +2662,7 @@ def test_on_github_an_error_the_command_code_logs_is_an_annotation(
     """These are logged through the root logger by the code every command shares."""
     monkeypatch.setenv("GITHUB_ACTIONS", "true")
     monkeypatch.setenv("GITHUB_WORKSPACE", str(repo))
+    monkeypatch.chdir(repo)
     args = action.parser.parse_args(["--directory", str(repo), "--no-junit"], argparse.Namespace(api_key=None))
     with contextlib.ExitStack() as stack:
         if "aristotlelib.cli.api_action.get_api_key" not in patches:
@@ -2389,6 +2680,7 @@ def test_on_github_a_project_that_is_not_found_is_an_annotation(
 ):
     monkeypatch.setenv("GITHUB_ACTIONS", "true")
     monkeypatch.setenv("GITHUB_WORKSPACE", str(repo))
+    monkeypatch.chdir(repo)
     args = action.parser.parse_args(["--directory", str(repo), "--project", "1a2b"], argparse.Namespace(api_key=None))
     missing = AristotleNotFoundError("project", "1a2b")
 
@@ -2755,6 +3047,115 @@ async def test_a_cut_short_runs_summary_is_fetched_once_the_run_has_ended(
     assert run.fetch_summary.await_count == fetched
     run_error = _testcases(tmp_path / DEFAULT_JUNIT_PATH)["Aristotle run"].find("error")
     assert run_error is not None and (UNCHECKED_SUMMARY in (run_error.text or "")) == fetched
+
+
+OWNER_MESSAGE = (
+    "This run stopped because your organization does not have enough Credits left. Buy credits, then send a "
+    "follow-up. A follow-up needs at least 1.00 Credit."
+)
+"""What Aristotle's summary of a run billing stopped for credits says to its owner."""
+
+
+@pytest.mark.parametrize(
+    ("reason", "again"),
+    [
+        (
+            BudgetFailureReason.OUT_OF_CREDITS,
+            f"Once an organization admin buys credits at {BILLING_PAGE}, run it again. ",
+        ),
+        (
+            BudgetFailureReason.TRIAL_CREDIT_CONCURRENCY_LIMIT,
+            "Once no other project of your organization is running, or an organization admin buys credits at "
+            f"{BILLING_PAGE}, run it again. ",
+        ),
+        (BudgetFailureReason.BILLING_UNAVAILABLE, "In a few minutes, run it again. "),
+        (BudgetFailureReason.UNKNOWN, ""),
+    ],
+    ids=["out of credits", "free credits' one project", "credits unreadable", "a reason this version doesn't know"],
+)
+async def test_a_run_billing_stopped_before_any_property_says_so_and_when_to_run_it_again(
+    action: CIAction, repo: Path, tmp_path: Path, caplog, reason: BudgetFailureReason, again: str
+):
+    with caplog.at_level(logging.INFO, logger="aristotle"):
+        run = await _run(
+            action,
+            ["--directory", str(repo)],
+            [],
+            final_status=TaskStatus.OUT_OF_BUDGET,
+            summary=OWNER_MESSAGE,
+            budget_failure_reason=reason,
+        )
+
+    assert run.code == EXIT_INFRASTRUCTURE_ERROR
+    assert f"  Aristotle's summary of the run:\n\n    {OWNER_MESSAGE}" in caplog.text
+    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == [
+        f"Billing stopped the run with no property under any of the manifest's ids. {again}Its summary is above; the "
+        f"run is at {_project().web_url()}"
+    ]
+    assert "out of budget" not in caplog.text
+    run.language_access.assert_not_awaited()
+    run_error = _testcases(tmp_path / DEFAULT_JUNIT_PATH)["Aristotle run"].find("error")
+    assert run_error is not None and run_error.get("type") == "billing"
+
+
+async def test_a_run_billing_stopped_reports_the_properties_it_reached_unchecked(
+    action: CIAction, repo: Path, tmp_path: Path, caplog
+):
+    with caplog.at_level(logging.INFO, logger="aristotle"):
+        run = await _run(
+            action,
+            ["--directory", str(repo)],
+            [_declaration(i) for i in IDS],
+            final_status=TaskStatus.OUT_OF_BUDGET,
+            summary=OWNER_MESSAGE,
+            budget_failure_reason=BudgetFailureReason.OUT_OF_CREDITS,
+        )
+
+    assert run.code == EXIT_INFRASTRUCTURE_ERROR
+    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == [
+        f"{results.BILLING_STOP_REASON} None of them counts as proved or refuted. Once an organization admin buys "
+        f"credits at {BILLING_PAGE}, run it again."
+    ]
+    run_error = _testcases(tmp_path / DEFAULT_JUNIT_PATH)["Aristotle run"].find("error")
+    assert run_error is not None and run_error.get("message") == results.BILLING_STOP_REASON
+
+
+async def test_a_run_out_of_budget_whose_task_cant_be_read_keeps_its_exit_code_and_reads_it_once(
+    action: CIAction, repo: Path, caplog
+):
+    """Billing's reason only words the report, so failing to read it is no reason to fail the step."""
+    with caplog.at_level(logging.WARNING, logger="aristotle"):
+        run = await _run(
+            action,
+            ["--directory", str(repo), "--no-junit", "--fail-on", "never"],
+            [],
+            final_status=TaskStatus.OUT_OF_BUDGET,
+            summary=AristotleAPIError("API request failed with status 503: Service Unavailable", 503),
+        )
+
+    assert run.code == EXIT_SUCCESS
+    run.fetch_summary.assert_awaited_once()
+    assert (
+        "Could not fetch the run's summary: API request failed with status 503: Service Unavailable" in caplog.messages
+    )
+    assert "The run ran out of budget with no property under any of the manifest's ids." in caplog.text
+
+
+def test_a_run_billing_refuses_for_credits_exits_6(action: CIAction, repo: Path, caplog):
+    args = action.parser.parse_args(["--directory", str(repo)], argparse.Namespace(api_key=None))
+    refused = AristotleNotProcessedError(
+        f"{OUT_OF_CREDITS['message']} {BUY_CREDITS} No run was started, so it is safe to submit it again.",
+        402,
+    )
+
+    with (
+        patch("aristotlelib.cli.api_action.get_api_key", return_value="test-key"),
+        patch("aristotlelib.cli.command.ci.runner.submit", AsyncMock(side_effect=refused)),
+    ):
+        code = action.run(args)
+
+    assert code == EXIT_RATE_LIMITED
+    assert caplog.messages[-1] == str(refused)
 
 
 @pytest.mark.parametrize(

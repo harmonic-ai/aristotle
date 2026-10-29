@@ -402,7 +402,9 @@ class ShowAction(APIAction):
             # A follow-up continues the latest task, so the command is for this one only when it is known to be that.
             not_latest = fetched is None or fetched.agent_task_id != task.agent_task_id
             resume = resume_commands(task, args.destination, non_interactive=False, json=False)
-            notice = ending_notice(task.status, task.project_id, task.read_only or not_latest, resume)
+            notice = ending_notice(
+                task.status, task.project_id, task.read_only or not_latest, resume, task.budget_failure_reason
+            )
             (logging.error if task.status == TaskStatus.FAILED else logging.info)(notice)
         return await self._wait_result(task, args.destination) if args.wait else None
 

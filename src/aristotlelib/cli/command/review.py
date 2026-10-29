@@ -85,7 +85,10 @@ class ReviewAction(VerifyAction):
             scope.check_arguments(args.scope, args.paths)
         except scope.ScopeError as e:
             self.parser.error(str(e))
-        return self._read_allowed(self.root(args.directory, context.detect()), args) if args.allow_untracked else None
+        build = context.detect()
+        if (code := self._check_folders(build, args.directory)) is not None:
+            return code
+        return self._read_allowed(self.root(args.directory, build), args) if args.allow_untracked else None
 
     async def run_action(self, args: argparse.Namespace) -> int:
         build = context.detect()

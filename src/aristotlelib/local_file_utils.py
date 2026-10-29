@@ -555,17 +555,19 @@ def _ceiling(path: str) -> int:
     return longest
 
 
-def enclosing_repository(project_dir: Path) -> Path | None:
+def enclosing_repository(project_dir: Path, *, across_filesystems: bool = False) -> Path | None:
     """The nearest of ``project_dir`` and the folders above it that holds a ``.git``, searched as git searches: from
     ``project_dir``, up to but not into the nearest GIT_CEILING_DIRECTORIES folder above it, and on its file system
-    unless GIT_DISCOVERY_ACROSS_FILESYSTEM is set. None if none does or its path cannot be resolved."""
+    unless GIT_DISCOVERY_ACROSS_FILESYSTEM is set or ``across_filesystems``. None if none does or its path cannot be
+    resolved."""
     try:
         # macOS's getcwd() fails under a folder that cannot be searched; Path.exists() would raise before 3.14.
         resolved = project_dir.resolve()
     except OSError:
         return None
     ceiling = _ceiling(_slashed(str(resolved)))
-    across = os.environ.get("GIT_DISCOVERY_ACROSS_FILESYSTEM", "").lower() in ("1", "true", "yes", "on")
+    discovery = os.environ.get("GIT_DISCOVERY_ACROSS_FILESYSTEM", "").lower()
+    across = across_filesystems or discovery in ("1", "true", "yes", "on")
     # git for Windows has no device numbers to compare.
     device = None if across or os.name == "nt" else _device(resolved)
     for folder in (resolved, *resolved.parents):

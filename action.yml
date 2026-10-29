@@ -60,7 +60,7 @@ outputs:
 runs:
   # This release's image, which the release pushes before it moves the `v3` tag.
   using: "docker"
-  image: "docker://ghcr.io/harmonic-ai/aristotle:3.0.0"
+  image: "docker://ghcr.io/harmonic-ai/aristotle:3.1.0"
   # The image has no entrypoint (GitLab and Jenkins start it with their own shell), so it is named here.
   entrypoint: "aristotle"
   args:

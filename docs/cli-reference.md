@@ -112,6 +112,10 @@ same way:
 | Any | Task failed, cancelled or out of budget | `aristotle continue <project-id> Continue`, with the wait's `--wait`, `--wait --json` or `--non-interactive` |
 | Any, with a `--destination` | Task failed, cancelled or out of budget | `aristotle continue <project-id> Continue`, which takes no `--destination`, then `aristotle show <project-id>` with it |
 
+A task that billing stopped ends `OUT_OF_BUDGET` with a `budget_failure_reason`. The wait prints Aristotle's message
+about it, and says when to resume: once credits are bought, in a few minutes when Aristotle couldn't read them, or,
+under the free credits' limit of one active project, once no other project of the organization is running.
+
 The `show` commands keep `--json` and `submit`'s `--destination`. Interrupted after the wait has seen the task finish
 and before the result archive is saved, or during the download, `submit` and a `show` with `--destination` say it wasn't
 saved, and name the `aristotle download` command that saves it there. `show --wait` waits as `submit --wait` does,
@@ -282,7 +286,7 @@ A refused request, an HTTP 403, reads:
 page's title. Trusting the corporate CA lets HTTPS connect, but doesn't override the proxy's access policy. A proxy
 can return JSON too, so the format is a clue to the source, not proof.
 
-Each request's `User-Agent` header names the client, as in `aristotlelib/3.0.0 (cli; python/3.12; linux)`: the SDK's
+Each request's `User-Agent` header names the client, as in `aristotlelib/3.1.0 (cli; python/3.12; linux)`: the SDK's
 version; `cli` for a command, `ci` for `aristotle ci` and `aristotle review`, `action` when the GitHub Action runs
 them, or `library` for a Python program; then the Python version and operating system. Nothing else: no arguments,
 paths, host or user names, or anything about your projects.
@@ -316,7 +320,7 @@ warnings and errors go to stderr.
 | `login` | `{"verification_uri", "user_code", "expires_in"}` while it waits for approval in the browser, then `{"credentials_path", "key_name"}` |
 | any `--non-interactive` wait that stops for questions (exit 10) | `{"project_id", "task", "questions"}` |
 | `submit` or `continue` whose request may have gone through (exit 7) | `{"outcome": "unknown", "error"}` |
-| `submit` or `continue` whose request didn't get through or was refused for too many runs, or `continue` or `questions --answer` whose lookup failed before anything was sent (exit 3, or 6 when rate limited) | `{"outcome": "not_processed", "error"}` |
+| `submit` or `continue` whose request didn't get through or was refused for too many runs or by billing, or `continue` or `questions --answer` whose lookup failed before anything was sent (exit 3, or 6 when rate limited or out of credits) | `{"outcome": "not_processed", "error"}` |
 | `questions` | `{"project_id", "task", "questions"}` |
 | `properties` | `{"project_id", "declarations", "pagination_key"}` |
 | `property` | a declaration |
@@ -356,7 +360,7 @@ know is `0`, named `UNKNOWN`. An unknown task status is `UNKNOWN`.
 | Record | Fields |
 |---|---|
 | Project | `project_id`, `name` (`Project.description` in Python, as the API calls it), `status` (1 running, 2 idle) and `status_name`, `latest_run_status` (how its latest run stands or ended, named as a task's `status` is; `null` before its first run), `created_at`, `last_updated`, `has_input`, `has_files`. |
-| Task | `agent_task_id`, `project_id`, `status` (`QUEUED`, `IN_PROGRESS`, `COMPLETE`, `COMPLETE_WITH_ERRORS`, `OUT_OF_BUDGET`, `FAILED`, `CANCELED` or `UNKNOWN`), `percent_complete` (deprecated: `null` from current servers; each property's `outcome` in `properties` says how the run stands), `description`, `output_summary`, `file_name`, `created_at`, `started_at` (when the run's job started, shortly before the run reports `IN_PROGRESS`; `null` while it is queued, for a run cancelled before it started, and from a server that doesn't send it, though a run that failed before it started may carry one), `last_updated_at`, `read_only` (someone else's shared project). |
+| Task | `agent_task_id`, `project_id`, `status` (`QUEUED`, `IN_PROGRESS`, `COMPLETE`, `COMPLETE_WITH_ERRORS`, `OUT_OF_BUDGET`, `FAILED`, `CANCELED` or `UNKNOWN`), `budget_failure_reason` (why billing stopped an `OUT_OF_BUDGET` run: 1 your organization ran out of credits, 2 Aristotle couldn't read its credits, 3 free credits allow one active project per organization; `null` when billing didn't stop it, and for someone else's shared project) and `budget_failure_reason_name`, `percent_complete` (deprecated: `null` from current servers; each property's `outcome` in `properties` says how the run stands), `description`, `output_summary`, `file_name`, `created_at`, `started_at` (when the run's job started, shortly before the run reports `IN_PROGRESS`; `null` while it is queued, for a run cancelled before it started, and from a server that doesn't send it, though a run that failed before it started may carry one), `last_updated_at`, `read_only` (someone else's shared project). |
 | Event | `event_id`, `agent_task_id`, `event_type` (a number; see `aristotlelib.EventType`) and `event_type_name`, `content`, `explanation`, `file_path`, `suggestions`, `status` (1 complete, 2 awaiting an answer) and `status_name`, `created_at`, `duration_seconds`. `EventType.AGENT_FOLLOW_UP` (`18`) carries a post-run message in `content`, such as a bug-fix offer or an invitation to continue after reaching the time limit. It's informational, and doesn't open the question-answer flow: act on it with a new prompt, through `Project.ask()` or `aristotle continue`. |
 | Question | `question_id`, `event_id`, `project_id`, `agent_task_id` (the task), `content`, `suggestions`, `response`, `state` (`PENDING` while it awaits an answer, `ANSWERED`, `IGNORED` when it closed without one, or, in `questions`, `UNANSWERED` when its run ended first, as the table shows it), `created_at`, `updated_at`, `blocking_since`, `ever_awaited`, `answered_at`, `ignored_at`. |
 | Declaration | `declaration_id`, `project_id`, `declaration_type` (1 property, 2 definition) and `declaration_type_name`, `name`, `status` (0 unknown, 1 in progress, 2 refuted, 3 proved, 4 removed, 6 failed) and `status_name`, `failure_reason` (1 out of budget, 2 system error, 3 the proof no longer checks, 4 the run finished without a verdict on it, 5 the run was cancelled) and `failure_reason_name`, `evidence` (0 unknown, 1 `COUNTEREXAMPLE`, 2 `NEGATION_PROVED`, 3 `BOTH`; required for `REFUTED`, otherwise nullable), `evidence_message` (the agent's explanation, preserved as received; it may contain inline Markdown), `source` (1 Aristotle, 2 you) and `source_name`, `filename`, `source_file`, `source_line`, `source_anchor`, `lean_code`, `description`, `artifact_paths` (the paths in the project of the files Aristotle linked to it, such as a counterexample's trace, as `download --artifact` takes them; empty when there are none), `created_at`, `last_updated`. |
@@ -374,10 +378,10 @@ Every command exits with one of these codes, so a script can tell a failed run f
 | 0 | Success. |
 | 1 | The task a wait followed (`submit --wait`, `continue --wait`, `show --wait`, a `--non-interactive` run, or a plain `show` at a terminal) finished without completing the request (`COMPLETE_WITH_ERRORS` or `OUT_OF_BUDGET`). Or the verdicts failed the build: `aristotle ci`'s on its manifest's properties, or `aristotle review`'s when `--fail-on` is `failure` or `no-verdict` ([What your team sees](aristotle-in-ci.md#what-your-team-sees)), a run Aristotle stopped for decisions only you can make included. Or `aristotle ci setup` found no proposed properties to write. |
 | 2 | Usage error: a missing or invalid argument, input Aristotle can't take, a project name or id prefix that matches more than one project, or an `aristotle ci --project` run that isn't of this checkout. |
-| 3 | The command couldn't complete: a server or network error outlasted the retries; a task you waited on failed or was cancelled; a wait ended with the task still running; an `aristotle ci` or `aristotle review` run's time budget cut it, whatever `--fail-on` is; an `aristotle ci` run, or an `aristotle review` run when `--fail-on` is `failure` or `no-verdict`, ran out of budget before Aristotle checked its results; `aristotle login` checked a key but couldn't store it; a key a browser login handed out can't be sent; or an unexpected error. |
+| 3 | The command couldn't complete: a server or network error outlasted the retries; a task you waited on failed or was cancelled; a wait ended with the task still running; an `aristotle ci` or `aristotle review` run's time budget cut it, whatever `--fail-on` is; an `aristotle ci` run, or an `aristotle review` run when `--fail-on` is `failure` or `no-verdict`, ran out of budget, or billing stopped it, before Aristotle checked its results; `aristotle login` checked a key but couldn't store it; a key a browser login handed out can't be sent; or an unexpected error. |
 | 4 | The project, task, property or question doesn't exist or your key can't see it, no project has that name or id prefix, or Aristotle refused the action: cancelling a finished task (one already cancelled counts as cancelled), or `questions --answer` for a closed question, an ended run or someone else's project. Also `download` of a project with no files yet, or of an `--artifact` it has no file at. |
 | 5 | No API key was found, Aristotle rejected it, it can't be sent (whitespace around a key is ignored, and what's left is empty or holds a space, a control character or a non-ASCII character), or `aristotle login` was denied in the browser or its code expired. |
-| 6 | Aristotle is rate limiting your account: too many runs in progress or waiting to start, or too many requests at once, even after the retries. The message says which, with Aristotle's limits when it gives them. Retry later; for runs, wait for one of yours to finish, or cancel one. Also an `aristotle ci` or `aristotle review` run still queued when its time budget ran out. |
+| 6 | Aristotle is rate limiting your account: too many runs in progress or waiting to start, or too many requests at once, even after the retries. The message says which, with Aristotle's limits when it gives them. Retry later; for runs, wait for one of yours to finish, or cancel one. Or your organization doesn't have the credits to start a run: once an organization admin buys them at https://aristotle.harmonic.fun/settings/billing, run it again. Also an `aristotle ci` or `aristotle review` run still queued when its time budget ran out. |
 | 7 | The request may have gone through: its response was lost after Aristotle may have acted on it, so it wasn't sent again, or an earlier copy was still in progress when the retries ran out. Check before sending it again ([Retries and lost requests](#retries-and-lost-requests)). |
 | 10 | A `--non-interactive` wait stopped because Aristotle is waiting for answers; stdout holds the questions. |
 | 130 | Interrupted with Ctrl-C, or ended by SIGTERM. A task you were following keeps running, and the log says how to follow or cancel it; `aristotle ci` and `aristotle review` cancel their run unless `--on-timeout leave` is set, and `aristotle ci --project` leaves it going unless `--on-timeout cancel` is. A `submit` interrupted after sending its create says the project may exist, which can take a few minutes to show, and how to find and cancel it; one interrupted before says nothing was sent. A `submit --wait`, or a `show` with `--destination`, interrupted after its wait has seen the task finish and before the result archive is saved, or during the download, says the archive wasn't saved, and names the `aristotle download` command that saves it where the wait would have. `aristotle ci`, `aristotle review` and `aristotle ci setup` interrupted once their create was sent look for the project by the name it was uploaded under for up to 10 seconds, and cancel its run once it starts unless `--on-timeout leave` is set; if they can't find the project, or its run hasn't started, they say how to find and cancel it. |
@@ -417,14 +421,16 @@ The rest handle it themselves:
 
 | Command | When its request may have gone through |
 |---|---|
-| `cancel` | It's sent again like a read, since cancelling twice cancels once, and a task already cancelled counts as cancelled. |
+| `cancel` | It's sent again like a read, since cancelling twice cancels once. If it still fails, or Aristotle refuses it, `cancel` reads the task, and a task that reads cancelled counts as cancelled. |
 | `aristotle ci`, `aristotle review` | They look for the run themselves and follow it, and exit 7 only when they can't find a run that started. |
 | `aristotle login` | When an answer that may have held the key is lost, the next answer decides, since Aristotle hands a key out once: one saying it's still waiting carries on, and anything but a denial exits 7. A key Aristotle made then shows on API keys, named after the machine, to revoke before logging in again. |
 
 **A request that didn't get through.** When no attempt got through, because no connection opened, the HTTP library
-refused to send the request, or Aristotle refused each as too many requests at once, or when Aristotle refused it for
-too many runs in progress, nothing was done, and the command says so: it exits 3, or 6 for the refusals, and
-`submit --json` and `continue --json` print `{"outcome": "not_processed", "error": "<what failed>"}`. `continue` and
-`questions --answer` do the same when a lookup they make first, such as the project's, fails with no response, a server
-error or too many requests at once. Then the same command is safe to run again. Otherwise `questions --answer` sends
-each answer on its own, so send again only those whose error says they weren't answered.
+refused to send the request, or Aristotle refused each as too many requests at once or because it couldn't read your
+organization's credits, nothing was done. When Aristotle refused it for too many runs in progress, for credits or while
+your organization is still setting up, no run was started and no prompt sent. Either way the command says so: it exits
+3, or 6 for too many requests or runs and for credits, and `submit --json` and `continue --json` print
+`{"outcome": "not_processed", "error": "<what failed>"}`. `continue` and `questions --answer` do the same when a lookup
+they make first, such as the project's, fails with no response, a server error or too many requests at once. Then the
+same command is safe to run again. Otherwise `questions --answer` sends each answer on its own, so send again only
+those whose error says they weren't answered.

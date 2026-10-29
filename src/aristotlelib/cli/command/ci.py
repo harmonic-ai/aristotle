@@ -17,7 +17,7 @@ from pathlib import Path, PurePosixPath
 from typing import TypeVar
 
 from aristotlelib import local_file_utils
-from aristotlelib.agent_task import TERMINAL_STATUSES, TaskStatus, follow_hint
+from aristotlelib.agent_task import TERMINAL_STATUSES, BudgetFailureReason, TaskStatus, billing_wait, follow_hint
 from aristotlelib.api_request import AristotleAPIError, set_surface
 from aristotlelib.ci import console, context, github, junit, manifest, naming, results, runner, scope
 from aristotlelib.ci.record import RunRecord
@@ -381,6 +381,13 @@ class VerifyAction(APIAction):
             return EXIT_USAGE_ERROR
         return None
 
+    @staticmethod
+    def _check_folders(build: context.CIContext, directory: Path | None) -> int | None:
+        if problem := _folder_problem(build, directory):
+            logger.error(problem)
+            return EXIT_USAGE_ERROR
+        return None
+
     def run(self, args: argparse.Namespace) -> int:
         # GitHub names the repository of the action a step runs, and none for a `run:` step.
         set_surface("action" if os.environ.get("GITHUB_ACTION_REPOSITORY") else "ci")
@@ -716,7 +723,10 @@ class VerifyAction(APIAction):
             run_results.failed or run_results.without_verdict or run_results.out_of_budget or registered_none
         ):
             # A stopped run's summary is already fetched, without its stop marker.
-            summary = stopped_summary if stopped_summary is not None else await _fetch_summary(project)
+            summary = stopped_summary
+            if summary is None:
+                summary, budget_failure_reason = await _fetch_summary(project)
+                run_results = dataclasses.replace(run_results, budget_failure_reason=budget_failure_reason)
             if summary != runner.NO_STOPPED_SUMMARY:
                 run_results = dataclasses.replace(run_results, run_summary=summary)
 
@@ -742,7 +752,9 @@ class VerifyAction(APIAction):
         if run_results.canceled:
             logger.error("The verification run was cancelled outside this job before it finished.")
         if run_results.cut_short:
-            access = await _language_access(root, scope_result, checked) if run_results.nothing_registered else {}
+            # A billing stop has its own cause, so the account's languages aren't asked about.
+            unexplained = run_results.nothing_registered and run_results.budget_failure_reason is None
+            access = await _language_access(root, scope_result, checked) if unexplained else {}
             logger.error(_cut_short_error(run_results, project.web_url(), access))
         if run_results.never_started:
             logger.error(
@@ -896,8 +908,10 @@ class CIAction(VerifyAction):
     def preflight(self, args: argparse.Namespace) -> int | None:
         self._build = context.detect()
         searched = not args.directory and not args.manifest and self._build.system == context.CISystem.LOCAL
-        self._root = self.root(args.directory, self._build, None if args.manifest else manifest.MANIFEST_NAME)
         logger.info(f"Aristotle CI — {self._build.describe()}")
+        if (code := self._check_folders(self._build, args.directory)) is not None:
+            return code
+        self._root = self.root(args.directory, self._build, None if args.manifest else manifest.MANIFEST_NAME)
         given: set[str] = getattr(args, "given_options", set())
         if args.project is not None:
             source = self._project_source = "--project" if "project" in given else "ARISTOTLE_PROJECT"
@@ -1313,8 +1327,57 @@ def _link_out(top: str, real_top: str, inside: Path) -> Path:
     return Path(top, inside)
 
 
-async def _fetch_summary(project: Project) -> str | None:
-    """The run's summary; None, with a warning, when it can't be fetched within SUMMARY_FETCH_SECONDS."""
+def _folder_problem(build: context.CIContext, directory: Path | None) -> str | None:
+    """Why the step can't run: ``directory`` is reached through _checkout_link(), or, in CI, the current folder resolves
+    outside the workspace; None if neither, with a warning where the workspace isn't a folder here."""
+    current = os.getcwd()
+    if directory is not None and (link := _checkout_link(current, directory)):
+        return (
+            f"--directory {directory} is reached through {link}, a link in the checkout, which could lead the run out "
+            "of it. Remove the link, or pass --directory a path with no link in the checkout."
+        )
+    if build.system == context.CISystem.LOCAL:
+        return None
+    real, workspace = os.path.realpath(current), os.path.realpath(build.workspace)
+    if _holds(workspace, Path(real)):
+        return None
+    outside = f"The current folder resolves to {real}, outside the workspace the CI system names, {workspace}"
+    if not os.path.isdir(workspace):
+        logger.warning(
+            f"{outside}. That isn't a folder here, as in a container that mounts the checkout elsewhere, so the "
+            "step goes on."
+        )
+        return None
+    return (
+        f"{outside}: a link in the checkout may have led the step out of it. Run the step in the workspace, and name "
+        "the folder to check with --directory."
+    )
+
+
+def _checkout_link(current: str, directory: Path) -> str | None:
+    """The first symbolic link or Windows junction on ``directory``'s way from ``current`` in the checkout ``current`` is
+    in, past any mount point, else in the first folder on the way, ``current`` and those above it aside, that holds a
+    .git; None if there is none."""
+    top = local_file_utils.enclosing_repository(Path(current), across_filesystems=True)
+    folder, *names = Path(current, directory).parts
+    for name in names:
+        if name == os.pardir:
+            # As Path.resolve() takes it: as text on Windows, else up from the folder reached so far, links followed.
+            folder = os.path.dirname(folder if os.name == "nt" else os.path.realpath(folder))
+            continue
+        if top is None and os.path.lexists(os.path.join(folder, ".git")) and not _holds(folder, Path(current)):
+            top = Path(folder)
+        path = os.path.join(folder, name)
+        linked = os.path.islink(path) or local_file_utils.is_junction(Path(path))
+        if linked and top is not None and _holds(str(top), Path(folder)):
+            return path
+        folder = path
+    return None
+
+
+async def _fetch_summary(project: Project) -> tuple[str | None, BudgetFailureReason | None]:
+    """The run's summary, and why billing stopped it; both None, with a warning, when they can't be fetched within
+    SUMMARY_FETCH_SECONDS."""
     try:
         return await asyncio.wait_for(runner.fetch_summary(project), SUMMARY_FETCH_SECONDS)
     except asyncio.TimeoutError:
@@ -1324,7 +1387,7 @@ async def _fetch_summary(project: Project) -> str | None:
         reason = str(e) or type(e).__name__
         logger.debug("Fetching the run's summary failed", exc_info=True)
     logger.warning(f"Could not fetch the run's summary: {reason}")
-    return None
+    return None, None
 
 
 _KIND_LANGUAGES = {manifest.Kind.SVA: "Verilog", manifest.Kind.C_FUNCTION_NO_UB: "C"}
@@ -1355,7 +1418,15 @@ def _summary_pointer(run_results: results.RunResults) -> str:
 
 
 def _cut_short_error(run_results: results.RunResults, url: str, access: dict[str, bool | None]) -> str:
-    """The error for a run that ran out of budget or time: why its results are unchecked, or why it has none."""
+    """The error for a run that ran out of budget or time, or that billing stopped: why its results are unchecked, or
+    why it has none."""
+    if (reason := run_results.budget_failure_reason) is not None:
+        again = None if (wait := billing_wait(reason)) is None else f"{wait}, run it again."
+        if not run_results.nothing_registered:
+            parts = [run_results.unchecked_reason, "None of them counts as proved or refuted.", again]
+        else:
+            parts = [run_results.unchecked_reason, again, f"{_summary_pointer(run_results)} {url}"]
+        return " ".join(part for part in parts if part)
     timed_out = not run_results.out_of_budget
     note = f" {SLOT_WAIT_NOTE}" if timed_out else ""
     if not run_results.nothing_registered:

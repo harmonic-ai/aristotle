@@ -31,9 +31,13 @@ from aristotlelib.api_request import (
     set_api_key,
 )
 from tests.conftest import (
+    BILLING_UNAVAILABLE,
+    BUY_CREDITS,
     FAKE_KEY,
+    OUT_OF_CREDITS,
     PADDED_KEYS,
     REFUSED_KEYS,
+    SIGNUP_GRANT_PENDING,
     fast_api_clock,
     give_key,
     shown_key_runs,
@@ -2082,6 +2086,103 @@ async def test_a_409_without_a_key_is_not_sent_again(api_server):
 
     assert info.value.status_code == 409
     assert len(requests) == 1
+
+
+async def test_a_keyed_409_that_isnt_the_busy_keys_is_final(api_server):
+    requests = api_server(_status(409, "Your organization changed. Reload and try again."))
+
+    async with AristotleRequestClient() as client:
+        with pytest.raises(AristotleAPIError) as info:
+            await client.post("/project", idempotency_key="k-1")
+
+    assert type(info.value) is AristotleAPIError
+    assert str(info.value) == "API request failed with status 409: Your organization changed. Reload and try again."
+    assert len(requests) == 1
+
+
+@pytest.mark.parametrize(
+    ("status", "detail", "error"),
+    [
+        (
+            402,
+            OUT_OF_CREDITS,
+            f"Your organization needs at least 1.00 Credit to start a run. {BUY_CREDITS}",
+        ),
+        (409, SIGNUP_GRANT_PENDING, SIGNUP_GRANT_PENDING["message"]),
+    ],
+    ids=["out of credits", "still setting up"],
+)
+async def test_a_run_billing_refuses_did_nothing_and_is_not_sent_again(status, detail, error, api_server):
+    requests = api_server(httpx.Response(status, json={"detail": detail}))
+
+    async with AristotleRequestClient() as client:
+        with pytest.raises(AristotleNotProcessedError) as info:
+            await client.post("/project", idempotency_key="k-1")
+
+    assert (str(info.value), info.value.status_code, info.value.error_code) == (error, status, detail["code"])
+    assert len(requests) == 1
+
+
+async def test_a_402_without_a_message_says_where_to_buy_credits_at_the_web_origin(api_server, monkeypatch):
+    monkeypatch.setenv("ARISTOTLE_WEB_URL", "http://127.0.0.1:8000")
+    api_server(httpx.Response(402, text="Payment Required"))
+
+    async with AristotleRequestClient() as client:
+        with pytest.raises(AristotleNotProcessedError) as info:
+            await client.post("/project", idempotency_key="k-1")
+
+    assert str(info.value) == (
+        "Your organization needs credits to start a run. An organization admin can buy credits at "
+        "http://127.0.0.1:8000/settings/billing."
+    )
+
+
+@pytest.mark.usefixtures("frozen_api_clock")
+async def test_a_run_billing_could_not_check_is_sent_again_and_did_nothing(api_server, caplog):
+    unavailable = [
+        lambda request: httpx.Response(503, json={"detail": BILLING_UNAVAILABLE})
+    ] * api_request.RETRY_ATTEMPTS
+    requests = api_server(*unavailable)
+
+    async with AristotleRequestClient() as client:
+        with pytest.raises(AristotleNotProcessedError) as info:
+            await client.post("/project", idempotency_key="k-1")
+
+    assert str(info.value) == (
+        "POST /project after 5 attempts over 0 s: The credit balance is temporarily unavailable. Aristotle didn't act "
+        "on it."
+    )
+    assert (info.value.status_code, info.value.error_code) == (503, "BILLING_UNAVAILABLE")
+    assert [request.headers["Idempotency-Key"] for request in requests] == ["k-1"] * api_request.RETRY_ATTEMPTS
+    assert caplog.messages[0].endswith(" after 503 on POST /project: The credit balance is temporarily unavailable.")
+
+
+async def test_a_run_billing_could_not_check_at_first_goes_through_on_a_retry(api_server):
+    requests = api_server(httpx.Response(503, json={"detail": BILLING_UNAVAILABLE}), _ok())
+
+    async with AristotleRequestClient() as client:
+        assert (await client.post("/project", idempotency_key="k-1")).json() == {"ok": True}
+
+    assert len(requests) == 2
+
+
+@pytest.mark.parametrize(
+    ("detail", "error", "error_code"),
+    [
+        ({"code": "LIMIT", "message": "Wait for the export to finish."}, "Wait for the export to finish.", "LIMIT"),
+        ({"code": "LIMIT"}, "API request failed with status 400: Bad Request", "LIMIT"),
+        ({"message": 7}, "API request failed with status 400: Bad Request", None),
+    ],
+    ids=["its message", "no message", "a message that isn't text"],
+)
+async def test_a_detail_object_gives_its_message_alone_and_its_code(detail, error, error_code, api_server):
+    api_server(httpx.Response(400, json={"detail": detail}))
+
+    async with AristotleRequestClient() as client:
+        with pytest.raises(AristotleAPIError) as info:
+            await client.get("/project")
+
+    assert (str(info.value), info.value.error_code) == (error, error_code)
 
 
 async def test_an_idempotent_post_is_retried_like_a_get(api_server):

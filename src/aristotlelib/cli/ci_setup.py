@@ -13,7 +13,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path, PurePath, PurePosixPath
 
 from aristotlelib import local_file_utils
-from aristotlelib.agent_task import TERMINAL_STATUSES, AgentTask, TaskStatus
+from aristotlelib.agent_task import INCOMPLETE_ENDING, TERMINAL_STATUSES, AgentTask, TaskStatus
 from aristotlelib.api_request import AristotleAPIError
 from aristotlelib.ci import context, location, manifest, naming, runner, scope
 from aristotlelib.ci.results import proved, refuted, status_label
@@ -776,7 +776,9 @@ class SetupAction(APIAction):
             task = tasks[0]
             try:
                 # A follow-up wouldn't write the manifest: --from does, below.
-                await task.wait_for_completion(interactive=True, title=project.description, resumable=False)
+                await task.wait_for_completion(
+                    interactive=True, title=project.description, resumable=False, _incomplete_ending=False
+                )
             except (KeyboardInterrupt, asyncio.CancelledError):
                 # The wait's own message already says how to follow or cancel the run.
                 logger.info(later)
@@ -800,6 +802,13 @@ class SetupAction(APIAction):
             logger.error(f"{e}\nNothing was written. {later}")
             return exit_code_for(e)
 
+        if task.status == TaskStatus.COMPLETE_WITH_ERRORS:
+            # A run that leaves its properties unproved, as SETUP_PROMPT asks, ends COMPLETE_WITH_ERRORS.
+            logger.info(
+                "Aristotle proposed the properties; setup leaves proving them to `aristotle ci`."
+                if _copied(declarations)
+                else INCOMPLETE_ENDING
+            )
         return self._write(declarations, project, args.force, [task], took)
 
     def _ci_flags(self) -> list[str]:

@@ -599,14 +599,14 @@ def exit_code_for(error: AristotleAPIError) -> int:
 
 
 def api_error_exit_code(status_code: int | None) -> int:
-    """401 is 5, 403 and 404 are 4, 400, 410 and 422 are 2, 429 is 6, and any other status or none is 3."""
+    """401 is 5, 403 and 404 are 4, 400, 410 and 422 are 2, 402 and 429 are 6, and any other status or none is 3."""
     if status_code == 401:
         return EXIT_AUTH_ERROR
     if status_code in (403, 404):
         return EXIT_NOT_FOUND
     if status_code in (400, 410, 422):
         return EXIT_USAGE_ERROR
-    if status_code == 429:
+    if status_code in (402, 429):
         return EXIT_RATE_LIMITED
     return EXIT_INFRASTRUCTURE_ERROR
 

@@ -124,7 +124,7 @@ async def _run(
         patch("aristotlelib.ci.runner.submit", AsyncMock(return_value=_project())) as submit,
         patch("aristotlelib.ci.runner.wait_for_completion", AsyncMock(return_value=final_status)),
         patch("aristotlelib.ci.runner.fetch_stopped_summary", AsyncMock(return_value=stopped_summary)),
-        patch("aristotlelib.ci.runner.fetch_summary", AsyncMock(return_value=summary)),
+        patch("aristotlelib.ci.runner.fetch_summary", AsyncMock(return_value=(summary, None))),
         patch("aristotlelib.ci.runner.language_access", language_access),
         patch.object(Project, "get_declarations", AsyncMock(return_value=declarations)),
     ):
@@ -410,6 +410,66 @@ async def test_a_change_with_no_source_file_writes_its_empty_report_over_a_link_
         in caplog.text
     )
     assert "This change touched no verifiable source file." in caplog.text
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink") or os.name == "nt", reason="POSIX symlinks")
+async def test_a_directory_reached_through_a_link_in_the_checkout_exits_2(
+    action: ReviewAction, repo: Path, tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch, caplog
+):
+    other = tmp_path_factory.mktemp("other-job")
+    (other / "secret_ip.v").write_text("module secret_ip;\nendmodule\n")
+    (repo / "hw").symlink_to(other, target_is_directory=True)
+    git(repo, "add", "hw")
+    git(repo, "commit", "-qm", "link hw")
+    monkeypatch.chdir(repo)
+
+    with caplog.at_level(logging.INFO, logger="aristotle"):
+        code, _ = await _run(action, ["--scope", "all", "--directory", "hw"], [], preflight=True)
+
+    assert code == EXIT_USAGE_ERROR
+    assert caplog.messages == [
+        f"--directory hw is reached through {repo.resolve() / 'hw'}, a link in the checkout, which could lead the run "
+        "out of it. Remove the link, or pass --directory a path with no link in the checkout."
+    ]
+
+
+async def test_in_ci_a_current_folder_outside_the_workspace_exits_2_naming_both(
+    action: ReviewAction, repo: Path, tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch, caplog
+):
+    other = tmp_path_factory.mktemp("other-job")
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(repo))
+    monkeypatch.chdir(other)
+
+    with caplog.at_level(logging.INFO, logger="aristotle"):
+        code, _ = await _run(action, ["--scope", "all", "--directory", "."], [], preflight=True)
+
+    assert code == EXIT_USAGE_ERROR
+    assert caplog.messages == [
+        f"The current folder resolves to {other.resolve()}, outside the workspace the CI system names, "
+        f"{repo.resolve()}: a link in the checkout may have led the step out of it. Run the step in the workspace, and "
+        "name the folder to check with --directory."
+    ]
+
+
+async def test_in_ci_a_current_folder_in_the_workspace_runs(
+    action: ReviewAction, repo: Path, tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+):
+    (repo / "rtl").mkdir()
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(repo))
+    monkeypatch.chdir(repo / "rtl")
+    report = tmp_path_factory.mktemp("junit") / "out.xml"
+
+    code, submit = await _run(
+        action,
+        ["--scope", "all", "--junit", str(report)],
+        [make_declaration("Spec.A", DeclarationStatus.PROVED)],
+        preflight=True,
+    )
+
+    assert code == EXIT_SUCCESS
+    assert submit.await_args.args[0] == repo.resolve()
 
 
 async def test_a_lean_change_is_verified_rather_than_passed_as_touching_no_source_file(

@@ -134,6 +134,8 @@ def _run_error(results: RunResults) -> tuple[str, str, str] | None:
         return None
     if results.task_failed or results.canceled:
         kind, note = ("failed" if results.task_failed else "cancelled"), UNCHECKED_PROOFS_NOTE
+    elif results.budget_failure_reason is not None:
+        kind, note = "billing", UNCHECKED_NOTE
     else:
         kind, note = ("out of budget" if results.out_of_budget else "time budget"), UNCHECKED_NOTE
     notes = [] if results.nothing_registered else [note]

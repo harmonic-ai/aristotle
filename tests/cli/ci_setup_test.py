@@ -18,7 +18,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from aristotlelib import api_request
-from aristotlelib.agent_task import AgentTask, TaskStatus
+from aristotlelib.agent_task import INCOMPLETE_ENDING, AgentTask, TaskStatus
 from aristotlelib.api_request import AristotleAPIError
 from aristotlelib.ci import context, manifest, runner
 from aristotlelib.cli.ci_setup import (
@@ -323,6 +323,53 @@ async def test_no_proposals_write_nothing_and_exit_1(repo: Path, caplog):
     assert code == EXIT_VERIFICATION_FAILED
     assert not (repo / "aristotle.toml").exists()
     assert "proposed no properties" in caplog.text
+
+
+PROPOSED = "Aristotle proposed the properties; setup leaves proving them to `aristotle ci`."
+
+
+async def test_a_setup_run_that_ends_incomplete_says_it_proposed_the_properties(repo: Path, caplog):
+    task = _task(status=TaskStatus.COMPLETE_WITH_ERRORS)
+
+    with caplog.at_level(logging.INFO, logger="aristotle"):
+        code, _ = await _setup([], [_proposal("p", "It holds.", 1)], task=task)
+
+    assert code == EXIT_SUCCESS
+    assert task.wait_for_completion.await_args.kwargs["_incomplete_ending"] is False
+    assert INCOMPLETE_ENDING not in caplog.messages
+    ending = caplog.messages.index(PROPOSED)
+    assert caplog.messages[ending + 1].startswith("Wrote aristotle.toml with 1 property:")
+
+
+@pytest.mark.parametrize(
+    "declarations",
+    [
+        [],
+        [_proposal("d", "A definition.", 1, declaration_type=DeclarationType.DEFINITION)],
+        [_proposal("withdrawn", "Withdrawn.", 1, status=DeclarationStatus.REMOVED)],
+    ],
+    ids=["nothing", "a definition", "a withdrawn property"],
+)
+async def test_a_setup_run_that_ends_incomplete_with_no_property_says_it_did_not_complete(
+    repo: Path, declarations, caplog
+):
+    with caplog.at_level(logging.INFO, logger="aristotle"):
+        code, _ = await _setup([], declarations, task=_task(status=TaskStatus.COMPLETE_WITH_ERRORS))
+
+    assert code == EXIT_VERIFICATION_FAILED
+    assert PROPOSED not in caplog.messages
+    ending = caplog.messages.index(INCOMPLETE_ENDING)
+    assert caplog.messages[ending + 1].startswith("Aristotle proposed no properties, so nothing was written.")
+
+
+@pytest.mark.parametrize("status", [TaskStatus.COMPLETE, TaskStatus.OUT_OF_BUDGET])
+async def test_setup_leaves_every_other_ending_to_the_wait(repo: Path, status: TaskStatus, caplog):
+    with caplog.at_level(logging.INFO, logger="aristotle"):
+        code, _ = await _setup([], [_proposal("p", "It holds.", 1)], task=_task(status=status))
+
+    assert code == EXIT_SUCCESS
+    assert PROPOSED not in caplog.messages
+    assert INCOMPLETE_ENDING not in caplog.messages
 
 
 @pytest.mark.parametrize("status", [TaskStatus.FAILED, TaskStatus.CANCELED])

@@ -7,9 +7,10 @@ from enum import Enum
 from typing import Any
 
 import httpx
+import pydantic
 
 from aristotlelib import api_request, progress_utils
-from aristotlelib.aristotle_object import AristotleObject
+from aristotlelib.aristotle_object import AristotleObject, SafeIntEnum
 from aristotlelib.cli.question_flow import (
     DEFAULT_DEADLINE_SECONDS,
     can_prompt,
@@ -58,6 +59,15 @@ class TaskStatus(Enum):
         return cls.UNKNOWN
 
 
+class BudgetFailureReason(SafeIntEnum):
+    """Why billing stopped a run, which then ends ``OUT_OF_BUDGET``."""
+
+    UNKNOWN = 0
+    OUT_OF_CREDITS = 1
+    BILLING_UNAVAILABLE = 2
+    TRIAL_CREDIT_CONCURRENCY_LIMIT = 3  # Free credits allow one active project per organization.
+
+
 # The statuses a task ends in; until another task runs, nothing changes its properties.
 TERMINAL_STATUSES = frozenset(
     {
@@ -91,6 +101,20 @@ def _prompt_line(text: str) -> None:
     print(printable(text), file=sys.stderr)
 
 
+def _question_notice(question: Question, read_only: bool = False) -> str:
+    asked = f"Aristotle asked: {question.content}"
+    if question.answered:
+        who = "The project's owner" if read_only else "You"
+        return f"{asked}\n{who} answered: {question.response}"
+    if question.ignored:
+        return f"{asked}\nThe question was closed without an answer."
+    if question.state == "UNANSWERED":
+        return f"{asked}\nThe run has ended, so no answer can reach Aristotle now."
+    if read_only:
+        return f"{asked}\nWaiting for an answer; only the project's owner can answer."
+    return f"{asked}\nWaiting for an answer; answer with: aristotle questions {question.project_id}"
+
+
 def follow_hint(project_id: str, read_only: bool = False, carry_on: str | None = None) -> str:
     """How to follow a run you stopped waiting for, by ``carry_on`` where given, and, if it is yours, cancel it."""
     hint = carry_on if carry_on is not None else f"Follow it with: aristotle show {project_id}"
@@ -114,17 +138,52 @@ _BAD_ENDINGS = {
 ENDED_BADLY = frozenset(_BAD_ENDINGS)
 """The statuses ending_notice() explains."""
 
+INCOMPLETE_ENDING = "Aristotle made progress but did not fully complete the request. Its summary says what is left."
+
+
+_BILLING_STOPS = {
+    BudgetFailureReason.OUT_OF_CREDITS: "Task stopped: your organization ran out of credits.",
+    BudgetFailureReason.TRIAL_CREDIT_CONCURRENCY_LIMIT: (
+        "Task stopped: free credits allow one active project per organization."
+    ),
+    BudgetFailureReason.BILLING_UNAVAILABLE: "Task stopped: Aristotle couldn't check your organization's credits.",
+}
+
+
+def billing_wait(reason: BudgetFailureReason) -> str | None:
+    """When a run billing stopped for ``reason`` can go again, to begin a sentence; None when only its summary says."""
+    billing = api_request.billing_url()
+    if reason == BudgetFailureReason.OUT_OF_CREDITS:
+        return f"Once an organization admin buys credits at {billing}"
+    if reason == BudgetFailureReason.TRIAL_CREDIT_CONCURRENCY_LIMIT:
+        return (
+            f"Once no other project of your organization is running, or an organization admin buys credits at {billing}"
+        )
+    if reason == BudgetFailureReason.BILLING_UNAVAILABLE:
+        return "In a few minutes"
+    return None
+
 
 def ending_notice(
-    status: TaskStatus, project_id: str, read_only: bool = False, resume: Sequence[Sequence[str]] | None = None
+    status: TaskStatus,
+    project_id: str,
+    read_only: bool = False,
+    resume: Sequence[Sequence[str]] | None = None,
+    reason: BudgetFailureReason | None = None,
 ) -> str | None:
     """What a task that ended FAILED, CANCELED or OUT_OF_BUDGET leaves to do, with the commands that resume it on the
     same project: ``resume``, each a list of words, where given, else `aristotle continue <project-id> Continue --wait`;
-    None for any other status. Only the project's owner can continue it."""
+    None for any other status. One that billing stopped for ``reason`` says so, and when to resume it. Only the
+    project's owner can continue it."""
     ending = _BAD_ENDINGS.get(status)
-    if ending is None or read_only:
-        return ending
+    if ending is None:
+        return None
     again = "Try it again" if status == TaskStatus.FAILED else "Resume it"
+    if status == TaskStatus.OUT_OF_BUDGET and reason is not None:
+        ending = _BILLING_STOPS.get(reason, "Task stopped by billing. Its summary says why.")
+        again = "Resume it" if (wait := billing_wait(reason)) is None else f"{wait}, resume it"
+    if read_only:
+        return ending
     commands = resume or [["aristotle", "continue", project_id, "Continue", "--wait"]]
     return f"{ending} {shell_hint(f'{again} on the same project with', *commands)}"
 
@@ -133,6 +192,8 @@ class AgentTask(AristotleObject):
     project_id: str
     agent_task_id: str
     status: TaskStatus
+    # Set when billing stopped the run, which ends OUT_OF_BUDGET; None otherwise, and for someone else's shared project.
+    budget_failure_reason: BudgetFailureReason | None = None
     created_at: UTCDatetime
     last_updated_at: UTCDatetime
     # When the run's job started, shortly before the run reports IN_PROGRESS. None while it is queued, for a run
@@ -147,6 +208,12 @@ class AgentTask(AristotleObject):
     read_only: bool = False
 
     endpoint_prefix = "task"
+
+    @pydantic.computed_field  # type: ignore[prop-decorator]
+    @property
+    def budget_failure_reason_name(self) -> str | None:
+        """``budget_failure_reason``'s name, such as ``OUT_OF_CREDITS``; null when it is."""
+        return None if self.budget_failure_reason is None else self.budget_failure_reason.name
 
     @property
     def object_id(self) -> str:
@@ -212,33 +279,36 @@ class AgentTask(AristotleObject):
             return events, pagination_key
 
     async def cancel(self) -> None:
-        """Cancel the task if it is in progress or queued; a task already CANCELED counts as cancelled, and one that
-        has otherwise finished raises a 404 that says so."""
+        """Cancel the task if it is in progress or queued; a task that reads CANCELED once the request has failed
+        counts as cancelled, and Aristotle's refusal of one that has otherwise finished raises a 404 that says so."""
         async with api_request.AristotleRequestClient() as client:
             try:
                 # Sending it twice cancels once, so a lost reply is sent again like a GET's.
                 response = await client.post(f"/{self.endpoint_prefix}/{self.agent_task_id}/cancel", idempotent=True)
             except api_request.AristotleAPIError as e:
-                # Aristotle refuses with a 404 any task no longer in progress or queued, one this cancel ended included.
-                if e.status_code != 404:
-                    raise
-                refusal = e
+                failure = e
             else:
                 self._update_from_response(response.json())
                 return
-        await self.refresh()
-        if self.status in TERMINAL_STATUSES and self.status != TaskStatus.CANCELED:
-            raise api_request.AristotleAPIError(
-                f"Task {self.agent_task_id} has already finished ({self.status.name}), so it can't be cancelled.",
-                refusal.status_code,
-            )
+        if failure.status_code == 404:
+            # Aristotle refuses with a 404 any task no longer in progress or queued, one this cancel ended included.
+            await self.refresh()
+            if self.status in TERMINAL_STATUSES and self.status != TaskStatus.CANCELED:
+                raise api_request.AristotleAPIError(
+                    f"Task {self.agent_task_id} has already finished ({self.status.name}), so it can't be cancelled.",
+                    failure.status_code,
+                )
+        else:
+            # Aristotle marks the task CANCELED before it stops the run, so a cancel that took effect can still fail.
+            await self._refresh_quietly()
         if self.status != TaskStatus.CANCELED:
-            raise refusal
+            raise failure
 
     async def show(
         self, num_events: int = 0, pagination_key: str | None = None, title: str | None = None
     ) -> str | None:
-        """Display task info, headed by ``title`` where given, as a wait's display is, and recent events."""
+        """Display task info, headed by ``title`` where given, as a wait's display is, and recent events, with each
+        question's text and state from the task's questions listing."""
         logger.info("\n".join(self._status_lines(title)))
         if self.output_summary:
             logger.info(self.output_summary)
@@ -247,11 +317,36 @@ class AgentTask(AristotleObject):
             return None
 
         events, next_pagination_key = await self.get_events(limit=num_events, pagination_key=pagination_key)
+        notices = await self._question_notices(events)
         for event in reversed(events):
-            logger.info(event)
+            logger.info(notices.get(event.event_id, event))
         if next_pagination_key:
             logger.info(f"Pagination key for next page: {next_pagination_key}")
         return next_pagination_key
+
+    async def _question_notices(self, events: list[Event]) -> dict[str, str]:
+        """Each unanswered question event's line: its listed question's, else what it asked unless SENT; none at all
+        from a server without the questions listing."""
+        asking = [
+            event for event in events if event.event_type == EventType.AGENT_QUESTION and event.explanation is None
+        ]
+        if not asking:
+            return {}
+        try:
+            questions = await Question.list_for_task(self.agent_task_id, run_live=self.live)
+        except api_request.AristotleAPIError as e:
+            if e.status_code in (404, 405):
+                return {}
+            logger.warning(f"Could not list the task's questions: {e}")
+            questions = []
+        by_event = {question.event_id: question for question in questions if question.event_id}
+        notices: dict[str, str] = {}
+        for event in asking:
+            if (question := by_event.get(event.event_id)) is not None:
+                notices[event.event_id] = _question_notice(question, self.read_only)
+            elif event.status != EventStatus.SENT:
+                notices[event.event_id] = f"Aristotle asked: {event.content}"
+        return notices
 
     async def _prompt_for_answer(self, event: Event, interactive: bool = True) -> bool:
         """Prompt user to answer an agent question with a timeout (the per-event fallback path); False if not prompted."""
@@ -349,6 +444,8 @@ class AgentTask(AristotleObject):
         resumable: bool = True,
         carry_on: str | None = None,
         resume: Sequence[Sequence[str]] | None = None,
+        # Private, for the CLI: False leaves a COMPLETE_WITH_ERRORS ending for the caller to say.
+        _incomplete_ending: bool = True,
     ) -> list[Question]:
         """Wait for the task; interactive, as the CLI waits, draws progress on stdout, headed by ``title``, such as the
         project's name, where given, and prompts on stdin at a terminal, where without it the wait uses neither and
@@ -531,14 +628,18 @@ class AgentTask(AristotleObject):
             show_progress()
 
             if self.status in ENDED_BADLY:
-                notice = ending_notice(self.status, self.project_id, self.read_only or not resumable, resume)
+                if self.budget_failure_reason is not None and self.output_summary:
+                    # Billing's message to the owner, which the summary carries.
+                    logger.info(self.output_summary)
+                notice = ending_notice(
+                    self.status, self.project_id, self.read_only or not resumable, resume, self.budget_failure_reason
+                )
                 (logger.error if self.status == TaskStatus.FAILED else logger.info)(notice)
             elif self.status == TaskStatus.COMPLETE:
                 logger.info("Task complete!")
             elif self.status == TaskStatus.COMPLETE_WITH_ERRORS:
-                logger.info(
-                    "Aristotle made progress but did not fully complete the request. Its summary says what is left."
-                )
+                if _incomplete_ending:
+                    logger.info(INCOMPLETE_ENDING)
             elif self.status == TaskStatus.QUEUED:
                 logger.error(
                     "The event stream ended before the run started.\n"
@@ -660,7 +761,7 @@ class _QuestionWatcher:
             if question.ignored and question.question_id in self._presented:
                 if question.question_id not in self._reported_ignored:
                     self._reported_ignored.add(question.question_id)
-                    entries.append(f"Aristotle asked: {question.content}\nThe question was closed without an answer.")
+                    entries.append(_question_notice(question))
 
         if any(question.question_id not in self._presented for question in pending):
             # A new pending question: present the whole pending set, not just the new one.

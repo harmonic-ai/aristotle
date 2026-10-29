@@ -4,6 +4,54 @@ All notable changes to `aristotlelib`, the Aristotle Python SDK and `aristotle` 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.1.0] - 2026-10-29
+
+### Added
+
+- `budget_failure_reason` and `budget_failure_reason_name` on every task in `--json`: why billing stopped a run that
+  ended `OUT_OF_BUDGET`, or `null` when billing didn't stop it or the project is someone else's. In the SDK they are
+  `AgentTask.budget_failure_reason`, an `aristotlelib.agent_task.BudgetFailureReason`, and
+  `AgentTask.budget_failure_reason_name`. `aristotlelib.agent_task.billing_wait()` says when such a run can go again,
+  and `aristotlelib.api_request.billing_url()` gives the page where an organization admin buys credits. (#350)
+- In the SDK, `AristotleAPIError.error_code` can also be the `code` of Aristotle's answer, such as `OUT_OF_CREDITS`,
+  `SIGNUP_GRANT_PENDING` or `BILLING_UNAVAILABLE`, so a program can tell a billing refusal from other errors.
+  `Project.create()` and `Project.ask()` raise these refusals as `AristotleNotProcessedError`, since no run was
+  started, but sending one again succeeds only once the organization has the credits, has finished setting up, or
+  has a balance Aristotle can read. (#350)
+
+### Fixed
+
+- `aristotle ci` and `aristotle review` stop with exit 2, naming the link, when `--directory` is reached through a
+  symbolic link in the checkout, or a junction on Windows. On GitHub, GitLab, Jenkins and Buildkite they also stop
+  when the current folder resolves outside the job's workspace, as where a step entered a committed link, and name
+  both folders. A pull request could commit such a link to another folder on the CI machine, such as another job's
+  checkout, and the run uploaded and verified that folder, so its file names and property text showed up in the
+  job's log and reports. A link above the checkout, such as a mount or macOS's `/tmp`, still works. (#337)
+- After a setup run that ends `COMPLETE_WITH_ERRORS`, as one that proposes properties without proving them usually
+  does, `aristotle ci setup` says that Aristotle proposed the properties and that setup leaves proving them to
+  `aristotle ci`. It said that Aristotle made progress but did not fully complete the request, which it still says
+  when the run proposed no property. (#352)
+- `aristotle cancel` and `AgentTask.cancel()` read the task when the cancel request fails, and count it as cancelled
+  when it reads `CANCELED`. Aristotle marks a run `CANCELED` before it stops the run, which can take longer than the
+  request's timeout and retries. A cancel that worked could then exit 3 with a `ReadTimeout`, and `AgentTask.cancel()`
+  raised it. (#349)
+- `aristotle show` prints each question Aristotle asked with its text and what became of it: your answer, that it
+  is waiting for one, with the command that answers it, that it was closed without an answer, or that the run ended
+  first. It printed "Aristotle asked: Asked a question" and said that Aristotle timed out and went with its best guess,
+  even for a question you had answered or one still waiting. `AgentTask.show()` prints them the same way. (#351)
+- A `submit`, `continue`, `aristotle ci` or `aristotle review` that billing refuses says so in Aristotle's words, and
+  that no run was started or the prompt was not sent. One refused for credits names the page where an organization admin
+  buys them and exits 6, and `submit` and `continue` print `{"outcome": "not_processed", "error"}` under `--json`. It
+  printed Aristotle's answer as a raw dictionary, exited 3 and printed nothing on stdout. One refused while Aristotle
+  can't read your organization's credits, which the CLI now sends again within its usual retries, or while your
+  organization is still setting up, no longer says the project or prompt may have gone through, and exits 3 rather than
+  7. `aristotle ci` no longer spends a minute looking for a project that was never made. Only the 409 for a request
+  whose earlier copy is still in progress is sent again; any other 409 is final. (#350)
+- A task billing stopped says so, prints Aristotle's message about it, and says when to resume it, where it said it ran
+  out of budget and to resume it at once, including into the free credits' limit of one active project. `aristotle ci`
+  and `aristotle review` report it as billing stopped, with a JUnit error of type `billing`. Results give the reason in
+  the task's new `budget_failure_reason` and `budget_failure_reason_name`. (#350)
+
 ## [3.0.0] - 2026-10-27
 
 The release candidates `3.0.0rc1`, `3.0.0rc2` and so on were pre-releases, not published to PyPI.

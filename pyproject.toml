@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "aristotlelib"
-version = "3.0.0"
+version = "3.1.0"
 description = "Aristotle SDK - formally verify your code from Python or the command line"
 readme = "README.md"
 license = "LicenseRef-Proprietary AND MIT"

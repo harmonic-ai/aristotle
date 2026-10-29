@@ -29,6 +29,7 @@ from aristotlelib.declaration import (
 from aristotlelib.project import AgentQuestionsSetting, Project, ProjectStatus
 from aristotlelib.question import Question
 from tests.cli.conftest import LOOKUP_FAILURES, mockable_project
+from tests.conftest import BUY_CREDITS, OUT_OF_CREDITS, SIGNUP_GRANT_PENDING
 
 
 @pytest.fixture(autouse=True)
@@ -964,6 +965,33 @@ def test_a_continue_refused_for_too_many_runs_exits_6_and_says_the_prompt_was_no
 
     assert [request.method for request in requests] == ["GET", "POST"]
     error = f"{api_request.PROJECT_LIMIT_FALLBACK} The prompt was not sent, so it is safe to send it again."
+    assert caplog.messages[-1] == error
+    out = capsys.readouterr().out
+    assert (json.loads(out) if flags else out) == ({"outcome": "not_processed", "error": error} if flags else "")
+
+
+@pytest.mark.parametrize(
+    ("detail", "status", "reason", "code"),
+    [
+        (OUT_OF_CREDITS, 402, f"{OUT_OF_CREDITS['message']} {BUY_CREDITS}", 6),
+        (SIGNUP_GRANT_PENDING, 409, SIGNUP_GRANT_PENDING["message"], 3),
+    ],
+    ids=["out of credits", "still setting up"],
+)
+@pytest.mark.parametrize("flags", [["--json"], []], ids=["--json", "text"])
+def test_a_continue_billing_refuses_says_the_prompt_was_not_sent(
+    detail, status, reason, code, flags, api_server, caplog, capsys
+):
+    project_id = "3f1002f7-0b6c-4c1e-9d8e-2a4b5c6d7e8f"
+    project = mockable_project(project_id)
+    refused = httpx.Response(status, json={"detail": detail})
+    requests = api_server(httpx.Response(200, json=project.model_dump(mode="json")), refused)
+
+    with patch("sys.argv", ["aristotle", "continue", project_id, "Go on", *flags]):
+        assert main() == code
+
+    assert [request.method for request in requests] == ["GET", "POST"]
+    error = f"{reason} The prompt was not sent, so it is safe to send it again."
     assert caplog.messages[-1] == error
     out = capsys.readouterr().out
     assert (json.loads(out) if flags else out) == ({"outcome": "not_processed", "error": error} if flags else "")

@@ -81,7 +81,7 @@ Codex's sandbox blocks the network without asking, so `aristotle` retries and th
 release:
 
 ```bash
-src=$(mktemp -d) && git clone --depth 1 --branch v3.0.0 https://github.com/harmonic-ai/aristotle.git "$src" &&
+src=$(mktemp -d) && git clone --depth 1 --branch v3.1.0 https://github.com/harmonic-ai/aristotle.git "$src" &&
   mkdir -p ~/.agents/skills && rm -rf ~/.agents/skills/aristotle &&
   cp -R "$src/skills/aristotle" ~/.agents/skills/
 ```
@@ -90,7 +90,7 @@ In PowerShell on Windows:
 
 ```powershell
 $src = Join-Path ([IO.Path]::GetTempPath()) ([IO.Path]::GetRandomFileName())
-git clone --depth 1 --branch v3.0.0 https://github.com/harmonic-ai/aristotle.git $src
+git clone --depth 1 --branch v3.1.0 https://github.com/harmonic-ai/aristotle.git $src
 if (Test-Path "$src\skills\aristotle") {
   New-Item -ItemType Directory -Force "$HOME\.agents\skills" | Out-Null
   Remove-Item -Recurse -Force "$HOME\.agents\skills\aristotle" -ErrorAction SilentlyContinue
@@ -169,8 +169,8 @@ from the `ARISTOTLE_API_KEY` environment variable instead. If it isn't set there
 Print one line for each part. Follow every line that isn't ✓ with the next action:
 
 ```text
-✓ Aristotle CLI: aristotlelib 3.0.0
-✓ Aristotle skill: aristotle@harmonic 3.0.0
+✓ Aristotle CLI: aristotlelib 3.1.0
+✓ Aristotle skill: aristotle@harmonic 3.1.0
 ⚠ Not logged in: run `aristotle login` in a terminal
 ```
 

@@ -182,7 +182,7 @@ API key.
 
 The GitLab and Jenkins recipes below pull the image `ghcr.io/harmonic-ai/aristotle:3`, which
 each release publishes. The GitHub Action runs the same image at its own release's version, so
-`harmonic-ai/aristotle@v3` runs the newest 3.x release and `@v3.0.0` stays on 3.0.0. The image is
+`harmonic-ai/aristotle@v3` runs the newest 3.x release and `@v3.1.0` stays on 3.1.0. The image is
 built for x86-64 (`linux/amd64`) only, so a runner on Arm needs x86-64 emulation to run it.
 
 Until Aristotle can re-check results it has already established, every `aristotle ci` run is a
@@ -875,8 +875,8 @@ the step advisory: once a run finishes, the step exits `0` whatever the verdicts
 still exits non-zero when no run can be started or followed — `2` for a usage problem such as a missing or invalid
 manifest or an unreadable repository, `3` when the service cannot be reached or the time budget
 cuts the run, `5` for a missing or rejected API key, or one that can't be sent, such as a secret
-with a space or a non-ASCII character in it (whitespace around it is ignored), `6` for too many requests at once, or when no run slot frees up in time (see
-[Concurrent pipelines](#concurrent-pipelines)), and `7` when the response to creating the
+with a space or a non-ASCII character in it (whitespace around it is ignored), `6` for too many requests at once, when no run slot frees up in time (see
+[Concurrent pipelines](#concurrent-pipelines)), or when your organization doesn't have the credits to start a run, and `7` when the response to creating the
 run was lost and the step can't find the run among your newest projects. To gate on some properties and not
 the rest, put the advisory ones in a second manifest and run a second step with `manifest`
 pointing at it and `fail-on: never`; each step is a full run of its own, and that step still

@@ -2,12 +2,14 @@
 
 import argparse
 import json
+import logging
 from datetime import datetime
 from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 import pytest
 
+from aristotlelib import api_request
 from aristotlelib.agent_task import AgentTask, TaskStatus
 from aristotlelib.api_request import AristotleAPIError, AristotleNotFoundError
 from aristotlelib.cli.command.cancel import CancelAction
@@ -288,4 +290,30 @@ def test_cancelling_a_finished_task_still_exits_4(api_server, caplog, capsys):
         assert main() == 4
 
     assert caplog.messages[-1] == f"Task {TASK_ID} has already finished (COMPLETE), so it can't be cancelled."
+    assert capsys.readouterr().out == ""
+
+
+TIMED_OUT = [lambda request: httpx.ReadTimeout("")] * api_request.RETRY_ATTEMPTS
+
+
+def test_a_cancel_that_times_out_on_a_task_that_then_reads_cancelled_exits_0(api_server, caplog, capsys):
+    caplog.set_level(logging.INFO)
+    sent = api_server(_task(TaskStatus.IN_PROGRESS), *TIMED_OUT, _task(TaskStatus.CANCELED))
+
+    with patch("sys.argv", ["aristotle", "cancel", "--task-id", TASK_ID, "--json"]):
+        assert main() == 0
+
+    assert [request.method for request in sent] == ["GET", *["POST"] * api_request.RETRY_ATTEMPTS, "GET"]
+    assert caplog.messages[-1] == f"Task {TASK_ID} canceled."
+    assert json.loads(capsys.readouterr().out)["status"] == "CANCELED"
+
+
+@pytest.mark.usefixtures("frozen_api_clock")
+def test_a_cancel_that_times_out_on_a_task_still_running_exits_3(api_server, caplog, capsys):
+    api_server(_task(TaskStatus.IN_PROGRESS), *TIMED_OUT, _task(TaskStatus.IN_PROGRESS))
+
+    with patch("sys.argv", ["aristotle", "cancel", "--task-id", TASK_ID, "--json"]):
+        assert main() == 3
+
+    assert caplog.messages[-1] == f"ReadTimeout on POST /task/{TASK_ID}/cancel after 5 attempts over 0 s"
     assert capsys.readouterr().out == ""

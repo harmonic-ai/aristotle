@@ -66,6 +66,12 @@ STREAM_READ_TIMEOUT_SECONDS = 90
 REQUEST_INTERVAL_SECONDS = 0.2
 # Header that makes a create or an ask safe to repeat on servers that take it; they answer 409 while its first copy runs.
 IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
+# How the detail of that 409 begins; a 409 with any other detail is final.
+KEY_BUSY_DETAIL = "A request with this Idempotency-Key is still in progress"
+# The detail code of the 503 for a run whose organization's credits couldn't be read, before Aristotle acts on it.
+BILLING_UNAVAILABLE = "BILLING_UNAVAILABLE"
+# The detail code of the 409 for a run of an organization still setting up, before Aristotle acts on it.
+SIGNUP_GRANT_PENDING = "SIGNUP_GRANT_PENDING"
 # Prefix of the project-limit 429 detail from servers that refuse runs over the limit; PROJECT_LIMIT_FALLBACK replaces it.
 LEGACY_PROJECT_LIMIT_DETAIL = "Too many inflight requests"
 # How the 429 details for the limit on runs in progress or queued begin; any other 429 is a limit on requests.
@@ -83,6 +89,10 @@ API_KEY: str | None = None
 
 def get_base_url() -> str:
     return f"{get_web_url()}/api/v{API_VERSION}"
+
+
+def billing_url() -> str:
+    return f"{get_web_url()}/settings/billing"
 
 
 def _later_event_id(current: str | None, candidate: str) -> str:
@@ -299,7 +309,8 @@ class AristotleAPIError(Exception):
         super().__init__(message)
         self.status_code = status_code
         self.error_code = error_code
-        """The ``error`` string of the server's JSON error response, such as ``authorization_pending``; None without one."""
+        """The ``error`` string of the server's JSON error response, such as ``authorization_pending``, or the ``code``
+        of its ``detail`` object, such as ``OUT_OF_CREDITS``; None without one."""
 
 
 class _IntermediaryError(AristotleAPIError):
@@ -335,8 +346,8 @@ class AristotleOutcomeUnknownError(AristotleAPIError):
 
 class AristotleNotProcessedError(AristotleAPIError):
     """A request that is not safe to repeat failed on every attempt before Aristotle acted on it: the connection never
-    opened, or Aristotle turned it away before any handler ran. Or it was never sent, as a request before it failed. It
-    did nothing, so it is safe to send again."""
+    opened, Aristotle turned it away before any handler ran, or billing refused the run it would start. Or it was never
+    sent, as a request before it failed. It did nothing, so it is safe to send again."""
 
 
 @contextlib.contextmanager
@@ -606,11 +617,14 @@ def _wait_text(seconds: float) -> str:
 
 
 def _json_detail(response: httpx.Response) -> str | None:
-    """The response's JSON ``detail`` string, or None when the body has none."""
+    """The response's JSON ``detail`` string, or the ``message`` of a ``detail`` object, or None when the body has
+    neither."""
     try:
         detail = response.json().get("detail")
     except Exception:
         return None
+    if isinstance(detail, dict):
+        detail = detail.get("message")
     if not isinstance(detail, str) or not detail.strip():
         return None
     return detail.strip()
@@ -761,7 +775,8 @@ def _log_refusal_response(error: httpx.HTTPStatusError, redact: Callable[[str], 
 
 def _status_error(error: httpx.HTTPStatusError, redact: Callable[[str], str] | None = None) -> AristotleAPIError:
     """The AristotleAPIError for an error response, with the server's detail and error code; a 429 says which limit was
-    hit, and a 403's verbose report passes through ``redact``."""
+    hit, a 402 where to buy credits, a detail object's message stands alone, and a 403's verbose report passes through
+    ``redact``."""
     if error.response.status_code == 403:
         _log_refusal_response(error, redact)
         content_type = error.response.headers.get("content-type", "").partition(";")[0].strip().lower()
@@ -784,10 +799,18 @@ def _status_error(error: httpx.HTTPStatusError, redact: Callable[[str], str] | N
     # Extract error message from response body if available
     error_message = None
     error_code = None
+    # The message of a detail object, as billing's refusals carry with their code, worded for the user.
+    worded = None
     try:
         error_data = error.response.json()
-        error_message = error_data.get("detail") or error_data.get("message")
-        error_code = error_data.get("error")
+        detail = error_data.get("detail")
+        if isinstance(detail, dict):
+            message, error_code = detail.get("message"), detail.get("code")
+            worded = message.strip() if isinstance(message, str) and message.strip() else None
+            error_message = worded
+        else:
+            error_message = detail or error_data.get("message")
+            error_code = error_data.get("error")
     except Exception:
         # If JSON parsing fails, try to get text
         try:
@@ -812,10 +835,20 @@ def _status_error(error: httpx.HTTPStatusError, redact: Callable[[str], str] | N
             else "Wait a few seconds and try again."
         )
         return AristotleAPIError(f"Too many requests to Aristotle at once. {advice}", status_code=429)
+    status = error.response.status_code
+    code = error_code if isinstance(error_code, str) else None
+    if status == 402:
+        refusal = worded or "Your organization needs credits to start a run."
+        stop = "" if refusal.endswith((".", "!", "?")) else "."
+        return AristotleAPIError(
+            f"{refusal}{stop} An organization admin can buy credits at {billing_url()}.",
+            status_code=402,
+            error_code=code,
+        )
+    if worded is not None:
+        return AristotleAPIError(worded, status_code=status, error_code=code)
     return AristotleAPIError(
-        f"API request failed with status {error.response.status_code}: {error_message}",
-        status_code=error.response.status_code,
-        error_code=error_code if isinstance(error_code, str) else None,
+        f"API request failed with status {status}: {error_message}", status_code=status, error_code=code
     )
 
 
@@ -874,6 +907,8 @@ class _Failure:
         self.retry_after: float | None = None
         self.key_busy = False
         self.rate_limited = False
+        # Whether billing refused the run the request would start, before Aristotle acted on it; no retry gets past it.
+        self.refused = False
         self.certificate_error: ssl.SSLCertVerificationError | None = None
         # Whether the TLS handshake that failed was with an https:// proxy, for its own certificate, not the server.
         self.proxy_tls = proxy_tls
@@ -886,15 +921,19 @@ class _Failure:
         elif isinstance(cause, httpx.HTTPStatusError):
             status = cause.response.status_code
             self.status_error = _status_error(cause, redact)
+            code = self.status_error.error_code
             self.retry_after = _retry_after(cause.response)
-            # The server refuses a keyed request with 409 while an earlier copy under its key is in progress, and any
-            # request with the per-second limit's 429 while authenticating it, before any handler runs.
-            self.key_busy = status == 409 and keyed
-            self.rate_limited = status == 429 and not isinstance(self.status_error, AristotleProjectLimitError)
-            self.unsent = self.key_busy or self.rate_limited
-            self.transient = self.unsent or status >= 500
-            self.maybe_processed = status >= 500
             detail = _json_detail(cause.response)
+            # The server refuses a keyed request with KEY_BUSY_DETAIL's 409 while an earlier copy under its key is in
+            # progress, any request with the per-second limit's 429 while authenticating it, before any handler runs,
+            # and a run with BILLING_UNAVAILABLE's 503 before creating anything.
+            self.key_busy = status == 409 and keyed and (detail or "").startswith(KEY_BUSY_DETAIL)
+            self.rate_limited = status == 429 and not isinstance(self.status_error, AristotleProjectLimitError)
+            billing_unavailable = status == 503 and code == BILLING_UNAVAILABLE
+            self.refused = status == 402 or (status == 409 and code == SIGNUP_GRANT_PENDING)
+            self.unsent = self.key_busy or self.rate_limited or billing_unavailable
+            self.transient = self.unsent or status >= 500
+            self.maybe_processed = status >= 500 and not billing_unavailable
             self.summary = f"{status} on {request}" + (f": {detail}" if detail else "")
         else:
             self.unsent = isinstance(cause, _UNSENT_ERRORS)
@@ -909,6 +948,9 @@ class _Failure:
         """The error to raise: the failure, the request, and the attempts made if more than one."""
         after = f" after {attempts} attempts over {seconds:.0f} s" if attempts > 1 else ""
         if isinstance(self.cause, httpx.HTTPStatusError):
+            if self.refused and not idempotent:
+                error = self.status_error
+                return AristotleNotProcessedError(str(error), error.status_code, error.error_code)
             if not self.transient:
                 return self.status_error
             if self.key_busy:
@@ -918,7 +960,7 @@ class _Failure:
                     self.status_error.status_code,
                 )
             message = f"{self.request}{after}: {self.status_error}"
-            status_code = self.status_error.status_code
+            status_code, error_code = self.status_error.status_code, self.status_error.error_code
         else:
             if isinstance(self.cause, httpx.ProxyError) and re.fullmatch(r"403(?: [^\r\n]+)?", str(self.cause)):
                 message = _refusal_message(str(self.cause), self.cause.request.url, known_proxy=True)
@@ -929,16 +971,16 @@ class _Failure:
                 message += f": {self.cause}"
             if self.certificate_error is not None:
                 message += _certificate_hint(self.certificate_error, self.proxy_tls)
-            status_code = None
+            status_code, error_code = None, None
         if not idempotent:
             message = message if message.endswith(".") else message + "."
             if self.maybe_processed:
                 return AristotleOutcomeUnknownError(
-                    f"{message} Aristotle may have acted on it, so it was not sent again.", status_code
+                    f"{message} Aristotle may have acted on it, so it was not sent again.", status_code, error_code
                 )
             # Retried only while unsent, and never after a refusal for its key: no attempt reached a handler.
-            return AristotleNotProcessedError(f"{message} Aristotle didn't act on it.", status_code)
-        return AristotleAPIError(message, status_code)
+            return AristotleNotProcessedError(f"{message} Aristotle didn't act on it.", status_code, error_code)
+        return AristotleAPIError(message, status_code, error_code)
 
 
 def _redacted(error: AristotleAPIError, redact: Callable[[str], str]) -> AristotleAPIError:
@@ -1037,13 +1079,14 @@ class AristotleRequestClient:
         is then _redacted_cause's.
 
         Any request is retried after a failure to connect, a proxy's refusal that a later try may pass, a refusal by the
-        per-second rate limit or, with ``idempotency_key``, a 409 while its first copy is in progress, which leave it
-        unprocessed, and an idempotent one also after a 5xx, a timeout, a dropped connection or a 2xx answer that
-        _foreign_body says isn't Aristotle's; a certificate this machine doesn't trust is not retried. A request that is
-        not idempotent raises AristotleOutcomeUnknownError after a failure that may have followed its processing, and
-        AristotleNotProcessedError when no attempt was processed. A retry waits at least as long as the response's
-        Retry-After asks, every attempt waits for its request slot, and an attempt whose connection isn't open within
-        CONNECTION_DEADLINE_SECONDS fails as a ConnectTimeout.
+        per-second rate limit, billing's 503 for credits it couldn't read or, with ``idempotency_key``, a 409 while its
+        first copy is in progress, which leave it unprocessed, and an idempotent one also after a 5xx, a timeout, a
+        dropped connection or a 2xx answer that _foreign_body says isn't Aristotle's; a certificate this machine doesn't
+        trust is not retried. A request that is not idempotent raises AristotleOutcomeUnknownError after a failure that
+        may have followed its processing, and AristotleNotProcessedError when no attempt was processed, as when billing
+        refused the run it would start, for credits or while the organization sets up. A retry waits at least as long as
+        the response's Retry-After asks, every attempt waits for its request slot, and an attempt whose connection isn't
+        open within CONNECTION_DEADLINE_SECONDS fails as a ConnectTimeout.
         """
         url = f"{get_base_url()}/{endpoint.lstrip('/')}"
         # As httpcore names it to the server's TLS handshake.

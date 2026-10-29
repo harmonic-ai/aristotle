@@ -6,7 +6,7 @@ description: Formally verify code with Harmonic's Aristotle through the `aristot
 # Aristotle
 
 Aristotle formally verifies code. You state a property in plain language, or name an assertion or a function in the
-code, and Aristotle either proves it or finds a counterexample. This skill targets **aristotlelib 3.0.0**. Its
+code, and Aristotle either proves it or finds a counterexample. This skill targets **aristotlelib 3.1.0**. Its
 commands are for POSIX shells; in Windows PowerShell, read [references/windows.md](references/windows.md) first.
 
 ## Before the first command
@@ -169,13 +169,13 @@ command again, or resume a run it had already started rather than start another.
 | Exit | Meaning | Next step |
 |---|---|---|
 | 0 | The run finished `COMPLETE`. | [Read the results](#reading-the-results). |
-| 1 | The run finished without completing the request. | Report what `task.output_summary` and the properties say was and wasn't established. |
+| 1 | The run finished without completing the request. | Report what `task.output_summary` and the properties say was and wasn't established. If `task.budget_failure_reason_name` is set, billing stopped the run: tell the user what the summary says. Resume it in a few minutes for `BILLING_UNAVAILABLE`, and otherwise only once an organization admin has bought credits or, for `TRIAL_CREDIT_CONCURRENCY_LIMIT`, once their other project has finished. |
 | 10 | Aristotle is waiting for answers; stdout holds the questions. | [Answer them](#answering-questions), then resume. |
 | 2 | Usage error, such as a bad argument or an ambiguous project name. | Read stderr and fix the command. Use the full project id. |
-| 3 | The run failed or was cancelled, or the command couldn't finish. | If stderr says nothing was done (under `--json`, `{"outcome": "not_processed"}`), run the same command again; if the files weren't saved, run `aristotle download <id> --destination <out>/result.tar.gz`. Otherwise read `task.status` with `aristotle show <id> --json`: resume a `QUEUED` or `IN_PROGRESS` run, report a `FAILED` or `CANCELED` one, and otherwise retry later. |
+| 3 | The run failed or was cancelled, or the command couldn't finish. | If stderr says nothing was done or no run was started (under `--json`, `{"outcome": "not_processed"}`), run the same command again, after the wait its message asks for, if any; if the files weren't saved, run `aristotle download <id> --destination <out>/result.tar.gz`. Otherwise read `task.status` with `aristotle show <id> --json`: resume a `QUEUED` or `IN_PROGRESS` run, report a `FAILED` or `CANCELED` one, and otherwise retry later. |
 | 4 | Not found, or refused: a closed question or an ended run. | Check the ids, for example with `aristotle questions <id> --json`. Don't retry the same command. |
 | 5 | No API key, or Aristotle rejected it, or it can't be sent (blank, or a space, a control or a non-ASCII character in it). From `aristotle login`, the user denied the login or its code expired. | Ask the user which way to log in (see above). After a denied or expired login, ask before starting another. |
-| 6 | Rate limited: too many projects in progress, or too many requests. | If stderr says too many runs or projects are in progress, `aristotle list --status RUNNING --json` shows what is running: wait for one to finish and retry, or ask the user whether to cancel one of theirs. Otherwise wait a minute and run the same command again. |
+| 6 | Rate limited: too many projects in progress, or too many requests. Or the organization doesn't have the credits to start a run. | If stderr says the organization needs credits, tell the user that an organization admin can buy them at https://aristotle.harmonic.fun/settings/billing, and run the command again only once that's done, or, when it says each active run needs a credit, once another of the organization's runs has finished. If it says too many runs or projects are in progress, `aristotle list --status RUNNING --json` shows what is running: wait for one to finish and retry, or ask the user whether to cancel one of theirs. Otherwise wait a minute and run the same command again. |
 | 7 | The request may have gone through, but its response was lost. | Don't send it again yet: [look for it](#finding-a-run-that-may-exist). If stderr says an earlier copy was still in progress, wait a minute first. |
 | 124, 130 | `timeout` ended a slice (124), or Ctrl-C did (130). | Resume, as under [Long waits](#long-waits). |
 | 141 | stdout or stderr was closed early, for example by `\| head`. | Don't send it again: resume, with stdout going to a file. |
@@ -338,6 +338,12 @@ Then check it:
 
 ## Older CLIs
 
+- **3.0.0**, and the pre-releases below, work as described here, except:
+  - A refusal for credits exits 3, quoting Aristotle's answer with `OUT_OF_CREDITS`, with nothing on stdout under
+    `--json`: no run was started, so go by the exit-6 row. A `submit` or `continue` whose stderr quotes
+    `BILLING_UNAVAILABLE` exits 7, though nothing was created: run it again in a few minutes.
+  - A run billing stopped says only that it ran out of budget, and results have no `budget_failure_reason`:
+    `task.output_summary` says when billing stopped it.
 - **3.0.0 pre-releases** (`3.0.0rc` and a number) work as described here, except:
   - Before relying on `aristotle ci`, check `aristotle ci --help`. If it doesn't mention `aristotle.toml`, that
     `aristotle ci` is an open-ended run that ignores the manifest: ask the user to upgrade.

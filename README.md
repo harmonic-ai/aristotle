@@ -222,7 +222,7 @@ Every command exits with one of these codes, so a script can tell a failed run f
 | 3 | The command couldn't complete: the run failed or was cancelled, a wait ended before the run did, or an error outlasted the retries. |
 | 4 | No such project, run, property, or question for your key, or Aristotle refused the action on it. |
 | 5 | No API key, Aristotle rejected the key, or a login was denied in the browser or its code expired. |
-| 6 | Rate limited: too many runs in progress, or too many requests at once. |
+| 6 | Rate limited: too many runs in progress, or too many requests at once. Or your organization doesn't have the credits to start a run. |
 | 7 | The request may have gone through. Check before you send it again. |
 | 10 | A `--non-interactive` wait stopped for Aristotle's questions. |
 | 130 | Interrupted by Ctrl-C or SIGTERM. A run you were following keeps going, unless `aristotle ci` or `aristotle review` started it. |
@@ -233,8 +233,9 @@ minutes. A wait survives an outage of up to 10 minutes. The CLI sends a `submit`
 when Aristotle can't have acted on it.
 
 When a request may have gone through, the CLI exits 7. Check for it (`aristotle list`, `aristotle tasks <project>`,
-or `aristotle questions <project> --json`) before you send it again. When the CLI says nothing was done (exit 3, or
-6 when rate limited), it's safe to run the same command again.
+or `aristotle questions <project> --json`) before you send it again. When the CLI says nothing was done or no run was
+started (exit 3, or 6 when rate limited or out of credits), it's safe to run the same command again, once an
+organization admin has bought credits if it was refused for them.
 
 The [CLI reference](https://github.com/harmonic-ai/aristotle/blob/main/docs/cli-reference.md) has every `--json`
 shape and field, each exit code in full, and a script that answers questions.

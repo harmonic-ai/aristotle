@@ -13,7 +13,7 @@ import pydantic
 import pytest
 
 from aristotlelib import api_request
-from aristotlelib.agent_task import AgentTask, TaskStatus
+from aristotlelib.agent_task import AgentTask, BudgetFailureReason, TaskStatus
 from aristotlelib.api_request import AristotleAPIError
 from aristotlelib.cli.api_action import resume_hint
 from aristotlelib.cli.command.show import ShowAction, broken_proofs_note, format_property_counts, log_property_counts
@@ -32,7 +32,7 @@ from aristotlelib.project import Project, ProjectStatus
 from aristotlelib.question import Question
 from aristotlelib.shell import shell_hint
 from tests.cli.conftest import MockableProject, mockable_project, unknown_evidence_page
-from tests.conftest import fast_api_clock
+from tests.conftest import BILLING_PAGE, fast_api_clock
 
 
 @pytest.fixture(autouse=True)
@@ -80,6 +80,7 @@ def _completed_task(task_id: str = "task-456", project_id: str = "project-123") 
     task.agent_task_id = task_id
     task.project_id = project_id
     task.status = TaskStatus.COMPLETE
+    task.budget_failure_reason = task.budget_failure_reason_name = None
     task.read_only = False
     task.created_at = datetime(2000, 1, 1)  # Before any property here, so each is this task's verdict.
     task.show = AsyncMock(return_value=None)
@@ -603,6 +604,7 @@ def _running_task(status_after_wait: TaskStatus) -> Mock:
     task.agent_task_id = "task-456"
     task.project_id = "project-123"
     task.status = TaskStatus.IN_PROGRESS
+    task.budget_failure_reason = task.budget_failure_reason_name = None
     task.created_at = datetime(2000, 1, 1)
 
     async def wait_for_completion(
@@ -1785,6 +1787,69 @@ def test_show_counts_a_refutation_whose_evidence_kind_this_version_does_not_know
 
 
 @pytest.mark.parametrize(
+    ("status", "response", "says"),
+    [
+        ("COMPLETE", "16", "You answered: 16"),
+        ("IN_PROGRESS", None, f"Waiting for an answer; answer with: aristotle questions {RETRIED_ID}"),
+    ],
+    ids=["answered", "waiting"],
+)
+def test_show_prints_the_question_aristotle_asked_and_what_became_of_it(
+    status, response, says, at_a_terminal, api_server, caplog
+):
+    caplog.set_level(logging.INFO)
+    at_a_terminal.return_value = False
+    tasks = _finished_tasks().json()
+    tasks["agent_tasks"][0]["status"] = status
+    placeholder = {
+        "event_id": "event-q1",
+        "agent_task_id": "task-1",
+        "event_type": EventType.AGENT_QUESTION.value,
+        "created_at": "2026-10-06T00:01:00",
+        "content": "Asked a question",
+        "file_path": None,
+        "explanation": None,
+        "suggestions": None,
+        "status": EventStatus.COMPLETE.value,
+        "question_id": "q-1",
+    }
+    question = {
+        "question_id": "q-1",
+        "event_id": "event-q1",
+        "project_id": RETRIED_ID,
+        "agent_run_id": "task-1",
+        "content": "Which width?",
+        "suggestions": ["8", "16"],
+        "response": response,
+        "created_at": "2026-10-06T00:01:00",
+        "updated_at": "2026-10-06T00:02:00",
+        "blocking_since": None,
+        "ever_awaited": True,
+        "answered_at": None if response is None else "2026-10-06T00:02:00",
+        "ignored_at": None,
+    }
+
+    def serve(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/tasks"):
+            return httpx.Response(200, json=tasks)
+        if path.endswith("/events"):
+            return httpx.Response(200, json={"events": [placeholder], "pagination_key": None})
+        if path.endswith("/task/task-1/questions"):
+            return httpx.Response(200, json=[question])
+        return _project_record()
+
+    requests = api_server(*[serve] * 20)
+
+    with patch("sys.argv", ["aristotle", "show", RETRIED_ID, "--limit", "5"]):
+        assert main() == 0
+
+    assert f"Aristotle asked: Which width?\n{says}" in caplog.messages
+    assert "timed out" not in caplog.text
+    assert sum(request.url.path.endswith("/questions") for request in requests) == 1
+
+
+@pytest.mark.parametrize(
     ("failure", "code", "message"),
     [
         (lambda: httpx.ReadTimeout(""), 3, f"ReadTimeout on GET /project/{RETRIED_ID} after 5 attempts over 0 s"),
@@ -2341,6 +2406,30 @@ async def test_show_of_a_task_that_ended_badly_names_the_command_that_resumes_it
 
     assert caplog.records[-1].levelno == level
     assert caplog.messages[-1].endswith(says)
+
+
+async def test_show_of_a_task_billing_stopped_says_so_and_when_to_resume_it(caplog):
+    action = ShowAction(argparse.ArgumentParser().add_subparsers())
+    action.add_action_arguments()
+    task = _completed_task()
+    task.status = TaskStatus.OUT_OF_BUDGET
+    task.budget_failure_reason = BudgetFailureReason.TRIAL_CREDIT_CONCURRENCY_LIMIT
+    project = Mock(spec=Project, description=None)
+    project.project_id = "project-123"
+    project.get_tasks = AsyncMock(return_value=([task], None))
+
+    with (
+        patch("aristotlelib.cli.command.show.Project.from_id", return_value=project),
+        caplog.at_level(logging.INFO),
+    ):
+        assert await action.run_action(action.parser.parse_args(["project-123"])) is None
+
+    assert caplog.messages[-1] == (
+        "Task stopped: free credits allow one active project per organization. Once no other project of your "
+        f"organization is running, or an organization admin buys credits at {BILLING_PAGE}, resume it on the same "
+        "project with:\n"
+        "  aristotle continue project-123 Continue --wait"
+    )
 
 
 async def test_show_wait_of_a_task_that_ended_badly_resumes_it_saving_where_it_would(caplog):

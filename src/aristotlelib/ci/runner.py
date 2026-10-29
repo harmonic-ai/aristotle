@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from aristotlelib import local_file_utils
-from aristotlelib.agent_task import TERMINAL_STATUSES, AgentTask, TaskStatus
+from aristotlelib.agent_task import TERMINAL_STATUSES, AgentTask, BudgetFailureReason, TaskStatus
 from aristotlelib.api_request import (
     AristotleAPIError,
     AristotleOutcomeUnknownError,
@@ -967,10 +967,11 @@ async def fetch_stopped_summary(project: Project) -> str | None:
     return "\n".join(sections[:-1]).strip() or NO_STOPPED_SUMMARY
 
 
-async def fetch_summary(project: Project) -> str | None:
-    """The run's summary, the agent's own user-facing text; None when it has none."""
+async def fetch_summary(project: Project) -> tuple[str | None, BudgetFailureReason | None]:
+    """The run's summary, the agent's own user-facing text, None when it has none; and why billing stopped the run,
+    None when it didn't."""
     task = await _current_task(project)
-    return (task.output_summary or "").strip() or None
+    return (task.output_summary or "").strip() or None, task.budget_failure_reason
 
 
 async def fetch_prompt(task: AgentTask) -> str | None:

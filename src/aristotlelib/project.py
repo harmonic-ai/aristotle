@@ -775,6 +775,9 @@ PROMPT_NOT_SENT = "The prompt was not sent, so it is safe to send it again."
 PROJECT_NOT_CREATED = "No project was created, so it is safe to submit it again."
 """What an AristotleNotProcessedError for a create says to do."""
 
+RUN_NOT_STARTED = "No run was started, so it is safe to submit it again."
+"""What a create billing refused says to do: Aristotle can refuse its run after making the project."""
+
 lookup_at_terminal: contextvars.ContextVar[bool] = contextvars.ContextVar("lookup_at_terminal", default=False)
 """Whether someone at a terminal waits on this context's lookups, which then say they are searching only after
 _LOOKUP_NOTE_SECONDS, rather than as their second page starts."""
@@ -971,7 +974,9 @@ class Project(AristotleObject):
                         e.status_code,
                     ) from e
                 except api_request.AristotleNotProcessedError as e:
-                    raise api_request.AristotleNotProcessedError(f"{e} {PROJECT_NOT_CREATED}", e.status_code) from e
+                    # Only billing's refusals are not processed with a 402 or a 409.
+                    advice = RUN_NOT_STARTED if e.status_code in (402, 409) else PROJECT_NOT_CREATED
+                    raise api_request.AristotleNotProcessedError(f"{e} {advice}", e.status_code, e.error_code) from e
                 return cls.model_validate(response.json())
 
     @classmethod
@@ -1296,7 +1301,9 @@ class Project(AristotleObject):
                         e.status_code,
                     ) from e
                 except api_request.AristotleNotProcessedError as e:
-                    raise api_request.AristotleNotProcessedError(f"{e} {PROMPT_NOT_SENT}", e.status_code) from e
+                    raise api_request.AristotleNotProcessedError(
+                        f"{e} {PROMPT_NOT_SENT}", e.status_code, e.error_code
+                    ) from e
                 return AgentTask.model_validate(response.json())
 
     async def get_files(self, destination: Path | str | None = None) -> Path:

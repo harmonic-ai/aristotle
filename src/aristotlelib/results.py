@@ -295,7 +295,7 @@ class OutcomeUnknown(pydantic.BaseModel):
 class NotProcessed(pydantic.BaseModel):
     """Printed under ``--json`` when a request that is not safe to repeat failed on every attempt before Aristotle acted
     on it, or was never sent as a request before it failed, so it did nothing and the same command can run again; exit
-    code 3, or 6 when rate limited."""
+    code 3, or 6 when rate limited or refused for credits."""
 
     outcome: Literal["not_processed"] = "not_processed"
     error: str

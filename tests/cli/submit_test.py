@@ -37,7 +37,18 @@ from aristotlelib.question import Question
 from aristotlelib.shell import shell_hint
 from aristotlelib.verilog import filelist
 from tests.ci.conftest import git
-from tests.conftest import FAKE_KEY, NEVER_READ, UNREACHABLE_HOST, WILDCARD_FOLDERS, fast_api_clock, shown_key_runs
+from tests.conftest import (
+    BILLING_UNAVAILABLE,
+    BUY_CREDITS,
+    FAKE_KEY,
+    NEVER_READ,
+    OUT_OF_CREDITS,
+    SIGNUP_GRANT_PENDING,
+    UNREACHABLE_HOST,
+    WILDCARD_FOLDERS,
+    fast_api_clock,
+    shown_key_runs,
+)
 
 PROJECT_ID = "3f1002f7-0b6c-4c1e-9d8e-2a4b5c6d7e8f"
 RENAME_BY_ID = "aristotlelib.project.Project.rename_by_id"
@@ -1910,6 +1921,52 @@ def test_a_submit_refused_for_too_many_runs_exits_6_and_says_no_project_was_crea
 
     assert len(requests) == 1
     error = f"{reason} No project was created, so it is safe to submit it again."
+    assert caplog.messages[-1] == error
+    out = capsys.readouterr().out
+    assert (json.loads(out) if flags else out) == ({"outcome": "not_processed", "error": error} if flags else "")
+
+
+NO_RUN = "No run was started, so it is safe to submit it again."
+NO_PROJECT = "No project was created, so it is safe to submit it again."
+
+
+@pytest.mark.parametrize(
+    ("refusal", "attempts", "error", "code"),
+    [
+        (
+            httpx.Response(402, json={"detail": OUT_OF_CREDITS}),
+            1,
+            f"{OUT_OF_CREDITS['message']} {BUY_CREDITS} {NO_RUN}",
+            6,
+        ),
+        (
+            httpx.Response(409, json={"detail": SIGNUP_GRANT_PENDING}),
+            1,
+            f"{SIGNUP_GRANT_PENDING['message']} {NO_RUN}",
+            3,
+        ),
+        (
+            httpx.Response(503, json={"detail": BILLING_UNAVAILABLE}),
+            api_request.RETRY_ATTEMPTS,
+            f"POST /project after 5 attempts over 0 s: {BILLING_UNAVAILABLE['message']} Aristotle didn't act on it. "
+            f"{NO_PROJECT}",
+            3,
+        ),
+    ],
+    ids=["out of credits", "still setting up", "credits unreadable"],
+)
+@pytest.mark.parametrize("flags", [["--json"], ["--non-interactive"], []], ids=["--json", "--non-interactive", "text"])
+@pytest.mark.usefixtures("frozen_api_clock")
+def test_a_submit_billing_refuses_says_it_started_no_run(
+    api_server, caplog, capsys, refusal: httpx.Response, attempts: int, error: str, code: int, flags: list[str]
+):
+    """Aristotle can refuse a run for credits, or while the organization sets up, after making its project."""
+    requests = api_server(*[refusal] * attempts)
+
+    with patch("sys.argv", ["aristotle", "submit", "Prove it", *flags]):
+        assert main() == code
+
+    assert len(requests) == attempts
     assert caplog.messages[-1] == error
     out = capsys.readouterr().out
     assert (json.loads(out) if flags else out) == ({"outcome": "not_processed", "error": error} if flags else "")

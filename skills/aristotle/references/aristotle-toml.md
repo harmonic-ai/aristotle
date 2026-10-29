@@ -75,7 +75,8 @@ The exit codes:
 - 3: the run failed, was cancelled elsewhere, or ran out of budget or time, or Aristotle couldn't be reached.
 - 5: no API key, a rejected one, or one that can't be sent: blank, or holding a space, a control or a non-ASCII
   character.
-- 6: no run slot freed up in time.
+- 6: no run slot freed up in time, or the organization doesn't have the credits to start a run: once an organization
+  admin buys them at https://aristotle.harmonic.fun/settings/billing, run it again.
 - 7: the response to creating the run was lost and the run couldn't be found: check `aristotle list` before running
   again.
 

@@ -3,6 +3,7 @@
 import dataclasses
 from enum import Enum
 
+from aristotlelib.agent_task import BudgetFailureReason
 from aristotlelib.ci.manifest import RequestedProperty
 from aristotlelib.declaration import Declaration, DeclarationFailureReason, DeclarationStatus, DeclarationType
 from aristotlelib.exit_codes import (
@@ -121,6 +122,9 @@ NEVER_STARTED_REASON = (
 
 OUT_OF_BUDGET_REASON = "The run ran out of budget before Aristotle checked its results."
 """Why the property results of a run that ended OUT_OF_BUDGET are unchecked."""
+
+BILLING_STOP_REASON = "Billing stopped the run before Aristotle checked its results."
+"""Why the property results of a run billing stopped, which ends OUT_OF_BUDGET, are unchecked."""
 
 TASK_FAILED_REASON = "The run failed due to an internal error before Aristotle checked its results."
 """Why the property results of a run that ended FAILED are unchecked."""
@@ -295,6 +299,8 @@ class RunResults:
     proofs unchecked."""
     out_of_budget: bool = False
     """The task ended OUT_OF_BUDGET; the properties are whatever it reached first, unchecked."""
+    budget_failure_reason: BudgetFailureReason | None = None
+    """Why billing stopped the task, which then ended OUT_OF_BUDGET; None when it didn't."""
     path_prefix: str = ""
     """Prepended to reported source paths, which are relative to the root, to make them repository-relative."""
     suggestions: list[PropertyResult] = dataclasses.field(default_factory=list)
@@ -409,7 +415,7 @@ class RunResults:
         if self.canceled:
             return "it was cancelled outside this job"
         if self.out_of_budget:
-            return "it ran out of budget"
+            return "it ran out of budget" if self.budget_failure_reason is None else "billing stopped it"
         if self.cut_short:
             return "the time budget ran out"
         return None
@@ -447,8 +453,13 @@ class RunResults:
         if not self.cut_short:
             return None
         if not self.nothing_registered:
+            if self.budget_failure_reason is not None:
+                return BILLING_STOP_REASON
             return OUT_OF_BUDGET_REASON if self.out_of_budget else TIME_BUDGET_REASON
-        ended = "The run ran out of budget" if self.out_of_budget else "The time budget ran out"
+        if self.budget_failure_reason is not None:
+            ended = "Billing stopped the run"
+        else:
+            ended = "The run ran out of budget" if self.out_of_budget else "The time budget ran out"
         under = "under any of the manifest's ids" if self.from_manifest else "in the run"
         return f"{ended} with no property {under}."
 

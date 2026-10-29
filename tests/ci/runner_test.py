@@ -19,8 +19,13 @@ import httpx
 import pytest
 
 from aristotlelib import api_request, local_file_utils
-from aristotlelib.agent_task import AgentTask, TaskStatus
-from aristotlelib.api_request import AristotleAPIError, AristotleOutcomeUnknownError, AristotleProjectLimitError
+from aristotlelib.agent_task import AgentTask, BudgetFailureReason, TaskStatus
+from aristotlelib.api_request import (
+    AristotleAPIError,
+    AristotleNotProcessedError,
+    AristotleOutcomeUnknownError,
+    AristotleProjectLimitError,
+)
 from aristotlelib.ci import runner, scope
 from aristotlelib.ci.manifest import Kind, Manifest, RequestedProperty
 from aristotlelib.ci.record import RunRecord, files_digest
@@ -28,7 +33,7 @@ from aristotlelib.event import EventType
 from aristotlelib.project import AgentQuestionsSetting, Project, ProjectStatus
 from aristotlelib.verilog import bundle
 from tests.ci.conftest import git, latin1_name
-from tests.conftest import hard_link, swapped_for_a_link
+from tests.conftest import BILLING_UNAVAILABLE, OUT_OF_CREDITS, hard_link, swapped_for_a_link
 
 NO_DEADLINE = float("inf")
 
@@ -559,6 +564,29 @@ async def test_a_lost_create_that_cannot_be_looked_for_is_outcome_unknown(git_re
 
     with pytest.raises(AristotleOutcomeUnknownError, match="^Your projects could not be listed to find it: API"):
         await _lose_the_create(git_repo, tmp_path, refused)
+
+
+@pytest.mark.parametrize(
+    ("detail", "status", "attempts", "left"),
+    [
+        (OUT_OF_CREDITS, 402, 1, "No run was started"),
+        (BILLING_UNAVAILABLE, 503, api_request.RETRY_ATTEMPTS, "No project was created"),
+    ],
+    ids=["out of credits", "credits unreadable"],
+)
+async def test_a_create_billing_refuses_is_neither_looked_for_nor_waited_on(
+    detail, status, attempts, left, git_repo, tmp_path, api_server
+):
+    result = scope.ScopeResult(upload_files=[Path("rtl/fifo.v")], focus_files=[Path("rtl/fifo.v")])
+    requests = api_server(*[lambda request: httpx.Response(status, json={"detail": detail})] * attempts)
+
+    with pytest.raises(AristotleNotProcessedError) as raised:
+        await runner.submit(git_repo, result, tmp_path / "out.tar.gz", resubmit_by=NO_DEADLINE)
+
+    assert raised.value.status_code == status
+    assert detail["message"] in str(raised.value)
+    assert str(raised.value).endswith(f" {left}, so it is safe to submit it again.")
+    assert [(request.method, request.url.path) for request in requests] == [("POST", "/api/v3/project")] * attempts
 
 
 @pytest.mark.parametrize(
@@ -2210,10 +2238,13 @@ def test_a_name_that_is_not_ascii_goes_up_under_its_utf8_name(git_repo: Path, tm
     [("\nFails at cycle 12.\n\n", "Fails at cycle 12."), ("  \n", None), (None, None)],
     ids=["summary", "blank", "none"],
 )
-async def test_the_summary_is_the_tasks_output_summary_stripped(summary: str | None, expected: str | None):
-    task = types.SimpleNamespace(status=TaskStatus.COMPLETE, output_summary=summary)
+@pytest.mark.parametrize("reason", [None, BudgetFailureReason.OUT_OF_CREDITS], ids=["no billing stop", "billing stop"])
+async def test_the_summary_is_the_tasks_output_summary_stripped_with_its_billing_reason(
+    summary: str | None, expected: str | None, reason: BudgetFailureReason | None
+):
+    task = types.SimpleNamespace(status=TaskStatus.COMPLETE, output_summary=summary, budget_failure_reason=reason)
 
-    assert await runner.fetch_summary(_FakeProject(task)) == expected
+    assert await runner.fetch_summary(_FakeProject(task)) == (expected, reason)
 
 
 HARDWARE = "/api/v3/user/has-hardware-verification-access"

@@ -1540,3 +1540,14 @@ def test_the_repository_search_stays_on_the_folders_file_system_as_git_does(tmp_
 
     # git for Windows has no device numbers to compare.
     assert found == (outer if across or os.name == "nt" else None)
+
+
+def test_a_repository_search_across_file_systems_passes_a_mount_point(tmp_path, monkeypatch):
+    outer = tmp_path.resolve() / "outer"
+    mount = outer / "mnt"
+    (mount / "proj").mkdir(parents=True)
+    _repository(outer)
+    monkeypatch.setattr(local_file_utils, "_device", lambda folder: int(mount in (folder, *folder.parents)))
+    monkeypatch.delenv("GIT_DISCOVERY_ACROSS_FILESYSTEM", raising=False)
+
+    assert local_file_utils.enclosing_repository(mount / "proj", across_filesystems=True) == outer

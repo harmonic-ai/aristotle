@@ -54,6 +54,27 @@ NEEDS_INT_DIGIT_LIMIT = pytest.mark.skipif(
 FAKE_KEY = "fake-Q7zP3wK9vX2m"
 """An API key no account has; no output may show it, or any 6-character run of it."""
 
+OUT_OF_CREDITS = {
+    "code": "OUT_OF_CREDITS",
+    "message": "Your organization needs at least 1.00 Credit to start a run.",
+    "required_credits": 1000000,
+}
+"""The detail of Aristotle's 402 for a run its organization lacks the credits to start."""
+
+SIGNUP_GRANT_PENDING = {
+    "code": "SIGNUP_GRANT_PENDING",
+    "message": "Your organization is still setting up. Try again in a few minutes.",
+}
+"""The detail of Aristotle's 409 for a run of an organization whose signup credits aren't granted yet."""
+
+BILLING_UNAVAILABLE = {"code": "BILLING_UNAVAILABLE", "message": "The credit balance is temporarily unavailable."}
+"""The detail of Aristotle's 503 for a run whose organization's credits it couldn't read."""
+
+BILLING_PAGE = "https://aristotle.harmonic.fun/settings/billing"
+
+BUY_CREDITS = f"An organization admin can buy credits at {BILLING_PAGE}."
+"""What a refusal for credits says after Aristotle's message."""
+
 PADDED_KEYS = [
     pytest.param(f"{padding}{FAKE_KEY}" if leading else f"{FAKE_KEY}{padding}", id=f"{side} {padding!r}")
     for leading, side in ((True, "leading"), (False, "trailing"))
