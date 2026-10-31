@@ -2,8 +2,10 @@ import argparse
 import asyncio
 import logging
 import os
+import tempfile
 from pathlib import Path
 
+from aristotlelib import local_file_utils
 from aristotlelib.agent_task import AgentTask
 from aristotlelib.api_request import AristotleProjectLimitError, before_sending, quietly
 from aristotlelib.ci.runner import describe_upload
@@ -26,23 +28,38 @@ from aristotlelib.cli.api_action import (
     with_latest_run,
 )
 from aristotlelib.cli.command.show import log_property_counts
-from aristotlelib.exit_codes import EXIT_INFRASTRUCTURE_ERROR
+from aristotlelib.cli.command.submit import read_block, report_dry_run
+from aristotlelib.exit_codes import EXIT_INFRASTRUCTURE_ERROR, EXIT_SUCCESS, EXIT_USAGE_ERROR
+from aristotlelib.local_file_utils import LeanProjectError
 from aristotlelib.project import (
     PROMPT_NOT_SENT,
     AgentQuestionsSetting,
+    ArchiveError,
+    FolderNotAppliedError,
     Project,
     ProjectStatus,
+    build_archive,
+    check_readable,
     continuation_uploads,
+    filelist_note,
     files_refused_while_running,
+    validate_project_dir,
     validate_prompt,
 )
 from aristotlelib.question import Question
 from aristotlelib.results import NO_SUMMARY, ContinueResult, PropertySummary
+from aristotlelib.verilog import bundle as verilog_bundle
+from aristotlelib.verilog.filelist import FilelistError
 
 _FILES_NAMED = 10
 """How many of the files sent with a prompt continue names."""
 QUESTIONS_HINT_SECONDS = 10
 """How long the hint after a prompt to a running task waits for that task's questions, retries included."""
+REPLACES = (
+    "Each file that goes up replaces the project's file at the same path, even one Aristotle has edited since, or is "
+    "added; the project's other files stay."
+)
+"""What a folder sent with a prompt does to the project's files, as --help and --dry-run say it."""
 
 
 class ContinueAction(APIAction):
@@ -52,7 +69,10 @@ class ContinueAction(APIAction):
 
     @property
     def description(self) -> str:
-        return "Give an existing project another instruction."
+        return (
+            "Give a project another instruction. A running task picks it up; on a finished project it starts a new "
+            "run, which spends credits. To read a result, use show, properties or download instead."
+        )
 
     @classmethod
     def priority(cls) -> int:
@@ -77,8 +97,41 @@ class ContinueAction(APIAction):
         self.parser.add_argument(
             "--project-dir",
             help=(
-                "Root for uploaded paths; default: the current directory. Only --files are uploaded. "
-                "Files outside this directory, also through links, and paths containing .. are refused."
+                "Root for uploaded paths; default: the current directory. Only --files are uploaded, unless "
+                "--send-folder sends the whole directory. Files outside this directory, also through links, and paths "
+                "containing .. are refused."
+            ),
+        )
+        self.parser.add_argument(
+            "--send-folder",
+            action="store_true",
+            help=(
+                "Upload the whole folder --project-dir names with the prompt, when the project is idle, its files "
+                "picked as submit --project-dir picks them, so the files the black boxes of its aristotle.f leave out "
+                "stay out. Nothing else of that aristotle.f applies: it and the files it names go up only as the "
+                "folder's other files do, so an ignore rule keeps them out without --include-ignored, and it goes up "
+                f"as written, in place of the project's, even one submit generated. {REPLACES} It needs --project-dir "
+                "and takes no --files. It needs a server that takes a folder with a follow-up: an older one starts the "
+                "task without it, and continue then names the task, with the command that cancels it, and exits 3."
+            ),
+        )
+        self.parser.add_argument(
+            "--include-ignored",
+            action="store_true",
+            help=(
+                "With --send-folder, also upload the files in --project-dir that git ignores, such as sources a build "
+                "generates, as submit --include-ignored does: files named like credentials or kept in a folder that "
+                "holds them, .git folders, result archives an earlier run saved and files whose names aren't UTF-8 "
+                "still stay out."
+            ),
+        )
+        self.parser.add_argument(
+            "--dry-run",
+            action="store_true",
+            help=(
+                "With --send-folder, send nothing, and need no key: list the files of --project-dir that would go up, "
+                "marking those --include-ignored adds, and those an ignore rule leaves out, and the prompt, and say "
+                "how large the upload would be. With --json, print that as one JSON object."
             ),
         )
         self.parser.add_argument(
@@ -125,22 +178,53 @@ class ContinueAction(APIAction):
             validate_prompt(args.prompt)
         except ValueError as e:
             self.parser.error(str(e))
-        if args.files or args.project_dir is not None:
+        if args.send_folder:
+            if args.project_dir is None:
+                self.parser.error("--send-folder needs --project-dir, the folder to send.")
+            if args.files is not None:
+                self.parser.error("--send-folder sends the whole folder, so it takes no --files.")
+            try:
+                args.project_dir = validate_project_dir(args.project_dir)
+            except ValueError as e:
+                self.parser.error(f"--project-dir: {e}")
+            if not os.path.isdir(args.project_dir):
+                self.parser.error(f"--project-dir must be a valid directory: {args.project_dir}")
+        elif args.include_ignored:
+            self.parser.error(
+                "--include-ignored needs --send-folder, which sends the folder whose ignored files it uploads."
+            )
+        elif args.dry_run:
+            self.parser.error("--dry-run needs --send-folder, which sends the folder whose files it lists.")
+        if args.dry_run and (args.wait or args.non_interactive):
+            self.parser.error("--dry-run sends nothing, so there is nothing to wait for.")
+        if not args.send_folder and (args.files or args.project_dir is not None):
             try:
                 continuation_uploads(args.files or [], project_dir=args.project_dir)
             except ValueError as e:
                 self.parser.error(f"--files: {e}")
         return None
 
+    def run(self, args: argparse.Namespace) -> int:
+        # A dry run only reads local files, so it must work without a key.
+        self.local_only = args.dry_run
+        return super().run(args)
+
     async def run_action(self, args: argparse.Namespace) -> int | None:
+        if args.dry_run:
+            return self._dry_run(args)
         if args.non_interactive:
             args.wait = args.json = True
-        uploads = continuation_uploads(args.files or [], project_dir=args.project_dir) if args.files else []
+        uploads = continuation_uploads(args.files, project_dir=args.project_dir) if args.files else []
         with before_sending(PROMPT_NOT_SENT):
             args.project_id = await Project.resolve_id(args.project_id)
             project = await Project.from_id(args.project_id)
-        if args.files and project.status != ProjectStatus.IDLE:
-            self.parser.error(files_refused_while_running(args.project_id, "--files"))
+        folder = args.project_dir if args.send_folder else None
+        if args.files:
+            sending = "--files"
+        else:
+            sending = "--send-folder" if folder is not None else ""
+        if sending and project.status != ProjectStatus.IDLE:
+            self.parser.error(files_refused_while_running(args.project_id, sending))
         no_questions_ignored = args.no_questions and project.status != ProjectStatus.IDLE
         if no_questions_ignored:
             logging.warning(
@@ -150,20 +234,57 @@ class ContinueAction(APIAction):
         agent_questions_setting = (
             AgentQuestionsSetting.DISABLED if args.no_questions else AgentQuestionsSetting.TIMEOUT_15_MIN
         )
+        block = None
+        if folder is not None:
+            try:
+                # submit's checks and reader, for the black boxes whose files stay out of the upload.
+                check_readable(folder)
+                block = read_block(folder, [], report=False)
+            except (LeanProjectError, FilelistError, verilog_bundle.BundleError) as e:
+                logging.error(str(e))
+                return EXIT_USAGE_ERROR
         # Before the send, so that a file gone after it can't fail a prompt that was sent.
         size = sum(os.path.getsize(path) for path in args.files or [])
+        not_applied = None
         try:
             task = await project.ask(
                 args.prompt,
                 files=args.files,
                 agent_questions_setting=agent_questions_setting,
                 project_dir=args.project_dir,
+                send_folder=args.send_folder,
+                include_ignored=args.include_ignored,
+                block=block,
             )
         except AristotleProjectLimitError as e:
             raise refused_run(e, PROMPT_NOT_SENT) from e
+        except (LeanProjectError, verilog_bundle.BundleError) as e:
+            logging.error(str(e))
+            return EXIT_USAGE_ERROR
+        except ArchiveError as e:
+            logging.error(str(e))
+            return EXIT_INFRASTRUCTURE_ERROR
+        except FolderNotAppliedError as e:
+            task, not_applied = e.task, e
+        except ValueError:
+            # Project.ask's refusal when its refresh finds a task started since the check above; else a real error.
+            if not sending or project.status == ProjectStatus.IDLE:
+                raise
+            self.parser.error(files_refused_while_running(args.project_id, sending))
         logging.info(f"Prompt submitted to project {args.project_id}, task {task.agent_task_id}")
         if args.files:
             logging.info(_uploaded([name for _, name in uploads], size))
+        if not_applied is not None:
+            # The prompt was sent: no wait, and 3, not the exit code of a refusal to retry, which would send it again.
+            logging.error(str(not_applied))
+            if args.json:
+                summary, _ = await judge_properties(task.project_id, task)
+                await refresh_quietly(project, task)
+                print_json(_result(project, task, summary))
+            return EXIT_INFRASTRUCTURE_ERROR
+        if task.files_applied is not None:
+            count = task.files_applied
+            logging.info(f"Aristotle applied {count} {'file' if count == 1 else 'files'} from {folder} to the project.")
 
         if args.wait:
             try:
@@ -211,6 +332,30 @@ class ContinueAction(APIAction):
                 log_unjudged(task.project_id, unjudged, level=logging.WARNING)
         return None
 
+    def _dry_run(self, args: argparse.Namespace) -> int:
+        """Archive the folder continue would send with the prompt, to a temporary file, and say what it holds; nothing
+        is sent."""
+        try:
+            # In a send's order: the folder's block, then Project.ask's checks and its archive.
+            check_readable(args.project_dir)
+            block = read_block(args.project_dir, [], report=False)
+            local_file_utils.check_lake_manifest_references_local_deps(args.project_dir)
+            with tempfile.TemporaryDirectory() as temp_dir:
+                archive = Path(temp_dir) / "project.tar.gz"
+                archived = build_archive(
+                    args.project_dir, archive, block, include_ignored=args.include_ignored, follow_up=True
+                )
+                size = archive.stat().st_size
+        except (LeanProjectError, FilelistError, verilog_bundle.BundleError) as e:
+            logging.error(str(e))
+            return EXIT_USAGE_ERROR
+        except ArchiveError as e:
+            logging.error(str(e))
+            return EXIT_INFRASTRUCTURE_ERROR
+        note = "\n".join(line for line in (REPLACES, filelist_note(archived, block)) if line is not None)
+        report_dry_run(archived, size, args.prompt, None, args.json, note=note)
+        return EXIT_SUCCESS
+
 
 async def _answer_hint(project_id: str, task: AgentTask, *, running: bool) -> str:
     """How to answer Aristotle: that it is waiting for answers when the prompt went to ``task`` as a ``running``
@@ -242,5 +387,10 @@ def _uploaded(files: list[str], size: int) -> str:
 
 def _result(project: Project, task: AgentTask, summary: PropertySummary) -> ContinueResult:
     return ContinueResult(
-        project_id=task.project_id, project=project, task=task, web_url=project.web_url(), **summary._asdict()
+        project_id=task.project_id,
+        project=project,
+        task=task,
+        web_url=project.web_url(),
+        files_applied=task.files_applied,
+        **summary._asdict(),
     )

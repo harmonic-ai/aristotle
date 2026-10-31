@@ -182,7 +182,7 @@ API key.
 
 The GitLab and Jenkins recipes below pull the image `ghcr.io/harmonic-ai/aristotle:3`, which
 each release publishes. The GitHub Action runs the same image at its own release's version, so
-`harmonic-ai/aristotle@v3` runs the newest 3.x release and `@v3.1.0` stays on 3.1.0. The image is
+`harmonic-ai/aristotle@v3` runs the newest 3.x release and `@v3.2.0` stays on 3.2.0. The image is
 built for x86-64 (`linux/amd64`) only, so a runner on Arm needs x86-64 emulation to run it.
 
 Until Aristotle can re-check results it has already established, every `aristotle ci` run is a
@@ -687,11 +687,9 @@ aristotle review --scope paths --path 'rtl/core/**'
 aristotle review --scope all         # every source file — for a nightly job
 ```
 
-Source files are Verilog and SystemVerilog (`.v`, `.sv`, `.svh`, `.vh`), C (`.c`, `.h`), Rust
-(`.rs`) and Lean (`.lean`). Lean's build files (`lakefile.lean`, `lakefile.toml`,
-`lake-manifest.json` and `lean-toolchain`) are not verified themselves, but `changed` counts a
-change to one as a change to every Lean file in its folder and below, since it decides how they
-build.
+Source files are Verilog and SystemVerilog (`.v`, `.sv`, `.svh`, `.vh`), C (`.c`, `.h`) and Rust
+(`.rs`, on accounts where Rust is enabled). Aristotle doesn't verify Lean, so a change to a `.lean`
+file is never in a run's scope.
 
 `--instructions` (`ARISTOTLE_INSTRUCTIONS`) adds instructions to the run, for example to use the
 assertions already in the repository.
@@ -745,8 +743,8 @@ so the upload is the checkout rather than the diff — `review`'s scope controls
 `.gitignore` rule now matches, anything your `.gitignore` excludes — build output, waveform
 dumps, vendor blobs, local credentials — never leaves the machine. The exceptions are Lean's
 build files (`lakefile.lean`, `lakefile.toml`, `lake-manifest.json` and `lean-toolchain`, in any
-folder), which go up whenever git tracks them, because a Lean project can't build without them, and
-the design's files that `--allow-untracked` lets through.
+folder), which go up whenever git tracks them, and the design's files that `--allow-untracked`
+lets through.
 The step names each tracked file it holds back, with the rule that matched it and how to upload
 it. With an `aristotle.f` at the root, it, every filelist it names, every file it names or
 includes, and the file any link among them leads to, must be tracked by git in the folder the step

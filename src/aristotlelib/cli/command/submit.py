@@ -34,8 +34,10 @@ from aristotlelib.cli.command.show import log_property_counts
 from aristotlelib.exit_codes import EXIT_INFRASTRUCTURE_ERROR, EXIT_SUCCESS, EXIT_USAGE_ERROR
 from aristotlelib.local_file_utils import LeanProjectError
 from aristotlelib.project import (
+    LEAN_FILES_WARNING,
     PROJECT_NOT_CREATED,
     AgentQuestionsSetting,
+    Archived,
     ArchiveError,
     Project,
     build_archive,
@@ -52,6 +54,13 @@ from aristotlelib.verilog import bundle as verilog_bundle
 from aristotlelib.verilog import filelist
 from aristotlelib.verilog.filelist import FilelistError
 
+PROMPT_ONLY_WARNING = (
+    "WARNING: No --project-dir, -f or -F was given, so only the prompt goes up. Unless the prompt includes the code "
+    "itself or asks Aristotle to design new hardware, the run ends without verifying anything. To verify your code, "
+    "submit the folder that holds it:\n"
+    '  aristotle submit "<prompt>" --project-dir <folder>'
+)
+
 
 class _BlockOption(argparse.Action):
     """Keeps ``--top``, ``-f``, ``-F`` and ``--blackbox``, with their values, in the order given, as lines of
@@ -62,11 +71,11 @@ class _BlockOption(argparse.Action):
 
 
 def read_block(
-    project_dir: Path | None, arguments: list[str], *, list_outside: bool = True
+    project_dir: Path | None, arguments: list[str], *, list_outside: bool = True, report: bool = True
 ) -> verilog_bundle.Bundle | None:
     """The Verilog block that ``project_dir``'s ``aristotle.f`` and then the command line's ``arguments`` describe,
-    logged, with each file from outside the folder when ``list_outside``, and its black boxes without ``project_dir``,
-    whose files build_archive() reads before naming them; None with neither.
+    logged with ``report``, with each file from outside the folder when ``list_outside``, and its black boxes without
+    ``project_dir``, whose files build_archive() reads before naming them; None with neither.
 
     Raises:
         FilelistError: a filelist can't be read, or is a credential.
@@ -108,6 +117,8 @@ def read_block(
         whole_folder=project_dir is not None,
         arguments=bool(arguments),
     )
+    if not report:
+        return block
     notes, warnings = verilog_bundle.report(block, files=list_outside, blackboxes=project_dir is None)
     for note in notes:
         logging.info(note)
@@ -162,25 +173,30 @@ class SubmitAction(APIAction):
 
     @property
     def description(self) -> str:
-        return "Submit a new project to Aristotle."
+        return (
+            "Submit code for Aristotle to verify, a folder with --project-dir or a Verilog block with -f or -F, and "
+            "the property to prove in the prompt. Each run spends credits."
+        )
 
     @classmethod
     def priority(cls) -> int:
         return 10
 
     def add_action_arguments(self) -> None:
-        add_prompt_arguments(self.parser, "Instructions to Aristotle")
+        add_prompt_arguments(self.parser, "The property to prove or refute, and what Aristotle may assume")
 
         self.parser.add_argument(
             "--project-dir",
             type=project_dir_argument,
             help=(
-                "A directory holding everything Aristotle will need. Verilog and C are available on every account, "
-                "and Rust on accounts where it's enabled. Files git ignores (unless "
-                "--include-ignored), files named like credentials or kept in a folder that holds them, result archives "
-                "an earlier run saved and files whose names aren't UTF-8 are left out, and the rest goes up as one "
-                "compressed archive of at most 100 MB. An aristotle.f there is read as a Verilog filelist, and every "
-                "file it names or includes goes up too, from outside the directory under _ext/."
+                "The folder holding the code to verify, as it is, and what the proof needs: Verilog and C on every "
+                "account, Rust on accounts where it's enabled. Aristotle writes the Lean itself, so don't send Lean or "
+                "pure mathematics, which it doesn't verify. Without --project-dir, -f or -F, only the prompt goes up. "
+                "Files git ignores (unless --include-ignored), files named like credentials or kept in a folder that "
+                "holds them, result archives an earlier run saved and files whose names aren't UTF-8 are left out, "
+                "and the rest goes up as one compressed archive of at most 100 MB. An aristotle.f there is read as a "
+                "Verilog filelist, and every file it names or includes goes up too, from outside the directory under "
+                "_ext/."
             ),
         )
 
@@ -373,6 +389,7 @@ class SubmitAction(APIAction):
                         block_prompt(args.prompt, block), block, agent_questions_setting, args.name
                     )
             else:
+                logging.warning(PROMPT_ONLY_WARNING)
                 project = await Project.create(
                     prompt=args.prompt,
                     agent_questions_setting=agent_questions_setting,
@@ -578,39 +595,54 @@ class SubmitAction(APIAction):
         except ArchiveError as e:
             logging.error(str(e))
             return EXIT_INFRASTRUCTURE_ERROR
+        if archived.holds_lean():
+            logging.warning(LEAN_FILES_WARNING)
         if block is not None:
             logging.info(verilog_bundle.listing(block))
-        block_names = {m.archive for m in block.members} | {block.filelist_name} if block is not None else set()
-        if others := sorted(n for n in archived.names if n not in block_names):
-            other = " other" if block is not None else ""
-            added = set(archived.added)
-            logging.info(
-                f"The folder's {len(others)}{other} {'file that goes' if len(others) == 1 else 'files that go'} up:"
-                + "".join(f"\n  {name}" + ("  (--include-ignored)" if name in added else "") for name in others)
-            )
-        ignored = len(archived.left_out)
-        if ignored:
-            logging.info(
-                f"Left out, since an ignore rule matches {'it' if ignored == 1 else 'them'}:"
-                + "".join(f"\n  {local_file_utils.archive_name(p)}" for p in archived.left_out)
-            )
-        logging.info(
-            "The prompt, as it would be sent:\n"
-            + "\n".join(f"  {line}" for line in block_prompt(prompt, block).splitlines())
-        )
-        counts = local_file_utils.ignore_counts(ignored, len(archived.included))
-        logging.info(f"Dry run: would upload {describe_upload(len(archived.names), size)}{counts}.")
-        if as_json:
-            result = {
-                "files": len(archived.names),
-                "size_bytes": size,
-                "paths": sorted(archived.names),
-                "left_out": [local_file_utils.archive_name(p) for p in archived.left_out],
-                "prompt": block_prompt(prompt, block),
-                "block": None if block is None else verilog_bundle.summary(block),
-            }
-            print(json.dumps(result, indent=2))
+        report_dry_run(archived, size, block_prompt(prompt, block), block, as_json)
         return EXIT_SUCCESS
+
+
+def report_dry_run(
+    archived: Archived,
+    size: int,
+    prompt: str,
+    block: verilog_bundle.Bundle | None,
+    as_json: bool,
+    note: str | None = None,
+) -> None:
+    """Log the folder's files a dry run archived, ``size`` bytes compressed, apart from ``block``'s, those an ignore rule
+    left out, ``note``, the ``prompt`` that would be sent and the upload's size; with ``as_json``, print them as one
+    JSON object."""
+    block_names = {m.archive for m in block.members} | {block.filelist_name} if block is not None else set()
+    if others := sorted(n for n in archived.names if n not in block_names):
+        other = " other" if block is not None else ""
+        added = set(archived.added)
+        logging.info(
+            f"The folder's {len(others)}{other} {'file that goes' if len(others) == 1 else 'files that go'} up:"
+            + "".join(f"\n  {name}" + ("  (--include-ignored)" if name in added else "") for name in others)
+        )
+    ignored = len(archived.left_out)
+    if ignored:
+        logging.info(
+            f"Left out, since an ignore rule matches {'it' if ignored == 1 else 'them'}:"
+            + "".join(f"\n  {local_file_utils.archive_name(p)}" for p in archived.left_out)
+        )
+    if note is not None:
+        logging.info(note)
+    logging.info("The prompt, as it would be sent:\n" + "\n".join(f"  {line}" for line in prompt.splitlines()))
+    counts = local_file_utils.ignore_counts(ignored, len(archived.included))
+    logging.info(f"Dry run: would upload {describe_upload(len(archived.names), size)}{counts}.")
+    if as_json:
+        result = {
+            "files": len(archived.names),
+            "size_bytes": size,
+            "paths": sorted(archived.names),
+            "left_out": [local_file_utils.archive_name(p) for p in archived.left_out],
+            "prompt": prompt,
+            "block": None if block is None else verilog_bundle.summary(block),
+        }
+        print(json.dumps(result, indent=2))
 
 
 async def _create_from_block(

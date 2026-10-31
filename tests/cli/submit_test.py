@@ -22,7 +22,7 @@ from aristotlelib import api_request, local_file_utils
 from aristotlelib.agent_task import AgentTask, TaskStatus
 from aristotlelib.api_request import AristotleAPIError
 from aristotlelib.cli.api_action import resume_hint
-from aristotlelib.cli.command.submit import SubmitAction
+from aristotlelib.cli.command.submit import PROMPT_ONLY_WARNING, SubmitAction
 from aristotlelib.cli.controller import main
 from aristotlelib.declaration import (
     Declaration,
@@ -32,15 +32,17 @@ from aristotlelib.declaration import (
     DeclarationType,
 )
 from aristotlelib.local_file_utils import LeanProjectError
-from aristotlelib.project import AgentQuestionsSetting, Project, ProjectStatus
+from aristotlelib.project import LEAN_FILES_WARNING, AgentQuestionsSetting, Project, ProjectStatus
 from aristotlelib.question import Question
 from aristotlelib.shell import shell_hint
 from aristotlelib.verilog import filelist
 from tests.ci.conftest import git
 from tests.conftest import (
+    BILLING_PAGE,
     BILLING_UNAVAILABLE,
     BUY_CREDITS,
     FAKE_KEY,
+    NAMED_ORGANIZATION,
     NEVER_READ,
     OUT_OF_CREDITS,
     SIGNUP_GRANT_PENDING,
@@ -204,17 +206,10 @@ async def test_submit_action_with_project_dir():
             has_files=False,
         )
 
-        # Mock the validation functions to avoid prompts (used inside Project.create_from_directory)
-        with (
-            patch(
-                "aristotlelib.project.local_file_utils.has_any_lean_files",
-                return_value=False,
-            ),
-            patch(
-                "aristotlelib.cli.command.submit.Project.create_from_directory",
-                return_value=mock_project,
-            ) as mock_create,
-        ):
+        with patch(
+            "aristotlelib.cli.command.submit.Project.create_from_directory",
+            return_value=mock_project,
+        ) as mock_create:
             await action.run_action(args)
 
         mock_create.assert_called_once()
@@ -690,278 +685,64 @@ async def test_no_questions_holds_for_a_waited_submit_too(caplog):
     assert not [message for message in caplog.messages if "aristotle questions" in message]
 
 
-async def test_submit_action_with_correct_toolchain():
-    """Test submitting with correct lean-toolchain proceeds without prompt."""
-    with tempfile.TemporaryDirectory() as temp_dir:
-        temp_path = Path(temp_dir)
+@pytest.mark.parametrize("dry_run", [False, True], ids=["run", "--dry-run"])
+@pytest.mark.parametrize(
+    ("lean", "warned"),
+    [("Spec.lean", True), ("lakefile.lean", False), ("ignored", False), (None, False)],
+    ids=["with .lean files", "a lakefile alone", "ignored .lean files", "without"],
+)
+def test_lean_files_get_a_warning_that_aristotle_does_not_verify_them_and_no_request(
+    api_server, tmp_path, monkeypatch, caplog, lean: str | None, warned: bool, dry_run: bool
+):
+    """The warning replaces advice on Lean's toolchain, which asked Aristotle for its own first, and is for the .lean
+    files that go up, not those an ignore rule keeps out."""
+    requests = api_server()
+    _write(tmp_path / "fir.c", "int fir(void) { return 0; }\n")
+    if lean == "ignored":
+        _write(tmp_path / ".gitignore", "aristotle-artifacts/\n")
+        _write(tmp_path / "aristotle-artifacts" / "Spec.lean", "theorem t : True := trivial\n")
+    elif lean is not None:
+        _write(tmp_path / lean, "theorem t : True := trivial\n")
 
-        parser = argparse.ArgumentParser()
-        subparsers = parser.add_subparsers()
-        action = SubmitAction(subparsers)
-        action.add_action_arguments()
+    argv = ["--project-dir", str(tmp_path), *(["--dry-run"] if dry_run else [])]
+    code, uploaded, _ = _run_submit(argv, monkeypatch, key=not dry_run)
 
-        args = action.parser.parse_args(["Test prompt", "--project-dir", str(temp_path)])
-
-        mock_project = Project(
-            project_id="test-toolchain",
-            status=ProjectStatus.RUNNING,
-            created_at=datetime.now(),
-            last_updated=datetime.now(),
-            description=None,
-            has_input=True,
-            has_files=False,
-        )
-
-        with (
-            patch(
-                "aristotlelib.project.local_file_utils.has_any_lean_files",
-                return_value=True,
-            ),
-            patch(
-                "aristotlelib.project.local_file_utils.get_lean_toolchain_version",
-                return_value="leanprover/lean4:v4.24.0",
-            ),
-            patch(
-                "aristotlelib.project.local_file_utils.get_expected_toolchain",
-                new=AsyncMock(return_value="leanprover/lean4:v4.24.0"),
-            ),
-            patch(
-                "aristotlelib.cli.command.submit.Project.create_from_directory",
-                return_value=mock_project,
-            ) as mock_create,
-            patch("builtins.input") as mock_input,
-        ):
-            await action.run_action(args)
-
-        # Should not prompt the user when toolchain is correct
-        mock_input.assert_not_called()
-        mock_create.assert_called_once()
+    assert code == 0
+    assert dry_run or "fir.c" in uploaded
+    assert requests == []
+    assert (LEAN_FILES_WARNING in caplog.messages) is warned
+    assert "toolchain" not in caplog.text
 
 
-async def test_submit_action_with_missing_toolchain_user_cancels():
-    """Test submitting with missing toolchain: code logs warning and proceeds (no prompt)."""
-    with tempfile.TemporaryDirectory() as temp_dir:
-        temp_path = Path(temp_dir)
+@pytest.mark.parametrize("flags", [[], ["--json"]], ids=["text", "--json"])
+def test_a_submit_with_no_files_warns_that_only_the_prompt_goes_up(
+    api_server, tmp_path, monkeypatch, caplog, capsys, flags
+):
+    """A prompt asking for a new hardware design still runs, so it's a warning, and --json's stdout stays JSON."""
+    monkeypatch.chdir(tmp_path)
+    no_tasks = httpx.Response(200, json={"agent_tasks": [], "pagination_key": None})
+    requests = api_server(httpx.Response(200, json=_project(None).model_dump(mode="json")), no_tasks)
 
-        parser = argparse.ArgumentParser()
-        subparsers = parser.add_subparsers()
-        action = SubmitAction(subparsers)
-        action.add_action_arguments()
+    with patch("sys.argv", ["aristotle", "submit", "Prove it", *flags]):
+        assert main() == 0
 
-        args = action.parser.parse_args(["Test prompt", "--project-dir", str(temp_path)])
-
-        mock_project = Project(
-            project_id="test-missing-toolchain",
-            status=ProjectStatus.RUNNING,
-            created_at=datetime.now(),
-            last_updated=datetime.now(),
-            description=None,
-            has_input=True,
-            has_files=False,
-        )
-        with (
-            patch(
-                "aristotlelib.project.local_file_utils.has_any_lean_files",
-                return_value=True,
-            ),
-            patch(
-                "aristotlelib.project.local_file_utils.get_lean_toolchain_version",
-                return_value=None,
-            ),
-            patch(
-                "aristotlelib.project.local_file_utils.get_expected_toolchain",
-                new=AsyncMock(return_value="leanprover/lean4:v4.24.0"),
-            ),
-            patch(
-                "aristotlelib.cli.command.submit.Project.create_from_directory",
-                return_value=mock_project,
-            ) as mock_create,
-            patch("builtins.input", return_value="n"),
-        ):
-            await action.run_action(args)
-
-        # Code warns but does not prompt; create_from_directory is called
-        mock_create.assert_called_once()
+    assert requests[0].method == "POST"
+    assert [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING] == [PROMPT_ONLY_WARNING]
+    assert PROMPT_ONLY_WARNING.endswith('\n  aristotle submit "<prompt>" --project-dir <folder>')
+    out = capsys.readouterr().out
+    if flags:
+        assert json.loads(out)["project"]["project_id"] == PROJECT_ID
 
 
-async def test_submit_action_with_missing_toolchain_user_proceeds():
-    """Test submitting with missing toolchain when user proceeds."""
-    with tempfile.TemporaryDirectory() as temp_dir:
-        temp_path = Path(temp_dir)
+@pytest.mark.parametrize("argv", [["--project-dir", "."], ["--top", "core", "-F", "ip/ip.f"]], ids=["folder", "block"])
+def test_a_submit_with_files_has_no_prompt_only_warning(tmp_path, monkeypatch, caplog, argv):
+    _ip(tmp_path)
+    monkeypatch.chdir(tmp_path)
 
-        parser = argparse.ArgumentParser()
-        subparsers = parser.add_subparsers()
-        action = SubmitAction(subparsers)
-        action.add_action_arguments()
+    code, _, _ = _run_submit(argv, monkeypatch)
 
-        args = action.parser.parse_args(["Test prompt", "--project-dir", str(temp_path)])
-
-        mock_project = Project(
-            project_id="test-proceed",
-            status=ProjectStatus.RUNNING,
-            created_at=datetime.now(),
-            last_updated=datetime.now(),
-            description=None,
-            has_input=True,
-            has_files=False,
-        )
-
-        with (
-            patch(
-                "aristotlelib.project.local_file_utils.has_any_lean_files",
-                return_value=True,
-            ),
-            patch(
-                "aristotlelib.project.local_file_utils.get_lean_toolchain_version",
-                return_value=None,
-            ),
-            patch(
-                "aristotlelib.project.local_file_utils.get_expected_toolchain",
-                new=AsyncMock(return_value="leanprover/lean4:v4.24.0"),
-            ),
-            patch(
-                "aristotlelib.cli.command.submit.Project.create_from_directory",
-                return_value=mock_project,
-            ) as mock_create,
-            patch("builtins.input", return_value="y"),
-        ):
-            await action.run_action(args)
-
-        # Should create project when user proceeds
-        mock_create.assert_called_once()
-
-
-async def test_submit_action_with_wrong_toolchain_user_cancels():
-    """Test submitting with wrong toolchain: code logs warning and proceeds (no prompt)."""
-    with tempfile.TemporaryDirectory() as temp_dir:
-        temp_path = Path(temp_dir)
-
-        parser = argparse.ArgumentParser()
-        subparsers = parser.add_subparsers()
-        action = SubmitAction(subparsers)
-        action.add_action_arguments()
-
-        args = action.parser.parse_args(["Test prompt", "--project-dir", str(temp_path)])
-
-        mock_project = Project(
-            project_id="test-wrong-toolchain",
-            status=ProjectStatus.RUNNING,
-            created_at=datetime.now(),
-            last_updated=datetime.now(),
-            description=None,
-            has_input=True,
-            has_files=False,
-        )
-        with (
-            patch(
-                "aristotlelib.project.local_file_utils.has_any_lean_files",
-                return_value=True,
-            ),
-            patch(
-                "aristotlelib.project.local_file_utils.get_lean_toolchain_version",
-                return_value="leanprover/lean4:v4.23.0",
-            ),
-            patch(
-                "aristotlelib.project.local_file_utils.get_expected_toolchain",
-                new=AsyncMock(return_value="leanprover/lean4:v4.24.0"),
-            ),
-            patch(
-                "aristotlelib.cli.command.submit.Project.create_from_directory",
-                return_value=mock_project,
-            ) as mock_create,
-            patch("builtins.input", return_value="n"),
-        ):
-            await action.run_action(args)
-
-        # Code warns but does not prompt; create_from_directory is called
-        mock_create.assert_called_once()
-
-
-async def test_submit_action_with_wrong_toolchain_user_proceeds():
-    """Test submitting with wrong toolchain version when user proceeds."""
-    with tempfile.TemporaryDirectory() as temp_dir:
-        temp_path = Path(temp_dir)
-
-        parser = argparse.ArgumentParser()
-        subparsers = parser.add_subparsers()
-        action = SubmitAction(subparsers)
-        action.add_action_arguments()
-
-        args = action.parser.parse_args(["Test prompt", "--project-dir", str(temp_path)])
-
-        mock_project = Project(
-            project_id="test-wrong-proceed",
-            status=ProjectStatus.RUNNING,
-            created_at=datetime.now(),
-            last_updated=datetime.now(),
-            description=None,
-            has_input=True,
-            has_files=False,
-        )
-
-        with (
-            patch(
-                "aristotlelib.project.local_file_utils.has_any_lean_files",
-                return_value=True,
-            ),
-            patch(
-                "aristotlelib.project.local_file_utils.get_lean_toolchain_version",
-                return_value="leanprover/lean4:v4.23.0",
-            ),
-            patch(
-                "aristotlelib.project.local_file_utils.get_expected_toolchain",
-                new=AsyncMock(return_value="leanprover/lean4:v4.24.0"),
-            ),
-            patch(
-                "aristotlelib.cli.command.submit.Project.create_from_directory",
-                return_value=mock_project,
-            ) as mock_create,
-            patch("builtins.input", return_value="yes"),
-        ):
-            await action.run_action(args)
-
-        # Should create project when user proceeds with "yes"
-        mock_create.assert_called_once()
-
-
-async def test_submit_action_without_lean_files_no_prompt():
-    """Test submitting without .lean files doesn't trigger toolchain check."""
-    with tempfile.TemporaryDirectory() as temp_dir:
-        temp_path = Path(temp_dir)
-
-        parser = argparse.ArgumentParser()
-        subparsers = parser.add_subparsers()
-        action = SubmitAction(subparsers)
-        action.add_action_arguments()
-
-        args = action.parser.parse_args(["Test prompt", "--project-dir", str(temp_path)])
-
-        mock_project = Project(
-            project_id="test-no-lean",
-            status=ProjectStatus.RUNNING,
-            created_at=datetime.now(),
-            last_updated=datetime.now(),
-            description=None,
-            has_input=True,
-            has_files=False,
-        )
-
-        with (
-            patch(
-                "aristotlelib.project.local_file_utils.has_any_lean_files",
-                return_value=False,
-            ),
-            patch(
-                "aristotlelib.cli.command.submit.Project.create_from_directory",
-                return_value=mock_project,
-            ) as mock_create,
-            patch("builtins.input") as mock_input,
-        ):
-            await action.run_action(args)
-
-        # Should not prompt the user when there are no lean files
-        mock_input.assert_not_called()
-        mock_create.assert_called_once()
+    assert code == 0
+    assert PROMPT_ONLY_WARNING not in caplog.messages
 
 
 def _project(description: str | None) -> Project:
@@ -1084,7 +865,8 @@ def test_submit_keeps_the_project_when_naming_it_fails(name: str, caplog, monkey
 
     assert f"Project created: {PROJECT_ID}" in caplog.messages
     assert f"Open in Aristotle Web: https://aristotle.harmonic.fun/projects/{PROJECT_ID}" in caplog.messages
-    [warning] = [record for record in caplog.records if record.levelno == logging.WARNING]
+    prompt_only, warning = [record for record in caplog.records if record.levelno == logging.WARNING]
+    assert prompt_only.message == PROMPT_ONLY_WARNING
     assert f"Project {PROJECT_ID} was created, but naming it failed: {server_error}" in warning.message
 
     command = warning.message.splitlines()[-1]
@@ -1940,6 +1722,13 @@ NO_PROJECT = "No project was created, so it is safe to submit it again."
             6,
         ),
         (
+            httpx.Response(402, json={"detail": {**OUT_OF_CREDITS, **NAMED_ORGANIZATION}}),
+            1,
+            f"{OUT_OF_CREDITS['message']} An admin of Acme Robotics can buy credits at {BILLING_PAGE}?org=org-acme. "
+            f"{NO_RUN}",
+            6,
+        ),
+        (
             httpx.Response(409, json={"detail": SIGNUP_GRANT_PENDING}),
             1,
             f"{SIGNUP_GRANT_PENDING['message']} {NO_RUN}",
@@ -1953,7 +1742,7 @@ NO_PROJECT = "No project was created, so it is safe to submit it again."
             3,
         ),
     ],
-    ids=["out of credits", "still setting up", "credits unreadable"],
+    ids=["out of credits", "out of credits, organization named", "still setting up", "credits unreadable"],
 )
 @pytest.mark.parametrize("flags", [["--json"], ["--non-interactive"], []], ids=["--json", "--non-interactive", "text"])
 @pytest.mark.usefixtures("frozen_api_clock")
@@ -3407,7 +3196,7 @@ def _no_verilog(folder: Path, files: list[str], more: int = 0) -> str:
             f"No Verilog source would go up from {folder}: an ignore rule matches each of its .v and .sv files:",
             *(f"  {line}" for line in files),
             *([f"  and {more} more"] if more else []),
-            "No .lean, .c or .rs file would go up either, so the run would have no design to verify. To upload them, "
+            "No .c or .rs file would go up either, so the run would have no code to verify. To upload them, "
             "pass --include-ignored (from Python, the include_ignored argument), which uploads the files ignore rules "
             "keep out, or describe the design with a filelist, which uploads every file it names, even one an ignore "
             f"rule matches: {folder / 'aristotle.f'}, -F <filelist>, or --top <module> with -f <filelist> (from "
@@ -3446,17 +3235,16 @@ def test_a_filelist_naming_the_ignored_verilog_uploads_it(tmp_path, monkeypatch,
 
 
 @pytest.mark.parametrize("dry_run", [False, True], ids=["run", "--dry-run"])
-@pytest.mark.parametrize("source", ["Main.lean", "lakefile.lean", "src/fir.c", "src/lib.rs"])
-def test_ignored_verilog_beside_lean_c_or_rust_is_a_warning(tmp_path, monkeypatch, caplog, source: str, dry_run: bool):
-    """As in a build folder: the Lean, C or Rust files still go up."""
+@pytest.mark.parametrize("source", ["src/fir.c", "src/lib.rs"])
+def test_ignored_verilog_beside_c_or_rust_is_a_warning(tmp_path, monkeypatch, caplog, source: str, dry_run: bool):
+    """As in a build folder: the C or Rust files still go up."""
     git(tmp_path, "init", "-q")
     _write(tmp_path / ".gitignore", "build/\n")
     _write(tmp_path / source, "x\n")
     _write(tmp_path / "build" / "fir.v", "module fir; endmodule\n")
 
     argv = ["--project-dir", str(tmp_path), *(["--dry-run"] if dry_run else [])]
-    with patch("aristotlelib.project.local_file_utils.get_expected_toolchain", AsyncMock(return_value=None)):
-        code, uploaded, create = _run_submit(argv, monkeypatch, key=not dry_run)
+    code, uploaded, create = _run_submit(argv, monkeypatch, key=not dry_run)
 
     assert code == 0
     assert create.called is not dry_run
@@ -3470,6 +3258,26 @@ def test_ignored_verilog_beside_lean_c_or_rust_is_a_warning(tmp_path, monkeypatc
         f"one an ignore rule matches: {tmp_path / 'aristotle.f'}, -F <filelist>, or --top <module> with -f <filelist> "
         "(from Python, the block argument)."
     ) in warnings
+
+
+@pytest.mark.parametrize("dry_run", [False, True], ids=["run", "--dry-run"])
+@pytest.mark.parametrize("source", ["Main.lean", "lakefile.lean"])
+def test_ignored_verilog_beside_only_lean_stops_before_any_request(
+    api_server, tmp_path, caplog, source: str, dry_run: bool
+):
+    """Aristotle doesn't verify Lean, so a folder whose only other source is Lean has no code to verify."""
+    requests = api_server()
+    git(tmp_path, "init", "-q")
+    _write(tmp_path / ".gitignore", "build/\n")
+    _write(tmp_path / source, "x\n")
+    _write(tmp_path / "build" / "fir.v", "module fir; endmodule\n")
+
+    argv = ["aristotle", "submit", "Prove it", "--project-dir", str(tmp_path), *(["--dry-run"] if dry_run else [])]
+    with patch("sys.argv", argv):
+        assert main() == 2
+
+    assert requests == []
+    assert caplog.messages[-1] == _no_verilog(tmp_path, ["build/fir.v  (.gitignore:1: build/)"])
 
 
 def test_one_verilog_source_that_goes_up_is_enough(tmp_path, monkeypatch, caplog):
@@ -3699,20 +3507,18 @@ def test_include_ignored_with_a_filelist_uploads_the_folders_other_ignored_files
 
 
 def test_without_include_ignored_both_warnings_name_it_and_with_it_neither_fires(tmp_path, monkeypatch, caplog):
-    """The held-back warning for a tracked file, and the one for Verilog an ignore rule leaves out beside Lean."""
+    """The held-back warning for a tracked file, and the one for Verilog an ignore rule leaves out beside C."""
     git(tmp_path, "init", "-q")
     _write(tmp_path / ".gitignore", "build/\n")
-    _write(tmp_path / "Main.lean", "theorem t : True := trivial\n")
+    _write(tmp_path / "main.c", "int main(void) { return 0; }\n")
     _write(tmp_path / "build" / "fir.v", "module fir; endmodule\n")
     _write(tmp_path / "build" / "keep.h", "#define KEEP 1\n")
-    git(tmp_path, "add", "-f", ".gitignore", "Main.lean", "build/keep.h")
-    toolchain = patch("aristotlelib.project.local_file_utils.get_expected_toolchain", AsyncMock(return_value=None))
+    git(tmp_path, "add", "-f", ".gitignore", "main.c", "build/keep.h")
 
-    with toolchain:
-        code, uploaded, _ = _run_submit(["--project-dir", str(tmp_path)], monkeypatch)
+    code, uploaded, _ = _run_submit(["--project-dir", str(tmp_path)], monkeypatch)
 
     assert code == 0
-    assert sorted(uploaded) == [".gitignore", "Main.lean"]
+    assert sorted(uploaded) == [".gitignore", "main.c"]
     warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     held_back = local_file_utils.held_back_warning({Path("build/keep.h"): ".gitignore:1: build/"}, include_ignored=True)
     assert held_back in warnings
@@ -3721,11 +3527,10 @@ def test_without_include_ignored_both_warnings_name_it_and_with_it_neither_fires
     assert f"\nTo verify them too, {INCLUDE_IGNORED_HINT}, or describe the design with a filelist" in no_verilog
     caplog.clear()
 
-    with toolchain:
-        code, uploaded, _ = _run_submit(["--project-dir", str(tmp_path), "--include-ignored"], monkeypatch)
+    code, uploaded, _ = _run_submit(["--project-dir", str(tmp_path), "--include-ignored"], monkeypatch)
 
     assert code == 0
-    assert sorted(uploaded) == [".gitignore", "Main.lean", "build/fir.v", "build/keep.h"]
+    assert sorted(uploaded) == [".gitignore", "build/fir.v", "build/keep.h", "main.c"]
     assert "Not uploading" not in caplog.text
     assert "No Verilog source" not in caplog.text
 

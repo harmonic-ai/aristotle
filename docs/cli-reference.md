@@ -39,6 +39,9 @@ The README's [Log in](../README.md#log-in) shows the login in the browser. Also:
 
 ## What goes up
 
+Without `--project-dir`, `-f` or `-F`, only the prompt goes up, and `submit` warns. Unless the prompt includes the code
+itself or asks Aristotle to design new hardware, such a run verifies nothing.
+
 `--project-dir` uploads the folder as one compressed archive of at most 100 MB; over that, `submit` says how large it
 is and exits 2 before uploading. It leaves out:
 
@@ -55,30 +58,42 @@ is and exits 2 before uploading. It leaves out:
 | In a git repository | Every `.gitignore` that applies, the repository's own included when you submit a subfolder, plus `.git/info/exclude` and your global excludes. Only the repository's `.gitignore` files hold back a tracked file, since the other two are this machine's alone. |
 | Elsewhere, in a folder git ignores, or, with a warning, where git isn't installed or refuses the repository, as for a checkout owned by another user | The folder's top-level `.gitignore`. |
 
-No ignore rule holds back `.lake` or Lean's build files (`lakefile.lean`, `lakefile.toml`, `lake-manifest.json` and
-`lean-toolchain`, in any folder). Still, in `.lake` and everywhere else, no file named `*.olean`, `*.ilean`, `*.ir`,
-`*.o`, `*.so` or `*.trace` goes up, nor the `.hash` file of an `.olean`, `.ilean`, `.ir` or `.so` file, nor an
-`.olean`'s `.lock`, `.private` and `.server` files and the `.hash` files of the last two; and neither do
-`.lake/build/ir`, `.lake/build/bin`, or mathlib and the packages it depends on under `.lake/packages` (`batteries`,
-`aesop`, `Qq`, `plausible`, `proofwidgets`, `importGraph`, `LeanSearchClient` and `Cli`). Other build output in
-`.lake`, such as `.a` or `.dylib` files, goes up.
+Lean's build files (`lakefile.lean`, `lakefile.toml`, `lake-manifest.json`, `lean-toolchain`) and `.lake` go up even
+when an ignore rule matches them. Some of Lean's build output never does: `.olean` and similar files, `.lake/build/ir`,
+`.lake/build/bin`, and mathlib and its packages under `.lake/packages`. Other build output in `.lake`, such as `.a` or
+`.dylib` files, goes up. In any folder, no `*.o`, `*.so`, `*.ir` or `*.trace` file goes up. Aristotle doesn't verify
+Lean: `submit` warns when a `.lean` file other than Lean's build files goes up.
 
 **Verilog sources.** Without a filelist (an `aristotle.f` in the folder, `-f` or `-F`; see
 [Verilog build configuration](verilog.md)), if ignore rules leave out every `.v` and `.sv` file, as with Verilog
 generated from templates and ignored, `submit` names up to five, each with its `.gitignore` rule where git can say. It
 suggests `--include-ignored`, or a filelist, which uploads every file it names, ignored or not. A header, such as a
-`.vh` file, isn't a source. If no `.lean`, `.c` or `.rs` file goes up either, there's no design to verify, so `submit`
-exits 2 before uploading, as `--dry-run` does; otherwise both warn.
+`.vh` file, isn't a source. If no `.c` or `.rs` file goes up either, there's no code to verify, so `submit` exits 2
+before uploading, as `--dry-run` does; otherwise both warn.
 
 **Files with a prompt.** `continue --files PATH...` uploads selected local files when the project is idle. File
 arguments are relative to the current directory or absolute. `--project-dir ROOT` determines their paths in the project; it defaults to the current
-directory. For example, `--project-dir out --files out/Proofs/Foo.lean` sends `Proofs/Foo.lean`. Selecting just one file
+directory. For example, `--project-dir out --files out/rtl/fifo.sv` sends `rtl/fifo.sv`. Selecting just one file
 does not remove its parent directories. Files outside ROOT, also through links, paths containing `..`, duplicate
-paths and names that multipart cannot preserve are usage errors (exit 2), checked before any request.
+paths and names that multipart cannot preserve are usage errors (exit 2), checked before any request. Only the selected
+files go up; `--send-folder` sends the whole folder instead, as below.
 
 `download --artifact` saves files at their project-relative paths beneath `--destination` (default:
 `aristotle-artifacts`). Use that folder as the root when uploading them again. Plain `download` saves the archive
 without extracting it or changing its directory structure.
+
+**A folder with a prompt.** `continue --project-dir <dir> --send-folder` sends the whole folder again with the prompt
+to an idle project, such as edited sources and new reports:
+`aristotle continue <project-id> "Use the new timing reports" --project-dir ./rtl --send-folder --wait`. It picks the
+folder's files as `submit` does, `--include-ignored` included, so the files the black boxes of its `aristotle.f` leave
+out stay out. Nothing else of that `aristotle.f` applies: it and the files it names go up only as the folder's other
+files do, so an ignore rule keeps them out without `--include-ignored`, and it goes up as written, in place of the
+project's, even one `submit` generated; `continue` says so when it does. Each file that goes up replaces the project's
+file at the same path, even one Aristotle has edited since, or is added; the project's other files stay, and nothing is
+deleted. `--dry-run` lists the files that would go up and sends nothing. Once the prompt is sent, `continue` says how
+many of them Aristotle applied. This needs a server that takes a folder with a follow-up: an older one starts the task
+without the folder, and `continue` then names the task, with the command that cancels it, and exits 3. `--send-folder`
+takes no `--files`. Without it, `--project-dir` is only the root of `--files`' paths, as above.
 
 **Long prompts.** `--prompt-file`, on `submit` and `continue`, reads the prompt from a file, for one too long for the
 command line: Linux takes at most 128 KiB in one argument, and fails a longer one before the command starts.
@@ -286,7 +301,7 @@ A refused request, an HTTP 403, reads:
 page's title. Trusting the corporate CA lets HTTPS connect, but doesn't override the proxy's access policy. A proxy
 can return JSON too, so the format is a clue to the source, not proof.
 
-Each request's `User-Agent` header names the client, as in `aristotlelib/3.1.0 (cli; python/3.12; linux)`: the SDK's
+Each request's `User-Agent` header names the client, as in `aristotlelib/3.2.0 (cli; python/3.12; linux)`: the SDK's
 version; `cli` for a command, `ci` for `aristotle ci` and `aristotle review`, `action` when the GitHub Action runs
 them, or `library` for a Python program; then the Python version and operating system. Nothing else: no arguments,
 paths, host or user names, or anything about your projects.
@@ -312,7 +327,7 @@ warnings and errors go to stderr.
 | `tasks` | `{"project_id", "tasks", "pagination_key"}` |
 | `show` | `{"project_id", "project", "task", "web_url", "events", "result_path", "property_counts", "requested_counts", "properties"}` |
 | `submit` | `{"project", "task", "web_url", "result_path", "property_counts", "requested_counts", "properties"}` |
-| `continue` | `{"project_id", "project", "task", "web_url", "property_counts", "requested_counts", "properties"}` |
+| `continue` | `{"project_id", "project", "task", "web_url", "files_applied", "property_counts", "requested_counts", "properties"}` |
 | `cancel` | a task |
 | `rename` | a project |
 | `download` | `{"project_id", "result_path"}` |
@@ -329,7 +344,7 @@ warnings and errors go to stderr.
 |---|---|
 | `show` | Waits only with `--wait`, even for a running task. `task`: the one asked for, else the latest (`null` if none). `events`: its latest events, oldest first; none for a finished task unless `--limit` asks. `result_path`: where `--destination`, with `--wait` or `--non-interactive`, saved the result archive: `null` without `--destination`, and otherwise as in `submit`'s. |
 | `submit` | `task`: the project's task (`null`, with a warning on stderr, if it couldn't be listed; `--wait` then exits 3, naming the `aristotle show` command that waits for it). `result_path`: where `--wait` saved the result archive; `null` without `--wait`, with nothing to download, when the wait ended first, or when saving failed, which exits 3. |
-| `continue` | `task`: the one the prompt went to, new if the project was idle, else the running one it steered. |
+| `continue` | `task`: the one the prompt went to, new if the project was idle, else the running one it steered. `files_applied`: how many of the files of the folder `--send-folder` sent Aristotle applied; `null` when no folder went up, and when the server took the prompt without it, which exits 3. |
 | `show`, `continue` | `project`: as it stands when printed, after any wait (`null` for `show --task` if it couldn't be fetched). `web_url`: its page in the web app, as in `submit`'s. If an interrupt cut the result short, or the project couldn't be refreshed, its `status` and `latest_run_status` are the latest task's, which the wait kept fresher, unless `show --task` names a finished task, which may be older. |
 | `properties` | Reads every page itself, so its `pagination_key` is always `null`, and it prints every match unless `--limit` is given. |
 | `download --artifact` | `files`: each file saved, in the order given, with its `artifact_path` in the project and its `saved_path`, where it went. `missing`: the paths with no file, which exit 4. |
@@ -378,10 +393,10 @@ Every command exits with one of these codes, so a script can tell a failed run f
 | 0 | Success. |
 | 1 | The task a wait followed (`submit --wait`, `continue --wait`, `show --wait`, a `--non-interactive` run, or a plain `show` at a terminal) finished without completing the request (`COMPLETE_WITH_ERRORS` or `OUT_OF_BUDGET`). Or the verdicts failed the build: `aristotle ci`'s on its manifest's properties, or `aristotle review`'s when `--fail-on` is `failure` or `no-verdict` ([What your team sees](aristotle-in-ci.md#what-your-team-sees)), a run Aristotle stopped for decisions only you can make included. Or `aristotle ci setup` found no proposed properties to write. |
 | 2 | Usage error: a missing or invalid argument, input Aristotle can't take, a project name or id prefix that matches more than one project, or an `aristotle ci --project` run that isn't of this checkout. |
-| 3 | The command couldn't complete: a server or network error outlasted the retries; a task you waited on failed or was cancelled; a wait ended with the task still running; an `aristotle ci` or `aristotle review` run's time budget cut it, whatever `--fail-on` is; an `aristotle ci` run, or an `aristotle review` run when `--fail-on` is `failure` or `no-verdict`, ran out of budget, or billing stopped it, before Aristotle checked its results; `aristotle login` checked a key but couldn't store it; a key a browser login handed out can't be sent; or an unexpected error. |
+| 3 | The command couldn't complete: a server or network error outlasted the retries; a task you waited on failed or was cancelled; a wait ended with the task still running; an `aristotle ci` or `aristotle review` run's time budget cut it, whatever `--fail-on` is; an `aristotle ci` run, or an `aristotle review` run when `--fail-on` is `failure` or `no-verdict`, ran out of budget, or billing stopped it, before Aristotle checked its results; a `continue --send-folder` prompt started a task without the folder, on a server that doesn't take one with a follow-up, which `continue` names with the command that cancels it; `aristotle login` checked a key but couldn't store it; a key a browser login handed out can't be sent; or an unexpected error. |
 | 4 | The project, task, property or question doesn't exist or your key can't see it, no project has that name or id prefix, or Aristotle refused the action: cancelling a finished task (one already cancelled counts as cancelled), or `questions --answer` for a closed question, an ended run or someone else's project. Also `download` of a project with no files yet, or of an `--artifact` it has no file at. |
 | 5 | No API key was found, Aristotle rejected it, it can't be sent (whitespace around a key is ignored, and what's left is empty or holds a space, a control character or a non-ASCII character), or `aristotle login` was denied in the browser or its code expired. |
-| 6 | Aristotle is rate limiting your account: too many runs in progress or waiting to start, or too many requests at once, even after the retries. The message says which, with Aristotle's limits when it gives them. Retry later; for runs, wait for one of yours to finish, or cancel one. Or your organization doesn't have the credits to start a run: once an organization admin buys them at https://aristotle.harmonic.fun/settings/billing, run it again. Also an `aristotle ci` or `aristotle review` run still queued when its time budget ran out. |
+| 6 | Aristotle is rate limiting your account: too many runs in progress or waiting to start, or too many requests at once, even after the retries. The message says which, with Aristotle's limits when it gives them. Retry later; for runs, wait for one of yours to finish, or cancel one. Or an organization doesn't have the credits to start a run: the message names the page to buy them on and, when Aristotle says which, the organization that needs them. Once they're bought, run it again. Also an `aristotle ci` or `aristotle review` run still queued when its time budget ran out. |
 | 7 | The request may have gone through: its response was lost after Aristotle may have acted on it, so it wasn't sent again, or an earlier copy was still in progress when the retries ran out. Check before sending it again ([Retries and lost requests](#retries-and-lost-requests)). |
 | 10 | A `--non-interactive` wait stopped because Aristotle is waiting for answers; stdout holds the questions. |
 | 130 | Interrupted with Ctrl-C, or ended by SIGTERM. A task you were following keeps running, and the log says how to follow or cancel it; `aristotle ci` and `aristotle review` cancel their run unless `--on-timeout leave` is set, and `aristotle ci --project` leaves it going unless `--on-timeout cancel` is. A `submit` interrupted after sending its create says the project may exist, which can take a few minutes to show, and how to find and cancel it; one interrupted before says nothing was sent. A `submit --wait`, or a `show` with `--destination`, interrupted after its wait has seen the task finish and before the result archive is saved, or during the download, says the archive wasn't saved, and names the `aristotle download` command that saves it where the wait would have. `aristotle ci`, `aristotle review` and `aristotle ci setup` interrupted once their create was sent look for the project by the name it was uploaded under for up to 10 seconds, and cancel its run once it starts unless `--on-timeout leave` is set; if they can't find the project, or its run hasn't started, they say how to find and cancel it. |

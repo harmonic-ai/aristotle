@@ -1277,11 +1277,12 @@ def report(bundle: Bundle, *, files: bool = True, blackboxes: bool = True) -> tu
     return notes, warnings
 
 
-def blackbox_note(bundle: Bundle) -> str | None:
-    """A note naming each black box, where it was named, and the files left out for it; None without any."""
+def blackbox_note(bundle: Bundle, named_by: str = "the prompt") -> str | None:
+    """A note naming each black box, which ``named_by`` names, where it was named, and the files left out for it; None
+    without any."""
     if not bundle.blackboxes:
         return None
-    lines = ["Black boxes, which the prompt names, and the files left out for them:"]
+    lines = [f"Black boxes, which {named_by} names, and the files left out for them:"]
     for box in bundle.blackboxes:
         left_out = ", ".join(filelist.shown(f) for f in box.files) or "no file in the upload declares it"
         lines.append(f"  {box.name} ({box.origin}): {left_out}")

@@ -75,8 +75,8 @@ The exit codes:
 - 3: the run failed, was cancelled elsewhere, or ran out of budget or time, or Aristotle couldn't be reached.
 - 5: no API key, a rejected one, or one that can't be sent: blank, or holding a space, a control or a non-ASCII
   character.
-- 6: no run slot freed up in time, or the organization doesn't have the credits to start a run: once an organization
-  admin buys them at https://aristotle.harmonic.fun/settings/billing, run it again.
+- 6: no run slot freed up in time, or the organization doesn't have the credits to start a run: once they're bought
+  on the billing page the message names, run it again.
 - 7: the response to creating the run was lost and the run couldn't be found: check `aristotle list` before running
   again.
 
@@ -122,6 +122,12 @@ level for `aristotle review`. Aristotle uses it as the build configuration, and 
   gives them, never a file in the repository, so propose that change to the user.
   `aristotle submit --project-dir <dir> --include-ignored` uploads generated files an ignore rule matches, and its
   `--dry-run` marks each one.
+  `aristotle continue <project-id> <prompt> --project-dir <dir> --send-folder`, with the same flags, sends the folder
+  again to an idle project when the user asks for that, each file replacing the project's at its path, even one
+  Aristotle has edited, without the files its `aristotle.f`'s black boxes leave out; that `aristotle.f` and the files it
+  names go up only as the folder's other files do, with `--include-ignored` if an ignore rule matches one, and the
+  `aristotle.f` as written. A server that doesn't take a folder with a follow-up starts the task without it, and
+  `continue` exits 3, naming the task to cancel.
 - A `--blackbox <module>` line has Aristotle treat a module, such as a foundry cell, as a black box with unconstrained
   outputs: write no stub for it. A tracked file the filelists name, or a tracked `.v`, `.sv`, `.vh` or `.svh` file they
   don't, that declares nothing but black boxes stays out of the run's upload; name one in the filelists only if git
@@ -148,9 +154,9 @@ level for `aristotle review`. Aristotle uses it as the build configuration, and 
 
 `aristotle review` is the open-ended run: Aristotle works out what should hold of the files in scope, and checks it.
 Its properties differ from run to run, so it is advisory, and `--fail-on` defaults to `never`. `--scope changed`, the
-default, covers the source files (Verilog, C, Rust and Lean) this change touched, compared with `--base-ref` or the
-branch the CI environment names, and every Lean file under a Lean build file it touched. Outside CI, without
-`--base-ref`, it covers only the last commit, so for uncommitted work use `--scope paths --path '<glob>'`, which
-uploads only tracked files: ask the user before you `git add` a new one. `--scope all` covers every source file.
+default, covers the source files (Verilog, C and Rust) this change touched, compared with `--base-ref` or the branch
+the CI environment names. Outside CI, without `--base-ref`, it covers only the last commit, so for uncommitted work use
+`--scope paths --path '<glob>'`, which uploads only tracked files: ask the user before you `git add` a new one.
+`--scope all` covers every source file.
 Use the properties it proves as candidates for the manifest. It takes `aristotle ci`'s `--timeout`, `--on-timeout`,
 `--junit`, `--no-junit`, `--directory`, `--name` and `--dry-run`, and it is paid just the same.

@@ -6,14 +6,17 @@ import io
 import json
 import logging
 import os
+import re
 import sys
+import tarfile
 from datetime import datetime
+from pathlib import Path
 from unittest.mock import ANY, AsyncMock, Mock, patch
 
 import httpx
 import pytest
 
-from aristotlelib import api_request
+from aristotlelib import api_request, local_file_utils
 from aristotlelib.agent_task import AgentTask, TaskStatus
 from aristotlelib.api_request import AristotleAPIError
 from aristotlelib.cli.command.continue_ import ContinueAction
@@ -26,10 +29,10 @@ from aristotlelib.declaration import (
     DeclarationStatus,
     DeclarationType,
 )
-from aristotlelib.project import AgentQuestionsSetting, Project, ProjectStatus
+from aristotlelib.project import ARCHIVE_FILES_HEADER, AgentQuestionsSetting, Project, ProjectStatus
 from aristotlelib.question import Question
 from tests.cli.conftest import LOOKUP_FAILURES, mockable_project
-from tests.conftest import BUY_CREDITS, OUT_OF_CREDITS, SIGNUP_GRANT_PENDING
+from tests.conftest import BUY_CREDITS, OUT_OF_CREDITS, SIGNUP_GRANT_PENDING, multipart_parts
 
 
 @pytest.fixture(autouse=True)
@@ -97,8 +100,11 @@ async def test_continue_action_basic():
     mock_project.ask.assert_called_once_with(
         "Continue with the proof",
         files=None,
-        project_dir=None,
         agent_questions_setting=AgentQuestionsSetting.TIMEOUT_15_MIN,
+        project_dir=None,
+        send_folder=False,
+        include_ignored=False,
+        block=None,
     )
 
 
@@ -121,8 +127,11 @@ async def test_continue_action_with_different_prompt():
     mock_project.ask.assert_called_once_with(
         "Try a different approach using induction",
         files=None,
-        project_dir=None,
         agent_questions_setting=AgentQuestionsSetting.TIMEOUT_15_MIN,
+        project_dir=None,
+        send_folder=False,
+        include_ignored=False,
+        block=None,
     )
 
 
@@ -144,8 +153,11 @@ async def test_continue_asks_with_the_prompt_from_stdin(monkeypatch):
     project.ask.assert_called_once_with(
         "Try induction on the length.",
         files=None,
-        project_dir=None,
         agent_questions_setting=AgentQuestionsSetting.TIMEOUT_15_MIN,
+        project_dir=None,
+        send_folder=False,
+        include_ignored=False,
+        block=None,
     )
 
 
@@ -505,6 +517,7 @@ async def test_files_sent_with_a_prompt_are_counted_sized_and_named_on_stderr(js
             "project",
             "task",
             "web_url",
+            "files_applied",
             "property_counts",
             "requested_counts",
             "properties",
@@ -672,11 +685,13 @@ async def test_continue_json_prints_the_task_and_the_projects_properties(propert
         "project",
         "task",
         "web_url",
+        "files_applied",
         "property_counts",
         "requested_counts",
         "properties",
     ]
     assert result["project_id"] == result["project"]["project_id"] == "project-123"
+    assert result["files_applied"] is None
     assert result["web_url"] == "https://aristotle.harmonic.fun/projects/project-123"
     assert result["task"]["agent_task_id"] == "task-456"
     assert result["task"]["status"] == "QUEUED"
@@ -1454,3 +1469,767 @@ async def test_a_failing_questions_listing_retries_quietly_and_gives_the_general
     assert [r.message for r in caplog.records if r.levelno >= logging.WARNING] == []
     assert any(r.message.startswith("Retrying in") for r in caplog.records if r.levelno == logging.DEBUG)
     assert caplog.messages[-1] == IF_ASKED
+
+
+FOLDER_PROJECT = "3f1002f7-0b6c-4c1e-9d8e-2a4b5c6d7e8f"
+FOLDER_TASK = "5d6e7f80-1a2b-4c3d-8e9f-0a1b2c3d4e5f"
+NOT_APPLIED = (
+    f"Aristotle didn't apply {{folder}} to project {FOLDER_PROJECT}: the server doesn't take a folder with a follow-up, "
+    f"so task {FOLDER_TASK} started without the folder's files. Cancel it with:\n  aristotle cancel {FOLDER_TASK}"
+)
+
+
+def _folder_project(status: ProjectStatus = ProjectStatus.IDLE) -> httpx.Response:
+    project = Project(
+        project_id=FOLDER_PROJECT,
+        status=status,
+        created_at=datetime(2026, 9, 1, 12, 0),
+        last_updated=datetime(2026, 9, 1, 12, 0),
+        description=None,
+        has_input=True,
+        has_files=True,
+    )
+    return httpx.Response(200, json=project.model_dump(mode="json"))
+
+
+def _follow_up(applied: str | None) -> httpx.Response:
+    """A follow-up's answer: its task, and ARCHIVE_FILES_HEADER at ``applied`` unless None, as an older server answers."""
+    task = _queued_task().model_copy(update={"project_id": FOLDER_PROJECT, "agent_task_id": FOLDER_TASK})
+    headers = {} if applied is None else {ARCHIVE_FILES_HEADER: applied}
+    return httpx.Response(200, json=task.model_dump(mode="json"), headers=headers)
+
+
+def _archive_in(request: httpx.Request, field: str = "archive") -> dict[str, bytes | None]:
+    """The members of the archive ``request`` sent as ``field``: each file's content, or None for any other member."""
+    (archive,) = [content for name, _, _, content in multipart_parts(request) if name == field]
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz", encoding="utf-8") as tar:
+        return {m.name: (f.read() if (f := tar.extractfile(m)) else None) for m in tar.getmembers()}
+
+
+def _rtl(tmp_path: Path) -> Path:
+    """A folder whose fifo.v, reports/timing.rpt and .gitignore go up, and whose build.log, which an ignore rule
+    matches, .env and earlier result archive stay out."""
+    rtl = tmp_path / "rtl"
+    (rtl / "reports").mkdir(parents=True)
+    (rtl / "fifo.v").write_bytes(b"module fifo; endmodule\n")
+    (rtl / "reports" / "timing.rpt").write_bytes(b"slack 0.12\n")
+    (rtl / ".gitignore").write_bytes(b"*.log\n")
+    (rtl / "build.log").write_bytes(b"built\n")
+    (rtl / ".env").write_bytes(b"TOKEN=never-sent\n")
+    (rtl / f"{FOLDER_PROJECT}-aristotle.tar.gz").write_bytes(b"an earlier result")
+    return rtl
+
+
+def _continue(*argv: str) -> int | None:
+    with patch("sys.argv", ["aristotle", "continue", FOLDER_PROJECT, *argv]):
+        return main()
+
+
+def test_a_folder_goes_up_with_the_prompt_as_submit_would_upload_it(tmp_path, api_server):
+    rtl = _rtl(tmp_path)
+    (tmp_path / "outside.v").write_bytes(b"module outside; endmodule\n")
+    try:
+        (rtl / "fifo_link.v").symlink_to("fifo.v")
+        (rtl / "outside_link.v").symlink_to(tmp_path / "outside.v")
+        links = True
+    except OSError:
+        links = False
+    requests = api_server(_folder_project(), _folder_project(), _folder_project(), _follow_up("4" if links else "3"))
+
+    with patch("sys.argv", ["aristotle", "submit", "Prove it", "--project-dir", str(rtl)]):
+        assert main() == 0
+    assert _continue("Use the new reports", "--project-dir", str(rtl), "--send-folder") == 0
+
+    assert [(request.method, request.url.path) for request in requests] == [
+        ("POST", "/api/v3/project"),
+        ("GET", f"/api/v3/project/{FOLDER_PROJECT}"),
+        ("GET", f"/api/v3/project/{FOLDER_PROJECT}"),
+        ("POST", f"/api/v3/project/{FOLDER_PROJECT}/ask"),
+    ]
+    submitted = _archive_in(requests[0], field="input")
+    assert _archive_in(requests[3]) == submitted
+    # A link inside the folder goes up as its file's content; one leading out of it stays out.
+    expected = [".gitignore", "fifo.v", *(["fifo_link.v"] if links else []), "reports/timing.rpt"]
+    assert sorted(submitted) == expected
+    assert [part[1:3] for part in multipart_parts(requests[3]) if part[0] == "archive"] == [
+        ("rtl.tar.gz", "application/gzip")
+    ]
+
+
+def test_a_folders_hard_links_go_up_as_files_of_their_own(tmp_path, api_server):
+    rtl = _rtl(tmp_path)
+    try:
+        os.link(rtl / "fifo.v", rtl / "fifo_copy.v")
+    except (AttributeError, OSError):
+        pytest.skip("this platform cannot create hard links")
+    try:
+        (rtl / "fifo_link.v").symlink_to("fifo.v")
+        linked = ["fifo_link.v"]
+    except OSError:
+        linked = []
+    requests = api_server(_folder_project(), _folder_project(), _follow_up(str(4 + len(linked))))
+
+    assert _continue("Use the new reports", "--project-dir", str(rtl), "--send-folder") == 0
+
+    (archive,) = [content for name, _, _, content in multipart_parts(requests[2]) if name == "archive"]
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tar:
+        # The server applies a hard link under its first name only, so each name holds its own copy.
+        assert {m.name: (m.isreg(), m.size) for m in tar.getmembers() if m.name.startswith("fifo")} == {
+            name: (True, len(b"module fifo; endmodule\n")) for name in ["fifo.v", "fifo_copy.v", *linked]
+        }
+
+
+@pytest.mark.parametrize("json_flag", [False, True], ids=["text", "json"])
+def test_the_count_aristotle_applied_is_said_and_given_as_files_applied(
+    json_flag, tmp_path, api_server, caplog, capsys
+):
+    caplog.set_level(logging.INFO)
+    rtl = _rtl(tmp_path)
+    # The project, its check that it is idle, the follow-up, and with --json its refresh before the result.
+    api_server(_folder_project(), _folder_project(), _follow_up("3"), _folder_project())
+
+    assert (
+        _continue("Use the new reports", "--project-dir", str(rtl), "--send-folder", *(["--json"] if json_flag else []))
+        == 0
+    )
+
+    assert caplog.messages[-4:] == [
+        "Uploading 3 files; 1 left out because it matches an ignore rule.",
+        f"Prompt submitted to project {FOLDER_PROJECT}, task {FOLDER_TASK}",
+        f"Aristotle applied 3 files from {rtl} to the project.",
+        f"If Aristotle asks anything, answer with:\n  aristotle questions {FOLDER_PROJECT}",
+    ]
+    out = capsys.readouterr().out
+    if json_flag:
+        assert json.loads(out)["files_applied"] == 3
+    else:
+        assert out == ""
+
+
+def test_one_file_applied_is_said_as_one(tmp_path, api_server, caplog):
+    caplog.set_level(logging.INFO)
+    (tmp_path / "rtl").mkdir()
+    (tmp_path / "rtl" / "fifo.v").write_bytes(b"module fifo; endmodule\n")
+    api_server(_folder_project(), _folder_project(), _follow_up("1"))
+
+    assert _continue("Use it", "--project-dir", str(tmp_path / "rtl"), "--send-folder") == 0
+
+    assert f"Aristotle applied 1 file from {tmp_path / 'rtl'} to the project." in caplog.messages
+
+
+@pytest.mark.parametrize(
+    "flags", [[], ["--wait"], ["--json"], ["--non-interactive"]], ids=["plain", "--wait", "--json", "--non-interactive"]
+)
+@pytest.mark.parametrize("header", [None, "", "three", "-1"], ids=["no header", "empty", "not a number", "negative"])
+def test_a_folder_the_server_did_not_apply_names_the_task_to_cancel_and_exits_3_without_waiting(
+    flags, header, tmp_path, api_server, caplog, capsys
+):
+    caplog.set_level(logging.INFO)
+    rtl = _rtl(tmp_path)
+    as_json = "--json" in flags or "--non-interactive" in flags
+    # No wait: nothing after the follow-up but the refresh a --json result makes.
+    requests = api_server(_folder_project(), _folder_project(), _follow_up(header), _folder_project())
+
+    assert _continue("Use the new reports", "--project-dir", str(rtl), "--send-folder", *flags) == 3
+
+    assert [request.method for request in requests] == ["GET", "GET", "POST", *(["GET"] if as_json else [])]
+    assert caplog.records[-1].levelno == logging.ERROR
+    assert caplog.messages[-2:] == [
+        f"Prompt submitted to project {FOLDER_PROJECT}, task {FOLDER_TASK}",
+        NOT_APPLIED.format(folder=rtl),
+    ]
+    out = capsys.readouterr().out
+    if as_json:
+        result = json.loads(out)
+        assert result["files_applied"] is None
+        assert result["task"]["agent_task_id"] == FOLDER_TASK
+    else:
+        assert out == ""
+
+
+@pytest.mark.parametrize("json_flag", [False, True], ids=["text", "json"])
+def test_files_under_project_dir_go_up_alone_at_their_paths(json_flag, tmp_path, api_server, caplog, capsys):
+    caplog.set_level(logging.INFO)
+    rtl = _rtl(tmp_path)
+    # The project, its check that it is idle, the follow-up, answered as for no folder, and with --json its refresh.
+    requests = api_server(_folder_project(), _folder_project(), _follow_up(None), _folder_project())
+    flags = ["--json"] if json_flag else []
+
+    assert (
+        _continue("Use these", "--project-dir", str(rtl), "--files", str(rtl / "reports" / "timing.rpt"), *flags) == 0
+    )
+
+    sent = [(name, filename) for name, filename, _, _ in multipart_parts(requests[2])]
+    assert sent == [("prompt", None), ("agent_questions_setting", None), ("files", "reports/timing.rpt")]
+    assert "Uploaded 1 file (11 bytes) with the prompt:\n  reports/timing.rpt" in caplog.messages
+    assert not [message for message in caplog.messages if message.startswith("Aristotle applied")]
+    out = capsys.readouterr().out
+    assert (json.loads(out)["files_applied"] if json_flag else out) == (None if json_flag else "")
+
+
+@pytest.mark.parametrize("files", [[], ["--files"]], ids=["no --files", "empty --files"])
+@pytest.mark.parametrize("status", [ProjectStatus.IDLE, ProjectStatus.RUNNING], ids=["idle", "running"])
+def test_without_send_folder_project_dir_is_only_a_root_and_the_prompt_goes_alone(status, files, tmp_path, api_server):
+    rtl = _rtl(tmp_path)
+    # The project, the follow-up, and for a running task the listing of its questions.
+    unlisted = httpx.Response(404, json={"detail": "Not Found"})
+    requests = api_server(_folder_project(status), _follow_up(None), unlisted)
+
+    assert _continue("Use these", "--project-dir", str(rtl), *files) == 0
+
+    assert [request.method for request in requests][:2] == ["GET", "POST"]
+    assert not [part for part in multipart_parts(requests[1]) if part[0] in ("files", "archive")]
+
+
+@pytest.mark.parametrize("include_ignored", [False, True], ids=["default", "--include-ignored"])
+def test_a_dry_run_lists_the_folder_says_each_file_replaces_the_projects_and_needs_no_key(
+    include_ignored, tmp_path, api_server, monkeypatch, caplog, capsys
+):
+    caplog.set_level(logging.INFO)
+    rtl = _rtl(tmp_path)
+    requests = api_server()
+    monkeypatch.setattr(api_request, "API_KEY", None)
+    monkeypatch.delenv("ARISTOTLE_API_KEY", raising=False)
+    monkeypatch.setattr("aristotlelib.cli.api_action.get_api_key", Mock(side_effect=AssertionError("no key needed")))
+    flags = ["--include-ignored"] if include_ignored else []
+
+    assert _continue("Use the new reports", "--project-dir", str(rtl), "--send-folder", *flags, "--dry-run") == 0
+
+    assert requests == []
+    listing = (
+        [
+            "The folder's 4 files that go up:\n  .gitignore\n  build.log  (--include-ignored)\n  fifo.v\n  reports/timing.rpt"
+        ]
+        if include_ignored
+        else [
+            "The folder's 3 files that go up:\n  .gitignore\n  fifo.v\n  reports/timing.rpt",
+            "Left out, since an ignore rule matches it:\n  build.log",
+        ]
+    )
+    assert caplog.messages[-len(listing) - 3 : -1] == [
+        *listing,
+        "Each file that goes up replaces the project's file at the same path, even one Aristotle has edited since, or "
+        "is added; the project's other files stay.",
+        "The prompt, as it would be sent:\n  Use the new reports",
+    ]
+    counts = "1 of them matches an ignore rule" if include_ignored else "1 left out because it matches an ignore rule"
+    assert re.fullmatch(
+        rf"Dry run: would upload {4 if include_ignored else 3} files \(\d+ bytes\); {counts}\.", caplog.messages[-1]
+    )
+    assert capsys.readouterr().out == ""
+
+
+def test_a_dry_run_with_json_prints_what_would_go_up(tmp_path, api_server, capsys):
+    rtl = _rtl(tmp_path)
+    requests = api_server()
+
+    assert _continue("Use the new reports", "--project-dir", str(rtl), "--send-folder", "--dry-run", "--json") == 0
+
+    assert requests == []
+    result = json.loads(capsys.readouterr().out)
+    assert {key: value for key, value in result.items() if key != "size_bytes"} == {
+        "files": 3,
+        "paths": [".gitignore", "fifo.v", "reports/timing.rpt"],
+        "left_out": ["build.log"],
+        "prompt": "Use the new reports",
+        "block": None,
+    }
+    assert result["size_bytes"] > 0
+
+
+@pytest.mark.parametrize("dry_run", [False, True], ids=["continue", "--dry-run"])
+def test_a_folder_over_the_upload_limit_exits_2_with_nothing_sent(dry_run, tmp_path, api_server, monkeypatch, caplog):
+    monkeypatch.setattr(local_file_utils, "MAX_FILE_SIZE_BYTES", 1024 * 1024)
+    big = tmp_path / "big"
+    big.mkdir()
+    (big / "trace.vcd").write_bytes(os.urandom(2 * 1024 * 1024))
+    requests = api_server(_folder_project())
+
+    assert (
+        _continue("Use the trace", "--project-dir", str(big), "--send-folder", *(["--dry-run"] if dry_run else [])) == 2
+    )
+
+    # Only the project's lookup, before the folder is read.
+    assert [request.method for request in requests] == ([] if dry_run else ["GET"])
+    assert caplog.messages[-1] == (
+        "The upload is 2.0 MB compressed, over the 1 MB limit. Exclude large files with .gitignore or submit a "
+        "smaller folder."
+    )
+    assert not [message for message in caplog.messages if message.startswith("Uploading")]
+
+
+@pytest.mark.parametrize("dry_run", [False, True], ids=["continue", "--dry-run"])
+@pytest.mark.parametrize(
+    ("aristotle_f", "sources"),
+    [
+        (b"fifo.v\n", "its .v and .sv files"),
+        (
+            b"--top fifo\n--blackbox sram\nfifo.v\nvendor/sram.v\n",
+            "its .v and .sv files that its black boxes don't leave out",
+        ),
+    ],
+    ids=["plain", "black-boxed"],
+)
+def test_a_folder_whose_verilog_an_ignore_rule_leaves_out_suggests_only_include_ignored(
+    aristotle_f, sources, dry_run, tmp_path, api_server, caplog
+):
+    rtl = tmp_path / "rtl"
+    (rtl / "vendor").mkdir(parents=True)
+    (rtl / ".gitignore").write_bytes(b"fifo.v\n")
+    (rtl / "fifo.v").write_bytes(b"module fifo; sram u(); endmodule\n")
+    (rtl / "vendor" / "sram.v").write_bytes(b"module sram; endmodule\n")
+    (rtl / "aristotle.f").write_bytes(aristotle_f)
+    if b"--blackbox" not in aristotle_f:
+        (rtl / ".gitignore").write_bytes(b"*.v\n")
+    requests = api_server(_folder_project())
+
+    assert (
+        _continue(
+            "Use the new sources", "--project-dir", str(rtl), "--send-folder", *(["--dry-run"] if dry_run else [])
+        )
+        == 2
+    )
+
+    assert [request.method for request in requests] == ([] if dry_run else ["GET"])
+    ignored = "  fifo.v\n" if b"--blackbox" in aristotle_f else "  fifo.v\n  vendor/sram.v\n"
+    assert caplog.messages[-1] == (
+        f"No Verilog source would go up from {rtl}: an ignore rule matches each of {sources}:\n"
+        f"{ignored}"
+        "No .c or .rs file would go up either, so none of the project's sources would be replaced. To upload "
+        "them, pass --include-ignored (from Python, the include_ignored argument), which uploads the files ignore "
+        "rules keep out."
+    )
+
+
+FILELIST_NOTE = (
+    "aristotle.f goes up as written, in place of the project's, even one submit generated: a follow-up takes only its "
+    "black boxes from it, so a file it names goes up only from inside the folder, and if an ignore rule matches it, only "
+    "with --include-ignored (from Python, the include_ignored argument)."
+)
+
+
+def _block_folder(tmp_path: Path) -> Path:
+    """A folder whose aristotle.f names top.v beside it, gen/fifo_gen.v, which an ignore rule matches, and ip/core.v
+    outside it."""
+    rtl = tmp_path / "rtl"
+    (rtl / "gen").mkdir(parents=True)
+    (tmp_path / "ip").mkdir()
+    (tmp_path / "ip" / "core.v").write_bytes(b"module core; endmodule\n")
+    (rtl / "top.v").write_bytes(b"module top; core u(); fifo_gen f(); endmodule\n")
+    (rtl / "gen" / "fifo_gen.v").write_bytes(b"module fifo_gen; endmodule\n")
+    (rtl / ".gitignore").write_bytes(b"gen/\n")
+    (rtl / "aristotle.f").write_bytes(b"--top top\ntop.v\ngen/fifo_gen.v\n../ip/core.v\n")
+    return rtl
+
+
+def test_an_aristotle_f_goes_up_as_written_and_names_nothing_more(tmp_path, api_server, caplog):
+    caplog.set_level(logging.INFO)
+    rtl = _block_folder(tmp_path)
+    requests = api_server(_folder_project(), _folder_project(), _follow_up("3"))
+
+    assert _continue("Use the new sources", "--project-dir", str(rtl), "--send-folder") == 0
+
+    assert _archive_in(requests[2]) == {
+        ".gitignore": b"gen/\n",
+        "aristotle.f": b"--top top\ntop.v\ngen/fifo_gen.v\n../ip/core.v\n",
+        "top.v": ANY,
+    }
+    uploading = caplog.messages.index("Uploading 3 files; 1 left out because it matches an ignore rule.")
+    assert caplog.messages[uploading + 1] == FILELIST_NOTE
+
+
+@pytest.mark.parametrize("dry_run", [False, True], ids=["continue", "--dry-run"])
+def test_an_aristotle_f_an_ignore_rule_keeps_out_gets_no_note(dry_run, tmp_path, api_server, caplog):
+    caplog.set_level(logging.INFO)
+    rtl = _block_folder(tmp_path)
+    (rtl / ".gitignore").write_bytes(b"gen/\naristotle.f\n")
+    requests = api_server(_folder_project(), _folder_project(), _follow_up("2"))
+
+    assert (
+        _continue(
+            "Use the new sources", "--project-dir", str(rtl), "--send-folder", *(["--dry-run"] if dry_run else [])
+        )
+        == 0
+    )
+
+    if not dry_run:
+        assert sorted(_archive_in(requests[2])) == [".gitignore", "top.v"]
+    assert not [message for message in caplog.messages if "aristotle.f goes up" in message]
+
+
+def test_a_dry_run_of_a_folder_with_an_aristotle_f_says_what_becomes_of_it(tmp_path, api_server, caplog):
+    caplog.set_level(logging.INFO)
+    rtl = _block_folder(tmp_path)
+    requests = api_server()
+
+    assert _continue("Use the new sources", "--project-dir", str(rtl), "--send-folder", "--dry-run") == 0
+
+    assert requests == []
+    assert caplog.messages[-5:-2] == [
+        "The folder's 3 files that go up:\n  .gitignore\n  aristotle.f\n  top.v",
+        "Left out, since an ignore rule matches it:\n  gen/fifo_gen.v",
+        "Each file that goes up replaces the project's file at the same path, even one Aristotle has edited since, or "
+        f"is added; the project's other files stay.\n{FILELIST_NOTE}",
+    ]
+
+
+def _soc(tmp_path: Path) -> Path:
+    """docs/verilog.md's black-box example: soc/aristotle.f black-boxes sram_1p, which vendor/sram_1p.v alone declares,
+    beside the design under rtl/."""
+    soc = tmp_path / "soc"
+    (soc / "rtl").mkdir(parents=True)
+    (soc / "vendor").mkdir()
+    (soc / "rtl" / "soc_top.v").write_bytes(
+        b"module soc_top(input clk, output q);\n  sram_1p u(.clk(clk), .q(q));\nendmodule\n"
+    )
+    (soc / "rtl" / "soc.f").write_bytes(b"soc_top.v\n")
+    (soc / "vendor" / "sram_1p.v").write_bytes(b"module sram_1p(input clk, output q);\n  assign q = clk;\nendmodule\n")
+    (soc / "aristotle.f").write_bytes(b"--top soc_top\n--blackbox sram_1p\n-F rtl/soc.f\nvendor/sram_1p.v\n")
+    (soc / "README.md").write_bytes(b"notes\n")
+    return soc
+
+
+SOC_BLACKBOXES = (
+    "Black boxes, which aristotle.f names, and the files left out for them:\n"
+    f"  sram_1p ({os.path.join('soc', 'aristotle.f')}:2): {os.path.join('soc', 'vendor', 'sram_1p.v')}"
+)
+
+
+def test_a_model_the_folders_aristotle_f_black_boxes_stays_out_as_it_does_of_submit(
+    tmp_path, api_server, monkeypatch, caplog
+):
+    caplog.set_level(logging.INFO)
+    soc = _soc(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    requests = api_server(_folder_project(), _folder_project(), _folder_project(), _follow_up("4"))
+
+    with patch("sys.argv", ["aristotle", "submit", "Prove it", "--project-dir", "soc"]):
+        assert main() == 0
+    assert _continue("Use the new sources", "--project-dir", "soc", "--send-folder") == 0
+
+    submitted, sent = _archive_in(requests[0], field="input"), _archive_in(requests[3])
+    assert sorted(sent) == sorted(submitted) == ["README.md", "aristotle.f", "rtl/soc.f", "rtl/soc_top.v"]
+    # submit sends the aristotle.f it generates; continue, the one in the folder.
+    assert sent | {"aristotle.f": None} == submitted | {"aristotle.f": None}
+    assert sent["aristotle.f"] == (soc / "aristotle.f").read_bytes()
+    assert caplog.messages.count(SOC_BLACKBOXES) == 1
+
+
+@pytest.mark.parametrize(
+    ("change", "flags", "withheld"),
+    [
+        pytest.param(
+            {"rtl/sram_copy.v": b"module sram_1p(input clk, output q);\nendmodule\n"},
+            [],
+            ["rtl/sram_copy.v", "vendor/sram_1p.v"],
+            id="an unnamed file declaring only the black box",
+        ),
+        pytest.param(
+            {
+                "aristotle.f": b"--top soc_top\n-F rtl/soc.f\nvendor/sram_1p.v\n",
+                "rtl/soc.f": b"--blackbox sram_1p\nsoc_top.v\n",
+            },
+            [],
+            ["vendor/sram_1p.v"],
+            id="a black box a nested filelist names",
+        ),
+        pytest.param(
+            {".gitignore": b"gen/\n", "gen/sram_gen.v": b"module sram_1p(input clk, output q);\nendmodule\n"},
+            ["--include-ignored"],
+            ["gen/sram_gen.v", "vendor/sram_1p.v"],
+            id="an ignored copy, with --include-ignored",
+        ),
+    ],
+)
+def test_continue_withholds_what_submit_withholds_for_a_black_box(
+    change, flags, withheld, tmp_path, api_server, monkeypatch
+):
+    soc = _soc(tmp_path)
+    for name, content in change.items():
+        (soc / name).parent.mkdir(parents=True, exist_ok=True)
+        (soc / name).write_bytes(content)
+    monkeypatch.chdir(tmp_path)
+    requests = api_server(_folder_project(), _folder_project(), _folder_project(), _follow_up("1"))
+
+    with patch("sys.argv", ["aristotle", "submit", "Prove it", "--project-dir", "soc", *flags]):
+        assert main() == 0
+    assert _continue("Use the new sources", "--project-dir", "soc", "--send-folder", *flags) == 0
+
+    submitted, sent = set(_archive_in(requests[0], field="input")), set(_archive_in(requests[3]))
+    files = {p.relative_to(soc).as_posix() for p in soc.rglob("*") if p.is_file()}
+    assert sorted(files - submitted - {".gitignore"}) == sorted(files - sent - {".gitignore"}) == withheld
+
+
+def test_a_dry_run_lists_what_the_folders_black_boxes_leave_out(tmp_path, api_server, monkeypatch, caplog):
+    caplog.set_level(logging.INFO)
+    _soc(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    requests = api_server()
+
+    assert _continue("Use the new sources", "--project-dir", "soc", "--send-folder", "--dry-run") == 0
+
+    assert requests == []
+    listed = caplog.messages.index(SOC_BLACKBOXES)
+    assert caplog.messages[listed + 1] == (
+        "The folder's 4 files that go up:\n  README.md\n  aristotle.f\n  rtl/soc.f\n  rtl/soc_top.v"
+    )
+
+
+@pytest.mark.parametrize("dry_run", [False, True], ids=["continue", "--dry-run"])
+@pytest.mark.parametrize(
+    ("change", "error"),
+    [
+        pytest.param(
+            {"aristotle.f": b"--top soc_top\n--blackbox sram_1p\n-F rtl/missing.f\n"},
+            f"{os.path.join('soc', 'aristotle.f')}:3: {os.path.join('soc', 'rtl', 'missing.f')}: no such file",
+            id="unreadable aristotle.f",
+        ),
+        pytest.param(
+            {"rtl/both.v": b"module sram_1p; endmodule\nmodule helper; endmodule\n"},
+            None,
+            id="a black box beside another module",
+        ),
+    ],
+)
+def test_a_black_box_submit_would_refuse_stops_continue_with_its_message(
+    change, error, dry_run, tmp_path, api_server, monkeypatch, caplog
+):
+    soc = _soc(tmp_path)
+    for name, content in change.items():
+        (soc / name).write_bytes(content)
+    monkeypatch.chdir(tmp_path)
+    requests = api_server(_folder_project())
+
+    with patch("sys.argv", ["aristotle", "submit", "Prove it", "--project-dir", "soc", "--dry-run"]):
+        assert main() == 2
+    refused = caplog.messages[-1]
+    assert (
+        _continue("Use the new sources", "--project-dir", "soc", "--send-folder", *(["--dry-run"] if dry_run else []))
+        == 2
+    )
+
+    # Only the project's lookup: nothing went up.
+    assert [request.method for request in requests] == ([] if dry_run else ["GET"])
+    assert caplog.messages[-1] == refused
+    if error is not None:
+        assert refused == error
+
+
+@pytest.mark.parametrize("dry_run", [False, True], ids=["continue", "--dry-run"])
+def test_a_folder_file_that_cant_be_read_exits_3_with_nothing_sent(dry_run, tmp_path, api_server, caplog):
+    rtl = _rtl(tmp_path)
+    gone = FileNotFoundError(2, "No such file or directory", str(rtl / "fifo.v"))
+    requests = api_server(_folder_project())
+
+    with patch("aristotlelib.project._build_archive", side_effect=gone):
+        code = _continue(
+            "Use the new reports", "--project-dir", str(rtl), "--send-folder", *(["--dry-run"] if dry_run else [])
+        )
+
+    assert code == 3
+    # Only the project's lookup: the folder is archived before Project.ask's own request.
+    assert [request.method for request in requests] == ([] if dry_run else ["GET"])
+    assert caplog.messages[-1] == f"Could not archive {rtl / 'fifo.v'}: No such file or directory. Try again."
+
+
+@pytest.mark.parametrize(
+    ("answer", "code", "error"),
+    [
+        pytest.param(
+            httpx.Response(422, json={"detail": "File must be a valid gzipped tar file (.tar.gz)"}),
+            2,
+            "API request failed with status 422: File must be a valid gzipped tar file (.tar.gz)",
+            id="not gzip",
+        ),
+        pytest.param(
+            httpx.Response(422, json={"detail": "The upload is not a readable tar archive."}),
+            2,
+            "API request failed with status 422: The upload is not a readable tar archive.",
+            id="unreadable tar",
+        ),
+        pytest.param(
+            httpx.Response(400, json={"detail": "Cannot add files to a running project"}),
+            2,
+            "API request failed with status 400: Cannot add files to a running project",
+            id="running since the check",
+        ),
+        pytest.param(
+            httpx.Response(400, json={"detail": "Too many files. Maximum number of files is 10, plus one archive."}),
+            2,
+            "API request failed with status 400: Too many files. Maximum number of files is 10, plus one archive.",
+            id="too many files",
+        ),
+        pytest.param(
+            httpx.Response(500, json={"detail": "Internal Server Error"}),
+            7,
+            f"POST /project/{FOLDER_PROJECT}/ask: API request failed with status 500: Internal Server Error. Aristotle "
+            "may have acted on it, so it was not sent again. If it did, the prompt was sent, though its task may take a "
+            f"few minutes to show up: check `aristotle tasks {FOLDER_PROJECT}` before sending it again.",
+            id="truncated gzip",
+        ),
+    ],
+)
+def test_a_folder_the_server_refuses_exits_as_any_refused_follow_up(answer, code, error, tmp_path, api_server, caplog):
+    rtl = _rtl(tmp_path)
+    requests = api_server(_folder_project(), _folder_project(), answer)
+
+    assert _continue("Use the new reports", "--project-dir", str(rtl), "--send-folder") == code
+
+    assert [request.method for request in requests] == ["GET", "GET", "POST"]
+    assert caplog.messages[-1] == error
+    assert not [message for message in caplog.messages if message.startswith(("Prompt submitted", "Aristotle applied"))]
+
+
+@pytest.mark.parametrize("flags", [["--json"], ["--non-interactive"], []], ids=["--json", "--non-interactive", "text"])
+def test_a_folder_refused_for_too_many_runs_exits_6_and_says_the_prompt_was_not_sent(
+    flags, tmp_path, api_server, caplog, capsys
+):
+    rtl = _rtl(tmp_path)
+    refused = httpx.Response(429, json={"detail": "Too many inflight requests. Please wait for them to finish."})
+    requests = api_server(_folder_project(), _folder_project(), refused)
+
+    assert _continue("Use the new reports", "--project-dir", str(rtl), "--send-folder", *flags) == 6
+
+    assert [request.method for request in requests] == ["GET", "GET", "POST"]
+    assert set(_archive_in(requests[2])) == {".gitignore", "fifo.v", "reports/timing.rpt"}
+    error = f"{api_request.PROJECT_LIMIT_FALLBACK} The prompt was not sent, so it is safe to send it again."
+    assert caplog.messages[-1] == error
+    out = capsys.readouterr().out
+    assert (json.loads(out) if flags else out) == ({"outcome": "not_processed", "error": error} if flags else "")
+
+
+@pytest.mark.parametrize(
+    ("argv", "error"),
+    [
+        (["--send-folder"], "--send-folder needs --project-dir, the folder to send."),
+        (
+            ["--project-dir", "{rtl}", "--send-folder", "--files", "{file}"],
+            "--send-folder sends the whole folder, so it takes no --files.",
+        ),
+        (
+            ["--project-dir", "{rtl}", "--send-folder", "--files"],
+            "--send-folder sends the whole folder, so it takes no --files.",
+        ),
+        (
+            ["--project-dir", "{rtl}", "--include-ignored"],
+            "--include-ignored needs --send-folder, which sends the folder whose ignored files it uploads.",
+        ),
+        (
+            ["--project-dir", "{rtl}", "--files", "{file}", "--include-ignored"],
+            "--include-ignored needs --send-folder, which sends the folder whose ignored files it uploads.",
+        ),
+        (
+            ["--project-dir", "{rtl}", "--dry-run"],
+            "--dry-run needs --send-folder, which sends the folder whose files it lists.",
+        ),
+        (
+            ["--project-dir", "{rtl}", "--send-folder", "--dry-run", "--wait"],
+            "--dry-run sends nothing, so there is nothing to wait for.",
+        ),
+        (
+            ["--project-dir", "{rtl}", "--send-folder", "--dry-run", "--non-interactive"],
+            "--dry-run sends nothing, so there is nothing to wait for.",
+        ),
+        (["--project-dir", "{file}", "--send-folder"], "--project-dir must be a valid directory: {file}"),
+        (["--project-dir", "{missing}", "--send-folder"], "--project-dir must be a valid directory: {missing}"),
+        (
+            ["--project-dir", "", "--send-folder"],
+            "--project-dir: Project directory cannot be empty; use . for the current directory",
+        ),
+    ],
+)
+def test_a_folder_option_misused_is_a_usage_error_before_any_request(argv, error, tmp_path, api_server, capsys):
+    rtl = _rtl(tmp_path)
+    notes = tmp_path / "notes.md"
+    notes.write_bytes(b"# Notes\n")
+    paths = {"rtl": rtl, "notes": notes, "file": rtl / "fifo.v", "missing": rtl / "missing"}
+    requests = api_server()
+
+    with pytest.raises(SystemExit) as exited:
+        _continue("Use the new reports", *[arg.format(**paths) for arg in argv])
+
+    assert exited.value.code == 2
+    assert requests == []
+    assert capsys.readouterr().err.endswith(f"error: {error.format(**paths)}\n")
+
+
+@pytest.mark.parametrize(
+    ("argv", "named"),
+    [
+        (["--project-dir", "{rtl}", "--send-folder"], "--send-folder"),
+        (["--files", "{notes}", "--project-dir", "{rtl}"], "--files"),
+        (["--files", "{notes}"], "--files"),
+    ],
+    ids=["folder", "files under the folder", "files under the current folder"],
+)
+def test_a_folder_for_a_running_project_is_refused_before_the_upload(
+    argv, named, tmp_path, api_server, monkeypatch, capsys
+):
+    rtl = _rtl(tmp_path)
+    monkeypatch.chdir(rtl)
+    notes = rtl / "notes.md"
+    notes.write_bytes(b"# Notes\n")
+    requests = api_server(_folder_project(ProjectStatus.RUNNING))
+
+    with pytest.raises(SystemExit) as exited:
+        _continue("Use the new reports", *[arg.format(rtl=rtl, notes=notes) for arg in argv])
+
+    assert exited.value.code == 2
+    assert [request.method for request in requests] == ["GET"]
+    assert capsys.readouterr().err.endswith(
+        f"error: Files can't be added to project {FOLDER_PROJECT} while it runs a task. Send the prompt without "
+        f"{named} to reach that task: its agent reads it right away. Or wait for the task to finish (`aristotle show "
+        f"{FOLDER_PROJECT} --wait`), then send the prompt with {named}. Cancelling the task first would lose the "
+        "prompts it was given, except the project's first.\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("argv", "named"),
+    [
+        (["--project-dir", "{rtl}", "--send-folder"], "--send-folder"),
+        (["--files", "{notes}", "--project-dir", "{rtl}"], "--files"),
+    ],
+    ids=["folder", "files under the folder"],
+)
+def test_a_task_started_while_the_folder_is_archived_is_refused_with_nothing_sent(
+    argv, named, tmp_path, api_server, capsys
+):
+    rtl = _rtl(tmp_path)
+    notes = rtl / "notes.md"
+    notes.write_bytes(b"# Notes\n")
+    # Idle at the command's check, running at the follow-up's own.
+    requests = api_server(_folder_project(), _folder_project(ProjectStatus.RUNNING))
+
+    with pytest.raises(SystemExit) as exited:
+        _continue("Use the new reports", *[arg.format(rtl=rtl, notes=notes) for arg in argv])
+
+    assert exited.value.code == 2
+    assert [request.method for request in requests] == ["GET", "GET"]
+    assert capsys.readouterr().err.endswith(
+        f"error: Files can't be added to project {FOLDER_PROJECT} while it runs a task. Send the prompt without "
+        f"{named} to reach that task: its agent reads it right away. Or wait for the task to finish (`aristotle show "
+        f"{FOLDER_PROJECT} --wait`), then send the prompt with {named}. Cancelling the task first would lose the "
+        "prompts it was given, except the project's first.\n"
+    )
+
+
+def test_a_reply_that_cant_be_read_after_a_folder_went_up_is_no_usage_error(tmp_path, api_server, capsys):
+    rtl = _rtl(tmp_path)
+    unreadable = httpx.Response(200, content=b"not JSON", headers={"content-type": "application/json"})
+    requests = api_server(_folder_project(), _folder_project(), unreadable)
+
+    assert _continue("Use the new reports", "--project-dir", str(rtl), "--send-folder") == 3
+
+    assert [request.method for request in requests] == ["GET", "GET", "POST"]
+    assert "JSONDecodeError" in capsys.readouterr().err
+
+
+def test_a_folder_with_nothing_to_upload_exits_2_with_nothing_sent(tmp_path, api_server, caplog):
+    (tmp_path / "empty").mkdir()
+    requests = api_server(_folder_project())
+
+    assert _continue("Use it", "--project-dir", str(tmp_path / "empty"), "--send-folder") == 2
+
+    assert [request.method for request in requests] == ["GET"]
+    assert caplog.messages[-1] == f"Nothing to upload: {tmp_path / 'empty'} is empty."

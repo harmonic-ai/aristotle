@@ -4,6 +4,68 @@ All notable changes to `aristotlelib`, the Aristotle Python SDK and `aristotle` 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.2.0] - 2026-10-31
+
+### Added
+
+- `continue --send-folder` sends the `--project-dir` folder again with the prompt, to an idle project. It picks the
+  folder's files as `submit --project-dir` does, `--include-ignored` included, so the files the black boxes of the
+  folder's `aristotle.f` leave out stay out. Nothing else of that `aristotle.f` applies: it and the files it names go up
+  only as the folder's other files do, so an ignore rule keeps them out without `--include-ignored`, and it goes up as
+  written, in place of the project's, even one `submit` generated, which `continue` notes. Each file replaces the
+  project's file at the same path, even one Aristotle has edited since, or is added; the project's other files stay, and
+  nothing is deleted. `--dry-run` lists the folder's files that would go up and sends nothing. Once the prompt is sent,
+  `continue` says how many of the folder's files Aristotle applied, and `continue --json` gives that count as
+  `files_applied` (`null` unless a folder went up). It needs a server that takes a folder with a follow-up: an older one
+  starts the task without the folder, and `continue` then names that task, prints the command that cancels it and exits
+  3, without waiting. Without `--send-folder`, `continue` works as before, and `--project-dir` is only the root of
+  `--files`' paths. In the SDK, `Project.ask(send_folder=True)` sends `project_dir` as a folder, with `include_ignored`
+  and the folder's `block`, of which only the black boxes apply; the task it returns has `files_applied`, and on such a
+  server it raises `FolderNotAppliedError`, which holds the task. (#311)
+- `aristotle submit` with no `--project-dir`, `-f` or `-F` warns on stderr that only the prompt goes up, and shows how
+  to submit the folder that holds the code. Unless the prompt includes the code itself or asks Aristotle to design new
+  hardware, such a run verifies nothing. The run still starts, and `--json` output on stdout is unchanged. (#356)
+
+### Changed
+
+- Aristotle doesn't verify Lean, and the CLI no longer treats Lean as code to verify (#356):
+  - `submit` and `continue --send-folder` exit 2 before uploading when ignore rules leave out every Verilog source and
+    only `.lean` files would go up besides, as they already did when nothing else would go up. `--dry-run` stops the
+    same way. In the SDK, `Project.create_from_directory()` and `Project.ask(send_folder=True)` raise
+    `LeanProjectError` there.
+  - `aristotle review` and `aristotle ci` no longer count `.lean` files as source files. `--scope changed` leaves out
+    a changed `.lean` file, and a change to one of Lean's build files no longer brings the Lean files under it into
+    scope. `aristotle review --scope all` on a checkout whose only sources are Lean files now stops, finding no source
+    file, and so does a `--path` glob, or `ARISTOTLE_PATHS`, that matches only `.lean` files, matching no tracked
+    source file.
+  - `submit` and `Project.create_from_directory()` warn once, when a `.lean` file other than Lean's build files goes up,
+    that Aristotle doesn't verify it, in place of the advice to match Aristotle's Lean toolchain and run `lake build`,
+    and `submit` no longer asks Aristotle for its toolchain first.
+- `submit --help`, the README, the skill and the agent setup guide say what to send: the code as it is, in Verilog, C,
+  or Rust where the account has it, never Lean or a translation of it, and not pure mathematics. The README also says
+  which of the MCP server, the CLI and the web app fits where, and what Aristotle's questions are about. The README,
+  the skill and `continue --help` say that a `continue` on a finished project starts a new run that spends credits.
+  (#356)
+- Agents that copy the skill, such as Cursor, get the newest 3.x release's skill, to go with the newest 3.x CLI that
+  `docs/agent-setup.md` installs. The guide clones the `v3` tag, which each release moves, where it named one release
+  and fell behind the CLI at the next. (#354)
+- A refusal for credits names the organization that needs them, with the billing link Aristotle gives for it, when
+  Aristotle's answer includes them: `An admin of Acme Robotics can buy credits at <link>`, or for a personal
+  organization `You can buy credits for your personal organization at <link>`. Someone in several organizations then
+  knows which one to buy credits for. Answers without them keep the earlier text, which links the billing page of the
+  organization the web app has open. (#355)
+
+### Deprecated
+
+- `aristotlelib.local_file_utils.get_lean_toolchain_version()` and `get_expected_toolchain()` warn with a
+  `DeprecationWarning`, and will be removed in 4.0. The CLI and the library no longer call them, since Aristotle
+  doesn't verify Lean. (#356)
+
+### Fixed
+
+- `continue --files` exits 2 with the refusal it gives a running project when the project starts a run between the
+  command's check and the upload. It printed a Python traceback and exited 3. (#311)
+
 ## [3.1.0] - 2026-10-29
 
 ### Added

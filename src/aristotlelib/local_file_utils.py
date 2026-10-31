@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import warnings
 from pathlib import Path, PurePath
 from typing import Any, BinaryIO
 
@@ -947,9 +948,15 @@ def upload_too_large(size: int) -> str | None:
     return f"The upload is {size / mb:.1f} MB compressed, over the {MAX_FILE_SIZE_BYTES // mb} MB limit."
 
 
+_TOOLCHAIN_DEPRECATED = (
+    "{} is deprecated and will be removed in 4.0: Aristotle doesn't verify Lean, and the CLI no longer reads the "
+    "Lean toolchain."
+)
+
+
 def get_lean_toolchain_version(project_dir: Path) -> str | None:
     """
-    Get the lean-toolchain version from the project.
+    Get the lean-toolchain version from the project. Deprecated, and removed in 4.0.
 
     Looks for the outermost lean-toolchain file (starting from the top level directory).
 
@@ -959,6 +966,7 @@ def get_lean_toolchain_version(project_dir: Path) -> str | None:
     Returns:
         The toolchain version string if found, None otherwise
     """
+    warnings.warn(_TOOLCHAIN_DEPRECATED.format("get_lean_toolchain_version()"), DeprecationWarning, stacklevel=2)
     toolchain_path = project_dir / "lean-toolchain"
     # os.path, not pathlib: before 3.14, Path.is_file() raises for a path out of reach.
     if os.path.isfile(toolchain_path):
@@ -994,11 +1002,12 @@ def has_any_lean_files(project_dir: Path) -> bool:
 
 async def get_expected_toolchain() -> str | None:
     """
-    Get the expected toolchain version from the Aristotle API.
+    Get the expected toolchain version from the Aristotle API. Deprecated, and removed in 4.0.
 
     Returns:
         The expected toolchain version string if available, None otherwise
     """
+    warnings.warn(_TOOLCHAIN_DEPRECATED.format("get_expected_toolchain()"), DeprecationWarning, stacklevel=2)
     try:
         async with api_request.AristotleRequestClient() as client:
             response = await client.get("/version")

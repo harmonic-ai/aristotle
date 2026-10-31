@@ -95,6 +95,20 @@ def billing_url() -> str:
     return f"{get_web_url()}/settings/billing"
 
 
+def _credits_pointer(refusal: dict[str, Any]) -> str:
+    """Where to buy credits: the refused organization's page if the answer gives one on this web address, else the web
+    app's open organization's."""
+    page = refusal.get("billing_url")
+    if not isinstance(page, str) or not page.startswith(f"{billing_url()}?"):
+        return f"An organization admin can buy credits at {billing_url()}."
+    if refusal.get("organization_kind") == "personal":
+        return f"You can buy credits for your personal organization at {page}."
+    name = refusal.get("organization_name")
+    if isinstance(name, str) and name.strip():
+        return f"An admin of {name.strip()} can buy credits at {page}."
+    return f"An organization admin can buy credits at {page}."
+
+
 def _later_event_id(current: str | None, candidate: str) -> str:
     """The later of two event ids, which the events stream sets to ISO creation times; an unparseable id wins."""
     if current is None:
@@ -801,10 +815,13 @@ def _status_error(error: httpx.HTTPStatusError, redact: Callable[[str], str] | N
     error_code = None
     # The message of a detail object, as billing's refusals carry with their code, worded for the user.
     worded = None
+    # The detail object itself, for the other fields a refusal carries.
+    refusal: dict[str, Any] = {}
     try:
         error_data = error.response.json()
         detail = error_data.get("detail")
         if isinstance(detail, dict):
+            refusal = detail
             message, error_code = detail.get("message"), detail.get("code")
             worded = message.strip() if isinstance(message, str) and message.strip() else None
             error_message = worded
@@ -838,10 +855,10 @@ def _status_error(error: httpx.HTTPStatusError, redact: Callable[[str], str] | N
     status = error.response.status_code
     code = error_code if isinstance(error_code, str) else None
     if status == 402:
-        refusal = worded or "Your organization needs credits to start a run."
-        stop = "" if refusal.endswith((".", "!", "?")) else "."
+        reason = worded or "Your organization needs credits to start a run."
+        stop = "" if reason.endswith((".", "!", "?")) else "."
         return AristotleAPIError(
-            f"{refusal}{stop} An organization admin can buy credits at {billing_url()}.",
+            f"{reason}{stop} {_credits_pointer(refusal)}",
             status_code=402,
             error_code=code,
         )

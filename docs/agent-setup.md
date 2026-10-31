@@ -1,8 +1,9 @@
 # Set up Aristotle for your user
 
-This guide is for a coding agent, such as Claude Code, Codex or Cursor, whose user asked it to set up Aristotle. Run
-each command yourself, except the steps marked **User step**, which only the user can do. Every command is safe to run
-again.
+This guide is for a coding agent, such as Claude Code, Codex or Cursor, whose user asked it to set up Aristotle. It
+sets up the CLI and the skill. To use Aristotle from a chat app such as claude.ai, or without a CLI, the user can add
+the hosted MCP server instead, as https://aristotle.harmonic.fun/docs/installation describes. Run each command
+yourself, except the steps marked **User step**, which only the user can do. Every command is safe to run again.
 
 At a User step, ask the user, then carry on with the next step, and list every User step still open in the report at
 the end. The steps marked **User step, then wait** are the exceptions, because the steps after them need what they set
@@ -78,10 +79,10 @@ Codex's sandbox blocks the network without asking, so `aristotle` retries and th
 `codex exec` also `sandbox_mode = "workspace-write"` at the top of that file, above the table.
 
 **Cursor, and other agents that read skills from `~/.agents/skills`,** need a copy of the skill's folder from the
-release:
+newest 3.x release:
 
 ```bash
-src=$(mktemp -d) && git clone --depth 1 --branch v3.1.0 https://github.com/harmonic-ai/aristotle.git "$src" &&
+src=$(mktemp -d) && git clone --depth 1 --branch v3 https://github.com/harmonic-ai/aristotle.git "$src" &&
   mkdir -p ~/.agents/skills && rm -rf ~/.agents/skills/aristotle &&
   cp -R "$src/skills/aristotle" ~/.agents/skills/
 ```
@@ -90,7 +91,7 @@ In PowerShell on Windows:
 
 ```powershell
 $src = Join-Path ([IO.Path]::GetTempPath()) ([IO.Path]::GetRandomFileName())
-git clone --depth 1 --branch v3.1.0 https://github.com/harmonic-ai/aristotle.git $src
+git clone --depth 1 --branch v3 https://github.com/harmonic-ai/aristotle.git $src
 if (Test-Path "$src\skills\aristotle") {
   New-Item -ItemType Directory -Force "$HOME\.agents\skills" | Out-Null
   Remove-Item -Recurse -Force "$HOME\.agents\skills\aristotle" -ErrorAction SilentlyContinue
@@ -98,8 +99,8 @@ if (Test-Path "$src\skills\aristotle") {
 }
 ```
 
-The copy matches the release those commands name. If `aristotle --version` prints an older version, update the CLI as
-for Claude Code above. An agent that keeps its skills somewhere else takes the same folder there.
+The copy's `SKILL.md` names the aristotlelib version it targets. If `aristotle --version` prints an older version,
+update the CLI as for Claude Code above. An agent that keeps its skills somewhere else takes the same folder there.
 
 ## 3. Check access, and log in
 
@@ -169,11 +170,13 @@ from the `ARISTOTLE_API_KEY` environment variable instead. If it isn't set there
 Print one line for each part. Follow every line that isn't ✓ with the next action:
 
 ```text
-✓ Aristotle CLI: aristotlelib 3.1.0
-✓ Aristotle skill: aristotle@harmonic 3.1.0
+✓ Aristotle CLI: aristotlelib <version>
+✓ Aristotle skill: aristotle@harmonic <version>
 ⚠ Not logged in: run `aristotle login` in a terminal
 ```
 
 ✓ means checked, ⚠ means the user has something to do, and ✗ means a step failed. List every User step that is still
 open, such as `/reload-plugins` or `uv tool update-shell`. Then tell the user what they can ask you for, such as "prove
-that this FIFO never overflows".
+that this FIFO never overflows". Aristotle verifies their Verilog and C as it is, and Rust too if their account has it,
+and writes the Lean itself. It doesn't verify pure mathematics or Lean: a project with only Lean files runs and verifies
+nothing. Runs cost money, so you'll confirm with them before starting one.

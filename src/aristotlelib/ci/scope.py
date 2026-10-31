@@ -3,7 +3,6 @@
 import dataclasses
 import logging
 import os
-import posixpath
 import re
 import shutil
 import stat
@@ -12,7 +11,7 @@ import sys
 import tempfile
 from collections.abc import Sequence
 from enum import Enum
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any
 
 from aristotlelib import local_file_utils, wildcard
@@ -31,7 +30,6 @@ SOURCE_EXTENSIONS = frozenset(
         ".c",
         ".h",
         ".rs",
-        ".lean",
     }
 )
 
@@ -70,7 +68,7 @@ GIT_MISSING = (
 
 class Scope(str, Enum):
     CHANGED = "changed"
-    """Source files touched by this change, and the Lean files under a Lean build file it touched."""
+    """Source files touched by this change."""
 
     PATHS = "paths"
     """An explicit list of path globs."""
@@ -465,9 +463,9 @@ def _push_base(root: Path, before: str) -> str | None:
     return before if present() else None
 
 
-def _changed_files(root: Path, base_ref: str | None, push_before: str | None = None) -> tuple[list[Path], list[Path]]:
-    """Files the change under test adds or modifies, and files it deletes, a rename being both; raises ScopeError if a
-    base branch has no merge base, or the commit before a push is neither in the checkout nor fetchable.
+def _changed_files(root: Path, base_ref: str | None, push_before: str | None = None) -> list[Path]:
+    """Files the change under test adds or modifies, a rename's new path included; raises ScopeError if a base branch
+    has no merge base, or the commit before a push is neither in the checkout nor fetchable.
 
     The base is the merge base with ``base_ref``, else ``push_before``, else, when neither is given, the parent commit.
     """
@@ -512,37 +510,7 @@ def _changed_files(root: Path, base_ref: str | None, push_before: str | None = N
         for status, path in zip(fields[::2], fields[1::2])
         if path and path.startswith(prefix)
     ]
-    entries += _build_files_above(root, diff_target)
-    return [p for status, p in entries if status != "D"], [p for status, p in entries if status == "D"]
-
-
-def _build_files_above(root: Path, diff_target: str) -> list[tuple[str, Path]]:
-    """The change's (status, path) entries for Lean's build files in the folders above ``root``, as ``../`` paths."""
-    prefix = _prefix(root).rstrip("/")
-    if not prefix:
-        return []
-    parts = PurePosixPath(prefix).parts
-    specs = [
-        f":(top,literal){PurePosixPath(*parts[:depth], name)}"
-        for depth in range(len(parts))
-        for name in sorted(local_file_utils.LEAN_BUILD_FILES)
-    ]
-    # diff.relative=false rather than --no-relative, which git before 2.28 rejects.
-    output = _run_git(
-        root,
-        "-c",
-        "diff.relative=false",
-        "diff",
-        "--name-status",
-        "-z",
-        "--no-renames",
-        diff_target,
-        "HEAD",
-        "--",
-        *specs,
-    )
-    fields = output.split("\0")
-    return [(status, Path(posixpath.relpath(path, prefix))) for status, path in zip(fields[::2], fields[1::2]) if path]
+    return [p for status, p in entries if status != "D"]
 
 
 def _glob(pattern: str) -> tuple[wildcard.Run | re.Pattern[str], ...]:
@@ -601,17 +569,8 @@ def _matching_files(candidates: list[Path], patterns: list[str]) -> list[Path]:
 
 
 def is_source_file(path: Path) -> bool:
-    """A file with one of SOURCE_EXTENSIONS, other than one of Lean's build files such as ``lakefile.lean``."""
-    return path.suffix.lower() in SOURCE_EXTENSIONS and path.name not in local_file_utils.LEAN_BUILD_FILES
-
-
-def _lean_files_built_by(changed: list[Path], source_files: list[Path]) -> list[Path]:
-    """The Lean files in the folder, or below it, of each of Lean's build files in ``changed``; one in a folder above
-    the root builds them all."""
-    folders = {p.parent for p in changed if p.name in local_file_utils.LEAN_BUILD_FILES}
-    if any(".." in folder.parts for folder in folders):
-        folders.add(Path("."))
-    return [p for p in source_files if p.suffix.lower() == ".lean" and not folders.isdisjoint(p.parents)]
+    """A file with one of SOURCE_EXTENSIONS."""
+    return path.suffix.lower() in SOURCE_EXTENSIONS
 
 
 def gated_languages(root: Path, paths: list[Path], taken: Sequence[Path] = ()) -> list[str]:
@@ -760,31 +719,17 @@ def resolve(
             if paths:
                 # Checked against the whole tree, not the diff: a glob that can never match would pass every build.
                 _require_matches(source_files, paths, extensions)
-            changed, deleted = _changed_files(root, base_ref, push_before)
+            changed = _changed_files(root, base_ref, push_before)
             tracked = set(source_files)
             focus_files = [p for p in changed if is_source_file(p) and p in tracked]
             left_out_names = set(left_out)
             not_utf8 = [p for p in changed if is_source_file(p) and p in left_out_names]
-            held_back_sources = [p for p in held_back if is_source_file(p)]
-            held_back_names = set(held_back_sources)
-            held_back_focus = sorted(
-                {p for p in changed if p in held_back_names}
-                | set(_lean_files_built_by(changed + deleted, held_back_sources))
-            )
-            in_focus = set(focus_files)
-            built = [p for p in _lean_files_built_by(changed + deleted, source_files) if p not in in_focus]
+            held_back_names = {p for p in held_back if is_source_file(p)}
+            held_back_focus = sorted(p for p in changed if p in held_back_names)
             if paths:
                 focus_files = _matching_files(focus_files, paths)
                 not_utf8 = _matching_files(not_utf8, paths)
                 held_back_focus = _matching_files(held_back_focus, paths)
-                built = _matching_files(built, paths)
-            if built:
-                build_files = [p.as_posix() for p in changed + deleted if p.name in local_file_utils.LEAN_BUILD_FILES]
-                folders = "its folder" if len(build_files) == 1 else "their folders"
-                logger.info(
-                    f"{', '.join(build_files)} changed, so the Lean files in {folders} and below are verified too."
-                )
-                focus_files += built
             return dataclasses.replace(
                 _result(root, upload_files, focus_files, held_back), not_utf8=not_utf8, held_back_focus=held_back_focus
             )

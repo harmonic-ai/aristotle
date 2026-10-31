@@ -10,8 +10,9 @@ import tarfile
 import tempfile
 from contextlib import nullcontext
 from pathlib import Path
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import Mock, patch
 
+import httpx
 import pytest
 
 from aristotlelib import local_file_utils
@@ -473,26 +474,24 @@ def test_upload_too_large_says_how_large_the_compressed_archive_is(size, message
     assert upload_too_large(size) == message
 
 
-def test_get_lean_toolchain_version_exists(tmp_path):
-    """Test getting lean-toolchain version when file exists at top level."""
-    (tmp_path / "lean-toolchain").write_text("leanprover/lean4:v4.24.0\n")
+def test_get_lean_toolchain_version_is_deprecated_and_still_reads_the_toolchain(tmp_path):
+    (tmp_path / "lean-toolchain").write_text("  leanprover/lean4:v4.24.0  \n")
 
-    result = get_lean_toolchain_version(tmp_path)
-    assert result == "leanprover/lean4:v4.24.0"
-
-
-def test_get_lean_toolchain_version_missing(tmp_path):
-    """Test getting lean-toolchain version when file doesn't exist."""
-    result = get_lean_toolchain_version(tmp_path)
-    assert result is None
+    with pytest.warns(
+        DeprecationWarning, match=r"get_lean_toolchain_version\(\) is deprecated and will be removed in 4\.0"
+    ):
+        assert get_lean_toolchain_version(tmp_path) == "leanprover/lean4:v4.24.0"
 
 
-def test_get_lean_toolchain_version_strips_whitespace(tmp_path):
-    """Test that lean-toolchain version is stripped of whitespace."""
-    (tmp_path / "lean-toolchain").write_text("  leanprover/lean4:v4.24.0  \n\n")
+async def test_get_expected_toolchain_is_deprecated_and_still_asks_aristotle(api_server):
+    requests = api_server(httpx.Response(200, json={"lean_toolchain_version": "leanprover/lean4:v4.24.0"}))
 
-    result = get_lean_toolchain_version(tmp_path)
-    assert result == "leanprover/lean4:v4.24.0"
+    with pytest.warns(
+        DeprecationWarning, match=r"get_expected_toolchain\(\) is deprecated and will be removed in 4\.0"
+    ):
+        assert await get_expected_toolchain() == "leanprover/lean4:v4.24.0"
+
+    assert requests[0].url.path.endswith("/version")
 
 
 def test_has_any_lean_files_exists():
@@ -512,66 +511,6 @@ def test_has_any_lean_files_missing():
 
     result = has_any_lean_files(mock_path)
     assert result is False
-
-
-async def test_get_expected_toolchain_success():
-    """Test get_expected_toolchain when API returns successfully."""
-    mock_response = Mock()
-    mock_response.json.return_value = {
-        "lean_toolchain_version": "leanprover/lean4:v4.24.0",
-        "mathlib_hash": "f897ebcf72cd16f89ab4577d0c826cd14afaafc7",
-    }
-
-    mock_client = AsyncMock()
-    mock_client.get.return_value = mock_response
-    mock_client.__aenter__.return_value = mock_client
-    mock_client.__aexit__.return_value = None
-
-    with patch(
-        "aristotlelib.local_file_utils.api_request.AristotleRequestClient",
-        return_value=mock_client,
-    ):
-        result = await get_expected_toolchain()
-
-    assert result == "leanprover/lean4:v4.24.0"
-    mock_client.get.assert_called_once_with("/version")
-
-
-async def test_get_expected_toolchain_api_error():
-    """Test get_expected_toolchain when API call fails."""
-    mock_client = AsyncMock()
-    mock_client.get.side_effect = Exception("API error")
-    mock_client.__aenter__.return_value = mock_client
-    mock_client.__aexit__.return_value = None
-
-    with patch(
-        "aristotlelib.local_file_utils.api_request.AristotleRequestClient",
-        return_value=mock_client,
-    ):
-        result = await get_expected_toolchain()
-
-    # Should return None on error
-    assert result is None
-
-
-async def test_get_expected_toolchain_missing_field():
-    """Test get_expected_toolchain when API response is missing the field."""
-    mock_response = Mock()
-    mock_response.json.return_value = {"mathlib_hash": "f897ebcf72cd16f89ab4577d0c826cd14afaafc7"}
-
-    mock_client = AsyncMock()
-    mock_client.get.return_value = mock_response
-    mock_client.__aenter__.return_value = mock_client
-    mock_client.__aexit__.return_value = None
-
-    with patch(
-        "aristotlelib.local_file_utils.api_request.AristotleRequestClient",
-        return_value=mock_client,
-    ):
-        result = await get_expected_toolchain()
-
-    # Should return None when field is missing
-    assert result is None
 
 
 def test_load_gitignore_spec_no_file():

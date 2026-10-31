@@ -31,9 +31,11 @@ from aristotlelib.api_request import (
     set_api_key,
 )
 from tests.conftest import (
+    BILLING_PAGE,
     BILLING_UNAVAILABLE,
     BUY_CREDITS,
     FAKE_KEY,
+    NAMED_ORGANIZATION,
     OUT_OF_CREDITS,
     PADDED_KEYS,
     REFUSED_KEYS,
@@ -2135,6 +2137,64 @@ async def test_a_402_without_a_message_says_where_to_buy_credits_at_the_web_orig
         "Your organization needs credits to start a run. An organization admin can buy credits at "
         "http://127.0.0.1:8000/settings/billing."
     )
+
+
+@pytest.mark.parametrize(
+    ("named", "pointer"),
+    [
+        (NAMED_ORGANIZATION, f"An admin of Acme Robotics can buy credits at {BILLING_PAGE}?org=org-acme."),
+        (
+            {**NAMED_ORGANIZATION, "organization_name": "Sam Example", "organization_kind": "personal"},
+            f"You can buy credits for your personal organization at {BILLING_PAGE}?org=org-acme.",
+        ),
+        (
+            {**NAMED_ORGANIZATION, "organization_name": None},
+            f"An organization admin can buy credits at {BILLING_PAGE}?org=org-acme.",
+        ),
+        (
+            {**NAMED_ORGANIZATION, "organization_name": " "},
+            f"An organization admin can buy credits at {BILLING_PAGE}?org=org-acme.",
+        ),
+        ({**NAMED_ORGANIZATION, "billing_url": "https://example.com/settings/billing?org=org-acme"}, BUY_CREDITS),
+        ({**NAMED_ORGANIZATION, "billing_url": BILLING_PAGE}, BUY_CREDITS),
+    ],
+    ids=["company", "personal", "no name", "blank name", "another web address", "no organization in the link"],
+)
+async def test_a_refusal_for_credits_links_the_billing_page_of_the_organization_it_names(named, pointer, api_server):
+    api_server(httpx.Response(402, json={"detail": {**OUT_OF_CREDITS, **named}}))
+
+    async with AristotleRequestClient() as client:
+        with pytest.raises(AristotleNotProcessedError) as info:
+            await client.post("/project", idempotency_key="k-1")
+
+    assert str(info.value) == f"{OUT_OF_CREDITS['message']} {pointer}"
+
+
+@pytest.mark.parametrize(
+    ("link", "pointer"),
+    [
+        (
+            "http://127.0.0.1:8000/settings/billing?org=org-acme",
+            "An admin of Acme Robotics can buy credits at http://127.0.0.1:8000/settings/billing?org=org-acme.",
+        ),
+        (
+            f"{BILLING_PAGE}?org=org-acme",
+            "An organization admin can buy credits at http://127.0.0.1:8000/settings/billing.",
+        ),
+    ],
+    ids=["on that address", "on the default address"],
+)
+async def test_a_refusal_for_credits_takes_a_link_only_on_the_configured_web_address(
+    link, pointer, api_server, monkeypatch
+):
+    monkeypatch.setenv("ARISTOTLE_WEB_URL", "http://127.0.0.1:8000")
+    api_server(httpx.Response(402, json={"detail": {**OUT_OF_CREDITS, **NAMED_ORGANIZATION, "billing_url": link}}))
+
+    async with AristotleRequestClient() as client:
+        with pytest.raises(AristotleNotProcessedError) as info:
+            await client.post("/project", idempotency_key="k-1")
+
+    assert str(info.value) == f"{OUT_OF_CREDITS['message']} {pointer}"
 
 
 @pytest.mark.usefixtures("frozen_api_clock")

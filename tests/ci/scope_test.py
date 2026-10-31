@@ -177,127 +177,37 @@ def test_scope_changed_uses_the_diff_against_the_parent_commit(git_repo: Path):
     assert Path("rtl/fifo.v") in result.upload_files
 
 
-def test_scope_changed_counts_a_lean_change(git_repo: Path):
+def test_scope_changed_leaves_out_lean_files_and_their_build_files(git_repo: Path):
+    """Aristotle doesn't verify Lean, so a change to a Lean file, or to one of Lean's build files, is in no run."""
     (git_repo / "Main.lean").write_text("theorem t : 1 + 1 = 2 := by decide\n")
+    (git_repo / "lean-toolchain").write_text("leanprover/lean4:v4.22.0\n")
     git(git_repo, "add", "-A")
     git(git_repo, "commit", "-qm", "add a theorem")
 
     result = scope.resolve(git_repo, scope.Scope.CHANGED)
 
-    assert result.focus_files == [Path("Main.lean")]
+    assert result.is_empty
+    assert Path("Main.lean") in result.upload_files
 
 
-def _lean_package(repo: Path, folder: str) -> None:
-    """Commit a Lake package in ``folder``: its build files and two Lean files."""
-    package = repo / folder
-    (package / "Proofs").mkdir(parents=True)
-    (package / "lean-toolchain").write_text("leanprover/lean4:v4.21.0\n")
-    (package / "lakefile.lean").write_text("import Lake\nopen Lake DSL\npackage proofs\n")
-    (package / "Proofs.lean").write_text("import Proofs.Basic\n")
-    (package / "Proofs" / "Basic.lean").write_text("theorem two : 1 + 1 = 2 := rfl\n")
-    git(repo, "add", "-A")
-    git(repo, "commit", "-qm", f"add the Lean package in {folder}")
-
-
-@pytest.mark.parametrize("build_file", ["lean-toolchain", "lakefile.lean"])
-def test_a_change_to_a_lean_build_file_brings_in_every_lean_file_of_its_package(
-    git_repo: Path, caplog, build_file: str
-):
-    _lean_package(git_repo, "lean")
-    _lean_package(git_repo, "other")
-    (git_repo / "lean" / build_file).write_text("leanprover/lean4:v4.22.0\n")
-    git(git_repo, "commit", "-qam", f"change {build_file}")
-
-    with caplog.at_level(logging.INFO, logger="aristotle"):
-        result = scope.resolve(git_repo, scope.Scope.CHANGED)
-
-    assert result.focus_files == [Path("lean/Proofs/Basic.lean"), Path("lean/Proofs.lean")]
-    assert f"lean/{build_file} changed, so the Lean files in its folder and below are verified too." in caplog.messages
-
-
-def test_a_lean_build_file_at_the_top_brings_in_lean_files_at_any_depth(git_repo: Path):
-    _lean_package(git_repo, ".")
-    (git_repo / "lake-manifest.json").write_text('{"version": "1.1.0", "packages": []}\n')
+def test_scope_all_on_a_checkout_of_only_lean_files_stops(git_repo: Path):
+    git(git_repo, "rm", "-rq", "rtl")
+    (git_repo / "Main.lean").write_text("theorem t : 1 + 1 = 2 := by decide\n")
     git(git_repo, "add", "-A")
-    git(git_repo, "commit", "-qm", "pin the dependencies")
+    git(git_repo, "commit", "-qm", "only Lean")
 
-    result = scope.resolve(git_repo, scope.Scope.CHANGED)
-
-    assert result.focus_files == [Path("Proofs/Basic.lean"), Path("Proofs.lean")]
-
-
-def test_deleting_a_lean_build_file_brings_in_the_lean_files_it_built(git_repo: Path):
-    _lean_package(git_repo, "lean")
-    git(git_repo, "rm", "-q", "lean/lean-toolchain")
-    git(git_repo, "commit", "-qm", "drop the toolchain pin")
-
-    result = scope.resolve(git_repo, scope.Scope.CHANGED)
-
-    assert result.focus_files == [Path("lean/Proofs/Basic.lean"), Path("lean/Proofs.lean")]
+    with pytest.raises(scope.ScopeError, match="source file"):
+        scope.resolve(git_repo, scope.Scope.ALL)
 
 
-def test_moving_a_lean_build_file_brings_in_the_lean_files_of_both_folders(git_repo: Path):
-    _lean_package(git_repo, "a")
-    _lean_package(git_repo, "b")
-    git(git_repo, "rm", "-q", "b/lean-toolchain")
-    git(git_repo, "commit", "-qm", "b without a toolchain")
-    git(git_repo, "mv", "a/lean-toolchain", "b/lean-toolchain")
-    git(git_repo, "commit", "-qm", "move the toolchain")
+@pytest.mark.parametrize("chosen", [scope.Scope.PATHS, scope.Scope.CHANGED])
+def test_a_path_glob_matching_only_lean_files_matches_no_source_file(git_repo: Path, chosen: scope.Scope):
+    (git_repo / "Main.lean").write_text("theorem t : 1 + 1 = 2 := by decide\n")
+    git(git_repo, "add", "-A")
+    git(git_repo, "commit", "-qm", "add a theorem")
 
-    result = scope.resolve(git_repo, scope.Scope.CHANGED)
-
-    assert result.focus_files == [
-        Path("a/Proofs/Basic.lean"),
-        Path("a/Proofs.lean"),
-        Path("b/Proofs/Basic.lean"),
-        Path("b/Proofs.lean"),
-    ]
-
-
-def test_a_lean_build_file_above_the_directory_brings_in_its_lean_files(git_repo: Path, caplog):
-    _lean_package(git_repo, ".")
-    _lean_package(git_repo, "other")
-    (git_repo / "lean-toolchain").write_text("leanprover/lean4:v4.22.0\n")
-    git(git_repo, "commit", "-qam", "bump Lean at the top")
-    git(git_repo, "config", "diff.relative", "true")
-
-    with caplog.at_level(logging.INFO, logger="aristotle"):
-        result = scope.resolve(git_repo / "Proofs", scope.Scope.CHANGED)
-
-    assert result.focus_files == [Path("Basic.lean")]
-    assert "../lean-toolchain changed, so the Lean files in its folder and below are verified too." in caplog.messages
-
-
-def test_deleting_a_lean_build_file_above_the_directory_brings_in_its_lean_files(git_repo: Path):
-    _lean_package(git_repo, ".")
-    git(git_repo, "rm", "-q", "lakefile.lean")
-    git(git_repo, "commit", "-qm", "drop the lakefile")
-
-    result = scope.resolve(git_repo / "Proofs", scope.Scope.CHANGED)
-
-    assert result.focus_files == [Path("Basic.lean")]
-
-
-def test_a_lean_build_file_beside_the_directory_brings_in_nothing(git_repo: Path):
-    _lean_package(git_repo, "lean")
-    _lean_package(git_repo, "other")
-    (git_repo / "other" / "lean-toolchain").write_text("leanprover/lean4:v4.22.0\n")
-    git(git_repo, "commit", "-qam", "bump Lean in the other package")
-
-    result = scope.resolve(git_repo / "lean", scope.Scope.CHANGED)
-
-    assert result.is_empty
-
-
-def test_a_folder_above_the_directory_is_named_literally_not_as_a_glob(git_repo: Path):
-    _lean_package(git_repo, "x[ab]")
-    _lean_package(git_repo, "xa")
-    (git_repo / "xa" / "lean-toolchain").write_text("leanprover/lean4:v4.22.0\n")
-    git(git_repo, "commit", "-qam", "bump Lean in xa")
-
-    result = scope.resolve(git_repo / "x[ab]" / "Proofs", scope.Scope.CHANGED)
-
-    assert result.is_empty
+    with pytest.raises(scope.ScopeError, match="No tracked source file .* matches --path '\\*.lean'"):
+        scope.resolve(git_repo, chosen, paths=["*.lean"])
 
 
 def test_a_renamed_source_file_is_in_focus_under_its_new_name(git_repo: Path):
@@ -307,25 +217,6 @@ def test_a_renamed_source_file_is_in_focus_under_its_new_name(git_repo: Path):
     result = scope.resolve(git_repo, scope.Scope.CHANGED)
 
     assert result.focus_files == [Path("rtl/queue.v")]
-
-
-def test_a_path_filter_narrows_the_lean_files_a_build_file_brings_in(git_repo: Path, caplog):
-    _lean_package(git_repo, "lean")
-    (git_repo / "lean" / "lean-toolchain").write_text("leanprover/lean4:v4.22.0\n")
-    git(git_repo, "commit", "-qam", "bump Lean")
-
-    with caplog.at_level(logging.INFO, logger="aristotle"):
-        narrowed = scope.resolve(git_repo, scope.Scope.CHANGED, paths=["lean/Proofs/**"])
-        elsewhere = scope.resolve(git_repo, scope.Scope.CHANGED, paths=["rtl/**"])
-
-    assert narrowed.focus_files == [Path("lean/Proofs/Basic.lean")]
-    assert elsewhere.is_empty
-    assert (
-        caplog.messages.count(
-            "lean/lean-toolchain changed, so the Lean files in its folder and below are verified too."
-        )
-        == 1
-    )
 
 
 def test_scope_changed_ignores_non_source_changes(git_repo: Path):
@@ -602,20 +493,6 @@ def test_scope_changed_names_the_changed_source_files_an_ignore_rule_holds_back(
 
     assert result.is_empty
     assert result.held_back_focus == held_back
-
-
-def test_a_lean_build_file_change_puts_the_lean_files_an_ignore_rule_holds_back_in_scope(git_repo: Path):
-    _lean_package(git_repo, "proofs")
-    (git_repo / ".gitignore").write_text("Basic.lean\n")
-    git(git_repo, "add", ".gitignore")
-    git(git_repo, "commit", "-qm", "ignore one of the package's Lean files")
-    (git_repo / "proofs" / "lean-toolchain").write_text("leanprover/lean4:v4.22.0\n")
-    git(git_repo, "commit", "-qam", "bump Lean")
-
-    result = scope.resolve(git_repo, scope.Scope.CHANGED)
-
-    assert result.focus_files == [Path("proofs/Proofs.lean")]
-    assert result.held_back_focus == [Path("proofs/Proofs/Basic.lean")]
 
 
 def test_scope_paths_names_the_source_files_it_matches_that_an_ignore_rule_holds_back(git_repo: Path):
@@ -997,20 +874,19 @@ def test_a_submodules_folder_is_listed_from_the_submodule(
     assert {argv[2] for argv in calls} == {str((git_repo / "lib").resolve())}
 
 
-def test_a_git_folder_git_passes_over_leaves_the_prefix_and_build_files_as_git_sees_them(git_repo: Path):
+def test_a_git_folder_git_passes_over_leaves_the_prefix_as_git_sees_it(git_repo: Path):
     """An empty .git, which git looks past to the repository above it."""
-    (git_repo / "lakefile.lean").write_text("-- build\n")
     (git_repo / "sub" / "hw").mkdir(parents=True)
-    (git_repo / "sub" / "hw" / "Spec.lean").write_text("theorem spec : True := trivial\n")
+    (git_repo / "sub" / "hw" / "core.v").write_text("module core; endmodule\n")
     git(git_repo, "add", "-A")
-    git(git_repo, "commit", "-qm", "a Lean project")
-    (git_repo / "lakefile.lean").write_text("-- build, changed\n")
-    git(git_repo, "commit", "-qam", "only the build file")
+    git(git_repo, "commit", "-qm", "a core")
+    (git_repo / "sub" / "hw" / "core.v").write_text("module core(input a); endmodule\n")
+    git(git_repo, "commit", "-qam", "change the core")
     (git_repo / "sub" / ".git").mkdir()
 
     result = scope.resolve(git_repo / "sub" / "hw", scope.Scope.CHANGED)
 
-    assert result.focus_files == [Path("Spec.lean")]
+    assert result.focus_files == [Path("core.v")]
     assert result.prefix == "sub/hw/"
 
 
@@ -1021,8 +897,8 @@ def test_a_git_folder_git_passes_over_leaves_the_prefix_and_build_files_as_git_s
         ("core.SV", True),
         ("driver.c", True),
         ("lib.rs", True),
-        ("Main.lean", True),
-        ("Proofs/Basic.LEAN", True),
+        ("Main.lean", False),
+        ("Proofs/Basic.LEAN", False),
         ("lakefile.lean", False),
         ("pkg/lakefile.lean", False),
         ("lean-toolchain", False),

@@ -1,11 +1,19 @@
 # Aristotle
 
-Aristotle formally verifies your code. Point it at a project, state the property that must hold, and it returns a
-proof or a counterexample. It verifies Verilog and C.
+Aristotle formally verifies your code. Point it at a project, state the property that must hold, and it returns a proof
+or a counterexample. It verifies Verilog and C, and Rust on accounts where Rust is enabled. Send your code as it is:
+Aristotle writes the Lean itself. It doesn't verify pure mathematics or Lean: a project with only Lean files runs and
+verifies nothing.
 
 This package is the `aristotle` command-line tool and the Python library for the Aristotle API. To sign up and read
-the full documentation, go to [aristotle.harmonic.fun](https://aristotle.harmonic.fun). Working in Claude, ChatGPT,
-or another MCP client? Connect the [hosted MCP server](#mcp-server) instead.
+the full documentation, go to [aristotle.harmonic.fun](https://aristotle.harmonic.fun).
+
+Which to use:
+
+- In a chat assistant such as claude.ai, Claude Desktop or ChatGPT, connect the [hosted MCP server](#mcp-server).
+- In a terminal, a coding agent working in your checkout, a script or CI, use this CLI. It uploads the folder, follows
+  long runs and saves the results.
+- In the browser, the [web app](https://aristotle.harmonic.fun) shows your projects, their questions and their results.
 
 ## Quick start
 
@@ -62,6 +70,10 @@ the CLI reference.
 
 ## Verify a project
 
+Pass the folder that holds the code with `--project-dir`, as it is, with its headers and build files. Aristotle writes
+the Lean itself, so don't translate the code or send Lean you wrote. Without a folder, only the prompt goes up:
+unless the prompt includes the code itself or asks Aristotle to design new hardware, the run verifies nothing.
+
 Describe the property precisely: the module or function, the signals or variables, the assumptions (such as reset
 and input ranges), and what must hold. Ask for one property, or a few, per run.
 
@@ -84,7 +96,7 @@ Wherever a command takes a project, you can give its id, the first 8 or more cha
 |---|---|
 | `aristotle list` | Lists your recent projects, and whether each one is running. |
 | `aristotle show <project>` | Shows the status of the latest run. At a terminal, it follows a running one. |
-| `aristotle continue <project> "<prompt>" --wait` | Sends a project another instruction. The run in progress picks it up, or a new run starts. |
+| `aristotle continue <project> "<prompt>" --wait` | Sends a project another instruction. The run in progress picks it up, or a new run starts. With `--send-folder`, it also sends the `--project-dir` folder to an idle project, each file replacing the project's at its path. |
 | `aristotle questions <project>` | Lists Aristotle's questions, and lets you answer the pending ones. |
 | `aristotle properties <project>` | Lists each property with its status. |
 | `aristotle property <project> <name>` | Shows one property in full, with any files Aristotle linked to it, such as a counterexample's trace. |
@@ -93,10 +105,11 @@ Wherever a command takes a project, you can give its id, the first 8 or more cha
 | `aristotle cancel <project>` | Cancels the run in progress. |
 | `aristotle rename <project> "<name>"` | Renames a project. |
 
-During a run, Aristotle may ask you questions, and it waits up to 15 minutes for each answer. With `--wait`, the CLI
-shows each question as it comes, with suggested answers to pick from. Otherwise, answer with
-`aristotle questions <project>` or in the web app. For a batch run that nobody will answer, pass `--no-questions`.
-Aristotle then leaves anything that needs your decision unverified, and names it in its summary.
+During a run, Aristotle may ask how you want your code verified, such as which reset polarity or input ranges to
+assume, and it waits up to 15 minutes for each answer. With `--wait`, the CLI shows each question as it comes, with
+suggested answers to pick from. Otherwise, answer with `aristotle questions <project>` or in the web app. For a batch
+run that nobody will answer, pass `--no-questions`. Aristotle then leaves anything that needs your decision unverified,
+and names it in its summary.
 
 To upload selected files with a new instruction, or to upload files you downloaded, see
 [What goes up](https://github.com/harmonic-ai/aristotle/blob/main/docs/cli-reference.md#what-goes-up) in the CLI
@@ -116,8 +129,7 @@ reference.
 | `(unchecked)` after a status | A proof or refutation that Aristotle never checked, because the run ended first. It isn't a verdict yet. |
 
 To summarize or look up results, use `show`, `properties`, `property`, or `download`. None of them starts a run.
-Don't send a `continue` only to ask about results: on an idle project, it starts a new run, which can spend hours
-checking the proofs again before it answers.
+Don't send a `continue` only to ask about results: on an idle project, it starts a new run, which spends credits.
 
 A wait can end before the run does. The run can also fail, be cancelled, or run out of budget. In each case, the CLI
 prints the command that picks up where it left off, such as
@@ -320,10 +332,12 @@ To upload selected files to an idle project, pass them to `Project.ask()` with t
 `continue --project-dir` takes it (by default, the current directory):
 
 ```python
-await project.ask("Use these proofs", files=["downloaded/Proofs/Foo.lean"], project_dir="downloaded")
+await project.ask("Check the fixed FIFO again", files=["rtl/fifo.sv"], project_dir=".")
 ```
 
 Files outside the root, including through symlinks, paths containing `..`, and duplicate upload paths are refused.
+Pass `send_folder=True` instead of `files` to send the whole `project_dir` folder, picked as
+`create_from_directory` picks it.
 
 ## Proxies and private networks
 

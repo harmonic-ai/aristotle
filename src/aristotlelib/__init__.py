@@ -14,6 +14,7 @@ from aristotlelib.event import Event, EventStatus, EventType
 from aristotlelib.project import (
     AgentQuestionsSetting,
     AmbiguousProjectError,
+    FolderNotAppliedError,
     Project,
     ProjectHasNoFilesError,
     ProjectStatus,
@@ -28,6 +29,7 @@ __all__ = [
     "ProjectStatus",
     "ProjectHasNoFilesError",
     "AmbiguousProjectError",
+    "FolderNotAppliedError",
     "AgentQuestionsSetting",
     "Event",
     "EventType",

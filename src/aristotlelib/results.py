@@ -264,6 +264,9 @@ class ContinueResult(pydantic.BaseModel):
     """A new task if the project was idle; otherwise the running one, which the prompt steered."""
     web_url: str
     """The project's page in Aristotle's web app."""
+    files_applied: int | None = None
+    """How many files of the folder ``--send-folder`` sent Aristotle applied, after its own filters; null when no
+    folder went up, or when the server took the prompt without it."""
     property_counts: PropertyCounts | None
     """Null until the task has ended, when the counts stand, when the project's properties could not be fetched, or
     when a wait was interrupted."""

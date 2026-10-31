@@ -127,7 +127,7 @@ _SETTING = re.compile(
     r"|\b(?P<assigned>[A-Z][A-Z0-9_]+)[ \t]*=(?!=)(?P<assigned_value>[^;,)\n]*)"
 )
 """Code setting an upper-case name on one line: a C or Verilog macro, a Verilog parameter override, a declaration
-with a type, as in Rust or Lean, or an assignment."""
+with a type, as in Rust, or an assignment."""
 
 _INTEGER = re.compile(
     r"\(*\s*(?:(?:\d+\s*)?'[sS]?(?P<base>[dDhHoObB])\s*|0(?P<prefix>[xXoObB]))?(?P<digits>[0-9a-fA-F][0-9a-fA-F_]*)"

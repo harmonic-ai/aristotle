@@ -8,6 +8,7 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import socket
 import sys
 import tempfile
@@ -74,6 +75,13 @@ BILLING_PAGE = "https://aristotle.harmonic.fun/settings/billing"
 
 BUY_CREDITS = f"An organization admin can buy credits at {BILLING_PAGE}."
 """What a refusal for credits says after Aristotle's message."""
+
+NAMED_ORGANIZATION = {
+    "organization_name": "Acme Robotics",
+    "organization_kind": "company",
+    "billing_url": f"{BILLING_PAGE}?org=org-acme",
+}
+"""What a refusal for credits adds to its detail when Aristotle names the organization that needs them."""
 
 PADDED_KEYS = [
     pytest.param(f"{padding}{FAKE_KEY}" if leading else f"{FAKE_KEY}{padding}", id=f"{side} {padding!r}")
@@ -318,6 +326,28 @@ def give_key(source: str, key: str, monkeypatch: pytest.MonkeyPatch, config_dir:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({"api_key": key}) + "\n", encoding="utf-8")
     return []
+
+
+def multipart_parts(request: httpx.Request) -> list[tuple[str, str | None, str | None, bytes]]:
+    """Each part of a multipart request, in order: its field name, its file name, its content type and its content."""
+    boundary = request.headers["content-type"].partition("boundary=")[2].encode()
+    parts = []
+    for part in request.content.split(b"--" + boundary)[1:-1]:
+        head, _, content = part.removeprefix(b"\r\n").removesuffix(b"\r\n").partition(b"\r\n\r\n")
+        headers = head.decode()
+        name = re.search(r'(?<!file)name="([^"]*)"', headers)
+        filename = re.search(r'filename="([^"]*)"', headers)
+        content_type = re.search(r"Content-Type: (\S+)", headers)
+        assert name is not None
+        parts.append(
+            (
+                name.group(1),
+                None if filename is None else filename.group(1),
+                None if content_type is None else content_type.group(1),
+                content,
+            )
+        )
+    return parts
 
 
 def user_agent_of(surface: str) -> str:

@@ -32,18 +32,22 @@ import pytest
 from aristotlelib import api_request, local_file_utils
 from aristotlelib.agent_task import ENDED_BADLY, AgentTask, BudgetFailureReason, TaskStatus, ending_notice
 from aristotlelib.api_request import AristotleAPIError, AristotleNotFoundError, set_api_key
+from aristotlelib.cli.command.submit import read_block
 from aristotlelib.cli.question_flow import DEFAULT_DEADLINE_SECONDS, FlowResult, pending_footer, read_stdin_line
 from aristotlelib.declaration import Declaration, DeclarationSource, DeclarationStatus, DeclarationType
 from aristotlelib.event import Event, EventType
 from aristotlelib.local_file_utils import SECRET_FILE_PATTERNS, LeanProjectError
 from aristotlelib.project import (
+    ARCHIVE_FILES_HEADER,
     AgentQuestionsSetting,
     AmbiguousProjectError,
     ArchiveError,
+    FolderNotAppliedError,
     Project,
     ProjectHasNoFilesError,
     ProjectStatus,
     _folder_name,
+    build_archive,
     continuation_uploads,
     download_artifacts_hint,
     file_path_error,
@@ -61,6 +65,7 @@ from tests.conftest import (
     fast_api_clock,
     fstat_on_another_device,
     hard_link,
+    multipart_parts,
     swapped_for_a_link,
 )
 
@@ -694,16 +699,7 @@ async def test_project_create_from_directory():
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=None)
 
-        with (
-            patch(
-                "aristotlelib.api_request.AristotleRequestClient",
-                return_value=mock_client,
-            ),
-            patch(
-                "aristotlelib.project.local_file_utils.get_expected_toolchain",
-                new=AsyncMock(return_value="leanprover/lean4:v4.24.0"),
-            ),
-        ):
+        with patch("aristotlelib.api_request.AristotleRequestClient", return_value=mock_client):
             project = await Project.create_from_directory(prompt="Process directory", project_dir=temp_path)
 
         assert project.project_id == "dir-project-789"
@@ -2683,13 +2679,7 @@ def _upload_mock_client():
 async def _uploaded(project_dir: Path, include_ignored: bool = False) -> tuple[str, bytes]:
     """The file name and the archive that creating a project from ``project_dir`` uploads."""
     client = _upload_mock_client()
-    with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=client),
-        patch(
-            "aristotlelib.project.local_file_utils.get_expected_toolchain",
-            new=AsyncMock(return_value="leanprover/lean4:v4.24.0"),
-        ),
-    ):
+    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=client):
         await Project.create_from_directory(
             prompt="Verify this", project_dir=project_dir, include_ignored=include_ignored
         )
@@ -2705,24 +2695,21 @@ async def _upload(project_dir: Path, include_ignored: bool = False) -> dict[str,
         return {m.name: tar.extractfile(m).read() if m.isfile() else None for m in tar.getmembers()}
 
 
-async def _refused_upload(project_dir: Path) -> tuple[str, AsyncMock, AsyncMock]:
-    """The error creating a project from ``project_dir`` raises, and the mocks of the toolchain's fetch and the create."""
+async def _refused_upload(project_dir: Path) -> tuple[str, AsyncMock]:
+    """The error creating a project from ``project_dir`` raises, and the mock of the create."""
     client = _upload_mock_client()
-    toolchain = AsyncMock(return_value="leanprover/lean4:v4.24.0")
     with (
         patch("aristotlelib.api_request.AristotleRequestClient", return_value=client),
-        patch("aristotlelib.project.local_file_utils.get_expected_toolchain", new=toolchain),
         pytest.raises(LeanProjectError) as info,
     ):
         await Project.create_from_directory(prompt="Verify this", project_dir=project_dir)
-    return str(info.value), toolchain, client.post
+    return str(info.value), client.post
 
 
 async def test_an_empty_folder_is_refused_before_anything_is_sent(tmp_path):
-    message, toolchain, create = await _refused_upload(tmp_path)
+    message, create = await _refused_upload(tmp_path)
 
     assert message == f"Nothing to upload: {tmp_path} is empty."
-    toolchain.assert_not_awaited()
     create.assert_not_awaited()
 
 
@@ -2742,11 +2729,9 @@ async def test_a_folder_whose_files_an_ignore_rule_all_holds_back_is_refused_bef
     for name in files:
         (tmp_path / name).write_text("-- a file\n")
 
-    message, toolchain, create = await _refused_upload(tmp_path)
+    message, create = await _refused_upload(tmp_path)
 
     assert message == f"Nothing to upload from {tmp_path}: {expected}."
-    # The .lean files would have it fetch Aristotle's toolchain first.
-    toolchain.assert_not_awaited()
     create.assert_not_awaited()
 
 
@@ -2763,10 +2748,9 @@ async def test_a_folder_whose_files_are_all_left_out_otherwise_is_refused_too(na
     (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
     (tmp_path / name).write_text("-- a file\n")
 
-    message, toolchain, create = await _refused_upload(tmp_path)
+    message, create = await _refused_upload(tmp_path)
 
     assert message == f"Nothing to upload from {tmp_path}: {expected}."
-    toolchain.assert_not_awaited()
     create.assert_not_awaited()
 
 
@@ -2779,13 +2763,12 @@ async def test_a_folder_whose_every_verilog_source_an_ignore_rule_leaves_out_is_
     (tmp_path / "top.vp").write_text("module `mname`; endmodule\n")
     (tmp_path / "top.v").write_text("module top; endmodule\n")
 
-    message, toolchain, create = await _refused_upload(tmp_path)
+    message, create = await _refused_upload(tmp_path)
 
     assert message.startswith(
         f"No Verilog source would go up from {tmp_path}: an ignore rule matches each of its .v and .sv files:\n"
         "  top.v  (.gitignore:1: *.v)\n"
     )
-    toolchain.assert_not_awaited()
     create.assert_not_awaited()
 
 
@@ -2803,12 +2786,11 @@ async def test_a_folder_that_cant_be_read_is_refused_and_said_so(mode, files, tm
         (folder / name).write_text("-- a file\n")
     folder.chmod(mode)
     try:
-        message, toolchain, create = await _refused_upload(folder)
+        message, create = await _refused_upload(folder)
     finally:
         folder.chmod(0o700)
 
     assert message == f"Nothing to upload: {folder} can't be read (Permission denied)."
-    toolchain.assert_not_awaited()
     create.assert_not_awaited()
 
 
@@ -2820,14 +2802,13 @@ async def test_a_folder_whose_only_other_files_are_in_a_folder_that_cant_be_read
     (tmp_path / "src" / "Main.lean").write_text("-- a file\n")
     (tmp_path / "src").chmod(0o300)
     try:
-        message, toolchain, create = await _refused_upload(tmp_path)
+        message, create = await _refused_upload(tmp_path)
     finally:
         (tmp_path / "src").chmod(0o700)
 
     assert (
         message == f"Nothing to upload from {tmp_path}: its folder src can't be read, and nothing else in it goes up."
     )
-    toolchain.assert_not_awaited()
     create.assert_not_awaited()
 
 
@@ -3886,7 +3867,7 @@ async def test_the_library_names_include_ignored_for_verilog_an_ignore_rule_leav
     (tmp_path / "top.vp").write_bytes(b"module `mname`; endmodule\n")
     (tmp_path / "top.v").write_bytes(b"module top; endmodule\n")
 
-    message, _, create = await _refused_upload(tmp_path)
+    message, create = await _refused_upload(tmp_path)
 
     create.assert_not_awaited()
     assert (
@@ -6953,8 +6934,7 @@ def _questions_setting(request: httpx.Request) -> int:
 
 
 async def test_a_new_project_or_prompt_lets_the_agent_ask_unless_told_not_to(api_server, tmp_path, monkeypatch):
-    (tmp_path / "Main.lean").write_text("theorem t : True := trivial\n")
-    monkeypatch.setattr(local_file_utils, "get_expected_toolchain", AsyncMock(return_value=None))
+    (tmp_path / "main.c").write_text("int main(void) { return 0; }\n")
     requests = api_server(*[lambda request: _task_record() if request.url.path.endswith("/ask") else _record()] * 6)
 
     await Project.create(prompt="Prove it")
@@ -7291,6 +7271,387 @@ async def test_ask_whose_check_that_the_project_is_idle_failed_says_the_prompt_w
         f"{failure.format(request=f'GET /project/{CREATED_ID}')} The prompt was not sent, so it is safe to send it again."
     )
     assert info.value.status_code == (429 if refusal == "per-second 429" else None)
+
+
+def _folder(tmp_path: Path) -> Path:
+    """A folder whose top.sv and src/fifo.sv go up, and whose .env stays out."""
+    folder = tmp_path / "rtl"
+    (folder / "src").mkdir(parents=True)
+    (folder / "top.sv").write_bytes(b"module top; endmodule\n")
+    (folder / "src" / "fifo.sv").write_bytes(b"module fifo; endmodule\n")
+    (folder / ".env").write_bytes(b"TOKEN=never-sent\n")
+    return folder
+
+
+def test_the_package_exports_the_error_for_a_folder_not_applied():
+    import aristotlelib
+
+    assert aristotlelib.FolderNotAppliedError is FolderNotAppliedError
+    assert "FolderNotAppliedError" in aristotlelib.__all__
+
+
+def _applied(count: str | bytes | None) -> httpx.Response:
+    """A follow-up's task, with ARCHIVE_FILES_HEADER at ``count`` unless None, as a server without folders answers."""
+    return httpx.Response(200, json=TASK, headers={} if count is None else {ARCHIVE_FILES_HEADER: count})
+
+
+def _sent_archive(request: httpx.Request) -> tuple[str | None, str | None, dict[str, bytes]]:
+    """The file name, content type and files of the archive a follow-up sent."""
+    ((_, name, content_type, archive),) = [part for part in multipart_parts(request) if part[0] == "archive"]
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz", encoding="utf-8") as tar:
+        files = {m.name: f.read() for m in tar.getmembers() if (f := tar.extractfile(m)) is not None}
+    return name, content_type, files
+
+
+async def test_ask_with_a_folder_sends_its_archive_and_the_task_counts_the_files_applied(api_server, tmp_path, caplog):
+    caplog.set_level(logging.INFO)
+    # The refresh that checks the project is idle, then the follow-up.
+    requests = api_server(_record(), _applied("2"))
+
+    task = await _listed(CREATED_ID, "Prove it").ask("Go on", send_folder=True, project_dir=_folder(tmp_path))
+
+    assert task.agent_task_id == "task-1"
+    assert task.files_applied == 2
+    assert [request.method for request in requests] == ["GET", "POST"]
+    assert _sent_archive(requests[1]) == (
+        "rtl.tar.gz",
+        "application/gzip",
+        {"top.sv": b"module top; endmodule\n", "src/fifo.sv": b"module fifo; endmodule\n"},
+    )
+    assert [r.getMessage() for r in caplog.records if r.name == "aristotle"] == [
+        "Excluded 1 file(s) matching secret patterns: .env",
+        "Uploading 2 files.",
+    ]
+    # The count is no part of the task's JSON.
+    assert "files_applied" not in task.model_dump()
+
+
+async def test_a_count_of_0_is_a_folder_applied(api_server, tmp_path):
+    api_server(_record(), _applied("0"))
+
+    task = await _listed(CREATED_ID, "Prove it").ask("Go on", send_folder=True, project_dir=_folder(tmp_path))
+
+    assert task.files_applied == 0
+
+
+# A superscript two is a digit to str.isdigit(), and a server can send it as a Latin-1 byte.
+@pytest.mark.parametrize("count", [None, "", "two", "-1", "1.0", b"\xb2"], ids=repr)
+async def test_ask_with_a_folder_the_server_did_not_apply_raises_holding_the_task(count, api_server, tmp_path):
+    folder = _folder(tmp_path)
+    requests = api_server(_record(), _applied(count))
+
+    with pytest.raises(FolderNotAppliedError) as info:
+        await _listed(CREATED_ID, "Prove it").ask("Go on", send_folder=True, project_dir=folder)
+
+    assert len(requests) == 2
+    assert info.value.task.agent_task_id == "task-1"
+    assert info.value.task.files_applied is None
+    assert info.value.project_dir == folder
+    assert isinstance(info.value, AristotleAPIError)
+    assert info.value.status_code is None
+    assert str(info.value) == (
+        f"Aristotle didn't apply {folder} to project {CREATED_ID}: the server doesn't take a folder with a follow-up, "
+        "so task task-1 started without the folder's files. Cancel it with:\n  aristotle cancel task-1"
+    )
+    rebuilt = pickle.loads(pickle.dumps(info.value))
+    assert (type(rebuilt), str(rebuilt), rebuilt.task) == (FolderNotAppliedError, str(info.value), info.value.task)
+
+
+async def test_ask_without_a_folder_has_no_count_whatever_the_server_says(api_server):
+    api_server(_applied("3"))
+
+    task = await _listed(CREATED_ID, "Prove it").ask("Go on")
+
+    assert task.files_applied is None
+
+
+@pytest.mark.parametrize(
+    ("files", "named"),
+    [(False, "send_folder"), (True, "files")],
+    ids=["folder", "files under its root"],
+)
+async def test_ask_with_a_folder_on_a_running_project_says_what_to_do_instead_and_sends_nothing(
+    files, named, api_server, tmp_path
+):
+    folder = _folder(tmp_path)
+    lemma = folder / "Lemma.lean"
+    lemma.write_bytes(b"theorem t : True := trivial\n")
+    running = _listed(CREATED_ID, "Prove it").model_copy(update={"status": ProjectStatus.RUNNING})
+    requests = api_server(httpx.Response(200, json=running.model_dump(mode="json")))
+
+    with pytest.raises(ValueError) as info:
+        await _listed(CREATED_ID, "Prove it").ask(
+            "Go on", files=[lemma] if files else None, project_dir=folder, send_folder=not files
+        )
+
+    assert [request.method for request in requests] == ["GET"]
+    assert str(info.value).startswith(
+        f"Files can't be added to project {CREATED_ID} while it runs a task. Send the prompt without {named} to reach "
+        "that task"
+    )
+
+
+async def test_ask_with_files_under_the_current_folder_on_a_running_project_names_files_alone(
+    api_server, tmp_path, monkeypatch
+):
+    monkeypatch.chdir(_folder(tmp_path))
+    running = _listed(CREATED_ID, "Prove it").model_copy(update={"status": ProjectStatus.RUNNING})
+    requests = api_server(httpx.Response(200, json=running.model_dump(mode="json")))
+
+    with pytest.raises(ValueError) as info:
+        await _listed(CREATED_ID, "Prove it").ask("Go on", files=["top.sv"])
+
+    assert [request.method for request in requests] == ["GET"]
+    assert "Send the prompt without files to reach that task" in str(info.value)
+
+
+@pytest.mark.parametrize(
+    ("project_dir", "send_folder", "include_ignored", "error"),
+    [
+        (None, False, True, "include_ignored needs send_folder, which sends the folder whose ignored files it uploads"),
+        (
+            "{folder}",
+            False,
+            True,
+            "include_ignored needs send_folder, which sends the folder whose ignored files it uploads",
+        ),
+        (None, True, False, "send_folder needs project_dir, the folder to send"),
+        ("", True, False, "Project directory cannot be empty; use . for the current directory"),
+        ("{file}", True, False, "Path is not a directory: {file}"),
+        ("{missing}", True, False, "Path is not a directory: {missing}"),
+    ],
+    ids=[
+        "include_ignored alone",
+        "include_ignored without send_folder",
+        "send_folder alone",
+        "empty",
+        "a file",
+        "missing",
+    ],
+)
+async def test_ask_refuses_a_folder_argument_it_cant_use_before_any_request(
+    project_dir, send_folder, include_ignored, error, api_server, tmp_path
+):
+    folder = _folder(tmp_path)
+    paths = {"folder": folder, "file": folder / "top.sv", "missing": tmp_path / "missing"}
+    requests = api_server()
+
+    with pytest.raises(ValueError) as info:
+        await _listed(CREATED_ID, "Prove it").ask(
+            "Go on",
+            project_dir=None if project_dir is None else project_dir.format(**paths),
+            send_folder=send_folder,
+            include_ignored=include_ignored,
+        )
+
+    assert str(info.value) == error.format(**paths)
+    assert requests == []
+
+
+async def test_ask_with_a_folder_aristotle_cant_take_sends_nothing(api_server, tmp_path):
+    (tmp_path / "empty").mkdir()
+    requests = api_server()
+
+    with pytest.raises(LeanProjectError) as info:
+        await _listed(CREATED_ID, "Prove it").ask("Go on", send_folder=True, project_dir=tmp_path / "empty")
+
+    assert str(info.value) == f"Nothing to upload: {tmp_path / 'empty'} is empty."
+    assert requests == []
+
+
+async def test_ask_with_files_takes_project_dir_as_their_root_and_sends_no_folder(api_server, tmp_path):
+    folder = _folder(tmp_path)
+    # The refresh that checks the project is idle, then the follow-up, answered as for no folder.
+    requests = api_server(_record(), _applied(None))
+
+    task = await _listed(CREATED_ID, "Prove it").ask("Go on", files=[folder / "src" / "fifo.sv"], project_dir=folder)
+
+    assert task.files_applied is None
+    assert [(name, file_name) for name, file_name, _, _ in multipart_parts(requests[1]) if file_name is not None] == [
+        ("files", "src/fifo.sv")
+    ]
+
+
+@pytest.mark.parametrize("files", [None, []], ids=["no files", "files=[]"])
+async def test_ask_without_send_folder_sends_no_folder_from_project_dir(files, api_server, tmp_path):
+    requests = api_server(_applied(None))
+
+    task = await _listed(CREATED_ID, "Prove it").ask("Go on", files=files, project_dir=_folder(tmp_path))
+
+    assert task.files_applied is None
+    assert [request.method for request in requests] == ["POST"]
+    assert not [part for part in multipart_parts(requests[0]) if part[0] in ("files", "archive")]
+
+
+@pytest.mark.parametrize(
+    ("option", "error"),
+    [
+        ("include_ignored", "include_ignored needs send_folder, which sends the folder whose ignored files it uploads"),
+        ("block", "block needs send_folder, which sends the folder whose files its black boxes leave out"),
+        ("send_folder", "send_folder sends the whole folder, so it takes no files"),
+    ],
+)
+async def test_ask_refuses_a_folder_option_with_files_before_any_request(option, error, api_server, tmp_path):
+    folder = _folder(tmp_path)
+    requests = api_server()
+    given = {"block": Mock()} if option == "block" else {option: True}
+
+    with pytest.raises(ValueError) as info:
+        await _listed(CREATED_ID, "Prove it").ask("Go on", files=[folder / "top.sv"], project_dir=folder, **given)
+
+    assert str(info.value) == error
+    assert requests == []
+
+
+@pytest.mark.parametrize("with_block", [False, True], ids=["no block", "block"])
+@pytest.mark.parametrize("ignored", [False, True], ids=["sent", "ignored"])
+async def test_ask_says_what_a_folders_aristotle_f_gives_only_when_it_goes_up(
+    ignored, with_block, api_server, tmp_path, caplog
+):
+    caplog.set_level(logging.INFO)
+    folder = _folder(tmp_path)
+    (folder / "aristotle.f").write_bytes(b"--top top\ntop.sv\n")
+    if ignored:
+        (folder / ".gitignore").write_bytes(b"aristotle.f\n")
+    block = read_block(folder, [], report=False) if with_block else None
+    requests = api_server(_record(), _applied("3"))
+
+    await _listed(CREATED_ID, "Prove it").ask("Go on", send_folder=True, project_dir=folder, block=block)
+
+    assert ("aristotle.f" in _sent_archive(requests[1])[2]) is not ignored
+    notes = [
+        r.getMessage() for r in caplog.records if r.name == "aristotle" and "aristotle.f goes up" in r.getMessage()
+    ]
+    takes = "only its black boxes" if with_block else "nothing"
+    assert notes == (
+        []
+        if ignored
+        else [
+            "aristotle.f goes up as written, in place of the project's, even one submit generated: a follow-up takes "
+            f"{takes} from it, so a file it names goes up only from inside the folder, and if an ignore rule matches "
+            "it, only with --include-ignored (from Python, the include_ignored argument)."
+        ]
+    )
+
+
+async def test_ask_refuses_a_block_without_a_folder_before_any_request(api_server, tmp_path):
+    folder = _folder(tmp_path)
+    (folder / "aristotle.f").write_bytes(b"--top top\ntop.sv\n")
+    requests = api_server()
+
+    with pytest.raises(ValueError) as info:
+        await _listed(CREATED_ID, "Prove it").ask("Go on", block=read_block(folder, [], report=False))
+
+    assert str(info.value) == "block needs send_folder, which sends the folder whose files its black boxes leave out"
+    assert requests == []
+
+
+async def test_ask_with_a_folder_leaves_out_what_its_blocks_black_boxes_do_and_no_more(api_server, tmp_path):
+    folder = _folder(tmp_path)
+    (folder / "vendor").mkdir()
+    (folder / "vendor" / "sram_1p.v").write_bytes(b"module sram_1p; endmodule\n")
+    (folder / "aristotle.f").write_bytes(b"--top top\n--blackbox sram_1p\ntop.sv\nvendor/sram_1p.v\n")
+    requests = api_server(_record(), _applied("4"), _record(), _applied("5"))
+
+    await _listed(CREATED_ID, "Prove it").ask(
+        "Go on", send_folder=True, project_dir=folder, block=read_block(folder, [], report=False)
+    )
+    await _listed(CREATED_ID, "Prove it").ask("Go on", send_folder=True, project_dir=folder)
+
+    withheld, sent = _sent_archive(requests[1])[2], _sent_archive(requests[3])[2]
+    assert sorted(withheld) == ["aristotle.f", "src/fifo.sv", "top.sv"]
+    assert sorted(sent) == ["aristotle.f", "src/fifo.sv", "top.sv", "vendor/sram_1p.v"]
+    # The block's aristotle.f goes up as written, not as submit generates it.
+    assert withheld["aristotle.f"] == (folder / "aristotle.f").read_bytes()
+
+
+async def test_ask_with_a_folder_whose_file_cant_be_read_sends_nothing(api_server, tmp_path):
+    folder = _folder(tmp_path)
+    gone = FileNotFoundError(2, "No such file or directory", str(folder / "top.sv"))
+    requests = api_server()
+
+    with patch("aristotlelib.project._build_archive", side_effect=gone), pytest.raises(ArchiveError) as info:
+        await _listed(CREATED_ID, "Prove it").ask("Go on", send_folder=True, project_dir=folder)
+
+    assert str(info.value) == f"Could not archive {folder / 'top.sv'}: No such file or directory. Try again."
+    assert requests == []
+
+
+async def test_ask_with_a_folder_takes_the_files_an_ignore_rule_matches_with_include_ignored(api_server, tmp_path):
+    folder = _folder(tmp_path)
+    (folder / ".gitignore").write_bytes(b"gen/\n")
+    (folder / "gen").mkdir()
+    (folder / "gen" / "fifo_gen.sv").write_bytes(b"module fifo_gen; endmodule\n")
+    requests = api_server(_record(), _applied("4"), _record(), _applied("3"))
+
+    await _listed(CREATED_ID, "Prove it").ask("Go on", send_folder=True, project_dir=folder, include_ignored=True)
+    await _listed(CREATED_ID, "Prove it").ask("Go on", send_folder=True, project_dir=folder)
+
+    assert sorted(_sent_archive(requests[1])[2]) == [".gitignore", "gen/fifo_gen.sv", "src/fifo.sv", "top.sv"]
+    assert sorted(_sent_archive(requests[3])[2]) == [".gitignore", "src/fifo.sv", "top.sv"]
+
+
+async def test_ask_sends_its_archive_in_full_again_when_it_is_retried(api_server, tmp_path):
+    folder = _folder(tmp_path)
+    (folder / "trace.vcd").write_bytes(os.urandom(256 * 1024))
+    # The refresh that checks the project is idle, a 429 after the server read the upload, then the task.
+    requests = api_server(_record(), _per_second_limit(), _applied("3"))
+
+    task = await _listed(CREATED_ID, "Prove it").ask("Go on", send_folder=True, project_dir=folder)
+
+    assert task.files_applied == 3
+    refused, retried = requests[1], requests[2]
+    assert refused.headers["Idempotency-Key"] == retried.headers["Idempotency-Key"]
+    assert _sent_archive(refused) == _sent_archive(retried)
+    assert _sent_archive(retried)[2]["trace.vcd"] == (folder / "trace.vcd").read_bytes()
+
+
+async def test_an_asks_reply_may_take_as_long_as_its_folder_takes_to_reach_the_server(api_server, tmp_path):
+    folder = _folder(tmp_path)
+    (folder / "trace.vcd").write_bytes(os.urandom(1024 * 1024))
+    requests = api_server(_record(), _applied("3"))
+
+    await _listed(CREATED_ID, "Prove it").ask("Go on", send_folder=True, project_dir=folder)
+
+    # The archive's megabyte, at 16 KB/s, on top of the 30 s.
+    assert requests[1].extensions["timeout"]["read"] == pytest.approx(30 + 64, abs=1)
+
+
+@pytest.mark.parametrize(
+    ("other_sources", "lean"),
+    [(False, False), (False, True), (True, False)],
+    ids=["stops", "stops-beside-lean", "warns"],
+)
+def test_a_follow_ups_archive_whose_verilog_an_ignore_rule_leaves_out_suggests_only_include_ignored(
+    other_sources, lean, tmp_path, caplog
+):
+    folder = tmp_path / "rtl"
+    folder.mkdir()
+    (folder / ".gitignore").write_bytes(b"*.sv\n")
+    (folder / "fifo.sv").write_bytes(b"module fifo; endmodule\n")
+    if lean:
+        (folder / "Spec.lean").write_bytes(b"theorem t : True := trivial\n")
+    if other_sources:
+        (folder / "driver.c").write_bytes(b"int main(void) { return 0; }\n")
+    listing = (
+        f"No Verilog source {'goes' if other_sources else 'would go'} up from {folder}: an ignore rule matches each "
+        "of its .v and .sv files:\n  fifo.sv\n"
+    )
+    hint = (
+        "pass --include-ignored (from Python, the include_ignored argument), which uploads the files ignore rules keep "
+        "out."
+    )
+
+    if other_sources:
+        build_archive(folder, tmp_path / "out.tar.gz", follow_up=True)
+        assert f"WARNING: {listing}To upload them too, {hint}" in caplog.messages
+    else:
+        with pytest.raises(LeanProjectError) as info:
+            build_archive(folder, tmp_path / "out.tar.gz", follow_up=True)
+        assert str(info.value) == (
+            f"{listing}No .c or .rs file would go up either, so none of the project's sources would be replaced. "
+            f"To upload them, {hint}"
+        )
 
 
 async def test_a_rename_is_sent_again_after_a_timeout(api_server):

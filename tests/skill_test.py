@@ -148,15 +148,32 @@ def test_the_marketplace_plugin_installs_the_skill_from_this_repository():
     assert [(REPO / skill).resolve() for skill in plugin["skills"]] == [SKILL_DIR]
 
 
-def test_the_plugin_and_the_copy_install_the_skill_from_this_versions_release():
-    """The version PR moves all of them to its tag, so the skill a user installs describes the CLI that release installs."""
+def test_the_plugin_installs_the_skill_from_this_versions_release():
+    """The version PR moves it to its tag, so the skill a user installs describes the CLI that release installs."""
     version = tomli.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
-    clones = [re.findall(r"git clone .*", path.read_text(encoding="utf-8")) for path in (REPO / "README.md", GUIDE)]
 
     # The version is how Claude Code tells a release's plugin from one it installed from main at the tag's commit.
     assert (_plugin()["version"], _plugin()["source"]["ref"]) == (version, f"v{version}")
-    assert [len(found) for found in clones] == [0, 2]
-    assert all(f" --branch v{version} {MIRROR}.git " in clone for found in clones for clone in found)
+
+
+def test_the_copy_installs_the_skill_from_the_newest_release_of_this_major_version():
+    """Each release moves the mirror's major tag to itself, so the copy follows the newest CLI that the guide installs."""
+    version = Version(tomli.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"])
+    readme_clones, guide_clones = [
+        re.findall(r"git clone .*", path.read_text(encoding="utf-8")) for path in (REPO / "README.md", GUIDE)
+    ]
+
+    assert (len(readme_clones), len(guide_clones)) == (0, 2)
+    assert all(f" --branch v{version.major} {MIRROR}.git " in clone for clone in guide_clones)
+
+
+def test_the_skill_names_the_version_it_targets():
+    """The guide compares it with the CLI's version, since the copy's tag names only the major version."""
+    version = Version(tomli.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"])
+    text = " ".join((SKILL_DIR / "SKILL.md").read_text(encoding="utf-8").split())
+
+    # A pre-release names the release it leads to.
+    assert f"targets **aristotlelib {version.base_version}**" in text
 
 
 def test_the_skill_says_3_0_0_is_not_on_pypi_only_while_this_is_a_pre_release():

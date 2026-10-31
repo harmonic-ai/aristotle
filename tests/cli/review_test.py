@@ -472,40 +472,16 @@ async def test_in_ci_a_current_folder_in_the_workspace_runs(
     assert submit.await_args.args[0] == repo.resolve()
 
 
-async def test_a_lean_change_is_verified_rather_than_passed_as_touching_no_source_file(
-    action: ReviewAction, repo: Path, caplog
-):
-    _commit(repo, "Main.lean", "theorem t : 1 + 1 = 2 := rfl\n")
-    _commit(repo, "Main.lean", "theorem t : 1 + 1 = 2 := by decide\n")
-
-    with caplog.at_level(logging.INFO, logger="aristotle"):
-        code, submit = await _run(
-            action, ["--directory", str(repo), "--fail-on", "no-verdict", "--no-junit", "--dry-run"], []
-        )
-
-    assert code == EXIT_SUCCESS
-    assert "Nothing to do" not in caplog.text
-    assert caplog.messages[2:4] == ["Verifying 1 file(s):", "  Main.lean"]
-    submit.assert_not_awaited()
-
-
-async def test_a_lean_build_file_above_the_directory_is_a_change_to_its_lean_files(
-    action: ReviewAction, repo: Path, caplog
-):
-    _commit(repo, "lean-toolchain", "leanprover/lean4:v4.21.0\n")
+async def test_a_change_to_a_lean_file_has_nothing_to_verify(action: ReviewAction, repo: Path, caplog):
+    """Aristotle doesn't verify Lean, so no run starts."""
     _commit(repo, "Proofs/Basic.lean", "theorem two : 1 + 1 = 2 := rfl\n")
-    _commit(repo, "lean-toolchain", "leanprover/lean4:v4.22.0\n")
+    _commit(repo, "Proofs/Basic.lean", "theorem two : 1 + 1 = 2 := by decide\n")
 
     with caplog.at_level(logging.INFO, logger="aristotle"):
-        code, submit = await _run(
-            action,
-            ["--directory", str(repo / "Proofs"), "--fail-on", "no-verdict", "--no-junit", "--dry-run"],
-            [],
-        )
+        code, submit = await _run(action, ["--directory", str(repo), "--no-junit"], [])
 
     assert code == EXIT_SUCCESS
-    assert "Nothing to do" not in caplog.text
-    assert "  Basic.lean" in caplog.messages
+    assert caplog.messages[-1] == "This change touched no verifiable source file. Nothing to do."
     submit.assert_not_awaited()
 
 
@@ -1006,20 +982,6 @@ async def test_a_path_filter_decides_whether_a_held_back_change_stops_the_review
         assert caplog.messages[-1] == "This change touched no verifiable source file matching fifo.v. Nothing to do."
 
 
-async def test_a_change_to_a_lean_build_file_whose_lean_files_an_ignore_rule_holds_back_stops(
-    action: ReviewAction, repo: Path, caplog
-):
-    _commit(repo, "Proofs/lean-toolchain", "leanprover/lean4:v4.21.0\n")
-    _commit(repo, "Proofs/Basic.lean", "theorem two : 1 + 1 = 2 := rfl\n")
-    _commit(repo, ".gitignore", "*.lean\n")
-    _commit(repo, "Proofs/lean-toolchain", "leanprover/lean4:v4.22.0\n")
-
-    code, _ = await _run(action, ["--directory", str(repo), "--no-junit"], [])
-
-    assert code == EXIT_USAGE_ERROR
-    assert caplog.messages[-1] == HELD_BACK_STOP.replace("gen/regs.v", "Proofs/Basic.lean")
-
-
 @NAMED
 async def test_a_change_only_to_a_held_back_file_a_black_box_leaves_out_has_nothing_to_verify(
     action: ReviewAction, repo: Path, caplog, named: bool
@@ -1223,7 +1185,7 @@ async def test_a_dry_run_counts_only_what_would_be_uploaded(action: ReviewAction
 
 async def test_a_dry_run_leaves_out_tracked_aws_credentials(action: ReviewAction, repo: Path, caplog):
     _commit(repo, ".aws/credentials", "[default]\naws_access_key_id = EXAMPLEINVALID\n")
-    _commit(repo, "Proofs/credentials_test.lean", "theorem t : True := trivial\n")
+    _commit(repo, "src/credentials_test.c", "int main(void) { return 0; }\n")
 
     with caplog.at_level(logging.INFO, logger="aristotle"):
         await _run(action, ["--scope", "all", "--directory", str(repo), "--dry-run"], [])

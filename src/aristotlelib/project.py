@@ -3,6 +3,7 @@ import contextvars
 import dataclasses
 import errno
 import io
+import itertools
 import json
 import logging
 import os
@@ -18,6 +19,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO
 from urllib.parse import quote, urlencode
 
+import httpx
 import pydantic
 
 from aristotlelib import api_request, local_file_utils
@@ -397,6 +399,13 @@ class Archived:
     def summary(self) -> str:
         return local_file_utils.upload_summary(len(self.names), len(self.left_out), len(self.included))
 
+    def holds_lean(self) -> bool:
+        """Whether a .lean file other than a Lake build file goes up."""
+        return any(
+            name.endswith(".lean") and PurePosixPath(name).name not in local_file_utils.LEAN_BUILD_FILES
+            for name in self.names
+        )
+
 
 class ArchiveError(OSError):
     """A file couldn't be archived, as when one of the block's went away after it was read. It carries the original
@@ -460,30 +469,38 @@ def build_archive(
     block: verilog_bundle.Bundle | None = None,
     *,
     include_ignored: bool = False,
+    follow_up: bool = False,
 ) -> Archived:
     """Archive what submit uploads to ``tar_file_path``: ``project_dir`` as Project.create_from_directory describes
     it, with ``include_ignored`` too, with ``block``'s files and without those its black boxes leave out, from the
     folder too, which the ``aristotle`` logger then names; without ``project_dir``, ``block``'s files and its
-    ``aristotle.f`` alone.
+    ``aristotle.f`` alone. With ``follow_up``, the archive Project.ask sends: ``block`` only withholds the files its
+    black boxes leave out, and the folder's other files, its ``aristotle.f`` included, go up as they are.
 
     Raises:
-        LeanProjectError: nothing in ``project_dir`` would go up, or without ``block`` an ignore rule leaves out each of
-            its Verilog sources and no .lean, .c or .rs file goes up either, git could not say which files it
-            ignores, ``project_dir`` has an ``_ext`` folder where the block's files from outside it would go, or the
-            archive is over local_file_utils.MAX_FILE_SIZE_BYTES.
+        LeanProjectError: nothing in ``project_dir`` would go up, or, without ``block`` or with ``follow_up``, an ignore
+            rule leaves out each of its Verilog sources and no .c or .rs file goes up either, git could not say
+            which files it ignores, ``project_dir`` has an ``_ext`` folder where the block's files from outside it
+            would go, or the archive is over local_file_utils.MAX_FILE_SIZE_BYTES.
         verilog_bundle.BundleError: a file of the block changed after it was read, or a .v, .sv, .vh or .svh file in
             ``project_dir`` that would go up declares a black box beside another design unit.
         ArchiveError: a file couldn't be read, or was replaced while it was archived, or the archive written.
     """
     try:
-        return _build_archive(project_dir, tar_file_path, block, include_ignored)
+        return _build_archive(project_dir, tar_file_path, block, include_ignored, follow_up)
     except OSError as e:
         raise ArchiveError.wrapping(e) from e
 
 
 def _build_archive(
-    project_dir: Path | None, tar_file_path: Path, block: verilog_bundle.Bundle | None, include_ignored: bool
+    project_dir: Path | None,
+    tar_file_path: Path,
+    block: verilog_bundle.Bundle | None,
+    include_ignored: bool,
+    follow_up: bool,
 ) -> Archived:
+    # A follow-up's block withholds its black boxes' files, and nothing else of it applies.
+    withhold, block = block, None if follow_up else block
     # Built-in exclusions and .gitignore are checked separately so the summary counts only the latter.
     candidates: list[Path] = []
     empty = False
@@ -513,18 +530,20 @@ def _build_archive(
                     skipped.append(rel_path)
                     logger.debug(f"Skipping ignored file: {rel_path}")
                     continue
-                if block is not None and block.leaves_out(project_dir / rel_path):
+                if withhold is not None and withhold.leaves_out(project_dir / rel_path):
                     continue
                 candidates.append(rel_path)
     reached = (
-        frozenset([Path(block.filelist_name), *(Path(m.archive) for m in block.members if not block.is_outside(m))])
-        if block
+        frozenset(
+            [Path(withhold.filelist_name), *(Path(m.archive) for m in withhold.members if not withhold.is_outside(m))]
+        )
+        if withhold
         else frozenset()
     )
     # With include_ignored every candidate goes up whatever the ignore rules, so none is named as held back.
     ignored = (
         local_file_utils.gitignored_files(
-            project_dir, candidates, frozenset(candidates) if include_ignored else reached
+            project_dir, candidates, frozenset(candidates) if include_ignored else reached if block else frozenset()
         )
         if project_dir is not None
         else set()
@@ -535,8 +554,8 @@ def _build_archive(
         candidates = [p for p in candidates if p not in behind_junction]
         ignored -= behind_junction
     gitignored = set() if include_ignored else ignored
-    if block is not None and project_dir is not None and block.blackboxes:
-        block.leave_out_unnamed(
+    if withhold is not None and project_dir is not None and withhold.blackboxes:
+        withhold.leave_out_unnamed(
             [
                 project_dir / p
                 for p in candidates
@@ -549,8 +568,8 @@ def _build_archive(
             "goes up with the folder",
             ignorable=not include_ignored,
         )
-        candidates = [p for p in candidates if not block.leaves_out(project_dir / p)]
-        logger.info(verilog_bundle.blackbox_note(block))
+        candidates = [p for p in candidates if not withhold.leaves_out(project_dir / p)]
+        logger.info(verilog_bundle.blackbox_note(withhold, "the prompt" if block else withhold.filelist_name))
 
     secrets: list[Path] = []
     results: list[Path] = []
@@ -675,7 +694,9 @@ def _build_archive(
         logger.warning("WARNING: " + local_file_utils.skipped_symlinks_warning(skipped_symlinks))
     # Not when nothing goes up and a folder couldn't be read, which nothing_to_upload names.
     if project_dir is not None and block is None and (names or not unreadable):
-        _check_verilog_left_out(project_dir, names, gitignored)
+        boxed_files = itertools.chain.from_iterable(box.files for box in withhold.blackboxes) if withhold else ()
+        boxed = any(Path(f).suffix.lower() in _VERILOG_SOURCES for f in boxed_files)
+        _check_verilog_left_out(project_dir, names, gitignored, follow_up, boxed)
     if project_dir is not None and not names:
         raise local_file_utils.LeanProjectError(
             local_file_utils.nothing_to_upload(
@@ -697,6 +718,20 @@ def _build_archive(
     )
 
 
+def filelist_note(archived: Archived, block: verilog_bundle.Bundle | None) -> str | None:
+    """What a follow-up does with the folder's ``aristotle.f`` when ``archived`` holds one, taking ``block``'s black
+    boxes from it, or nothing without ``block``; None when it doesn't hold one."""
+    name = next((n for n in archived.names if "/" not in n and n.lower() == verilog_bundle.FILELIST_NAME), None)
+    if name is None:
+        return None
+    takes = "only its black boxes" if block is not None else "nothing"
+    return (
+        f"{name} goes up as written, in place of the project's, even one submit generated: a follow-up takes {takes} "
+        "from it, so a file it names goes up only from inside the folder, and if an ignore rule matches it, only with "
+        "--include-ignored (from Python, the include_ignored argument)."
+    )
+
+
 def _archive_names(names: list[str]) -> list[str]:
     """``names``, paths as the walk spells them, as archive_name() spells them in the archive, sorted."""
     return sorted(local_file_utils.archive_name(Path(name)) for name in names)
@@ -705,16 +740,26 @@ def _archive_names(names: list[str]) -> list[str]:
 _VERILOG_SOURCES = (".v", ".sv")
 """Suffixes of a Verilog source file; a header, such as ``.vh``, isn't one."""
 
-_OTHER_SOURCES = (".lean", ".c", ".rs")
-"""Suffixes of a Lean, C or Rust file."""
+_OTHER_SOURCES = (".c", ".rs")
+"""Suffixes of a C or Rust file."""
+
+LEAN_FILES_WARNING = (
+    "WARNING: The folder holds .lean files. Aristotle verifies Verilog and C code, and Rust where the account has it, "
+    "and writes the Lean itself: it doesn't verify Lean you send, and a project with only Lean files ends without "
+    "verifying anything."
+)
 
 _LEFT_OUT_SHOWN = 5
 """How many of the Verilog sources an ignore rule leaves out _check_verilog_left_out names."""
 
 
-def _check_verilog_left_out(project_dir: Path, names: list[str], ignored: set[Path]) -> None:
+def _check_verilog_left_out(
+    project_dir: Path, names: list[str], ignored: set[Path], follow_up: bool, boxed: bool
+) -> None:
     """When ``ignored``, the files of ``project_dir`` an ignore rule leaves out, hold a Verilog source and ``names``, the
-    upload's paths, hold none: raise LeanProjectError if ``names`` hold no .lean, .c or .rs file either, else warn."""
+    upload's paths, hold none: raise LeanProjectError if ``names`` hold no .c or .rs file either, else warn;
+    for a ``follow_up``, which takes no file from a filelist, suggesting only include_ignored, and, when black boxes
+    left out a source, ``boxed``, speaking of the sources they don't."""
     suffixes = [PurePosixPath(name).suffix.lower() for name in names]
     if any(suffix in _VERILOG_SOURCES for suffix in suffixes):
         return
@@ -723,25 +768,28 @@ def _check_verilog_left_out(project_dir: Path, names: list[str], ignored: set[Pa
         return
     stop = not any(suffix in _OTHER_SOURCES for suffix in suffixes)
     rules = local_file_utils.left_out_rules(project_dir, left_out[:_LEFT_OUT_SHOWN])
+    sources = "its .v and .sv files that its black boxes don't leave out" if boxed else "its .v and .sv files"
     lines = [
-        f"No Verilog source {'would go' if stop else 'goes'} up from {project_dir}: an ignore rule matches each of its "
-        ".v and .sv files:"
+        f"No Verilog source {'would go' if stop else 'goes'} up from {project_dir}: an ignore rule matches each of "
+        f"{sources}:"
     ]
     lines += [f"  {local_file_utils.archive_name(p)}" + (f"  ({rule})" if rule else "") for p, rule in rules.items()]
     if len(left_out) > _LEFT_OUT_SHOWN:
         lines.append(f"  and {len(left_out) - _LEFT_OUT_SHOWN} more")
     how = (
-        f"{local_file_utils.INCLUDE_IGNORED_HINT}, or describe the design with a filelist, which uploads every file it "
-        f"names, even one an ignore rule matches: {project_dir / verilog_bundle.FILELIST_NAME}, -F <filelist>, or "
+        f"{local_file_utils.INCLUDE_IGNORED_HINT}."
+        if follow_up
+        else f"{local_file_utils.INCLUDE_IGNORED_HINT}, or describe the design with a filelist, which uploads every file "
+        f"it names, even one an ignore rule matches: {project_dir / verilog_bundle.FILELIST_NAME}, -F <filelist>, or "
         "--top <module> with -f <filelist> (from Python, the block argument)."
     )
     if stop:
-        lines.append(
-            "No .lean, .c or .rs file would go up either, so the run would have no design to verify. To upload them, "
-            + how
+        consequence = (
+            "none of the project's sources would be replaced" if follow_up else "the run would have no code to verify"
         )
+        lines.append(f"No .c or .rs file would go up either, so {consequence}. To upload them, {how}")
         raise local_file_utils.LeanProjectError("\n".join(lines))
-    lines.append(f"To verify them too, {how}")
+    lines.append(f"To {'upload' if follow_up else 'verify'} them too, {how}")
     logger.warning("WARNING: " + "\n".join(lines))
 
 
@@ -757,6 +805,34 @@ def _file_and_folder(names: set[str]) -> tuple[str, str] | None:
 
 class ProjectHasNoFilesError(api_request.AristotleAPIError):
     """The project has neither output nor input files to download."""
+
+
+ARCHIVE_FILES_HEADER = "X-Aristotle-Archive-Files"
+"""The header of a follow-up's response giving how many files of its folder the server applied, after its filters."""
+
+
+class FolderNotAppliedError(api_request.AristotleAPIError):
+    """Project.ask's prompt started ``task`` without ``project_dir``'s files: the server answered without
+    ARCHIVE_FILES_HEADER, as one that doesn't take a folder with a follow-up does."""
+
+    def __init__(self, project_dir: Path, task: AgentTask):
+        super().__init__(
+            f"Aristotle didn't apply {project_dir} to project {task.project_id}: the server doesn't take a folder with "
+            f"a follow-up, so task {task.agent_task_id} started without the folder's files. "
+            + shell_hint("Cancel it with", ["aristotle", "cancel", task.agent_task_id])
+        )
+        self.project_dir = project_dir
+        self.task = task
+
+    def __reduce__(self) -> tuple[type["FolderNotAppliedError"], tuple[Path, AgentTask]]:
+        """Rebuilds from the constructor's arguments; args holds only the message."""
+        return type(self), (self.project_dir, self.task)
+
+
+def _files_applied(response: httpx.Response) -> int | None:
+    """The count a follow-up's ``response`` gives in ARCHIVE_FILES_HEADER; None when it gives none, or no count."""
+    value = response.headers.get(ARCHIVE_FILES_HEADER, "").strip()
+    return int(value) if value.isascii() and value.isdigit() else None
 
 
 PROJECT_ID_PREFIX_MIN_LENGTH = 8
@@ -998,12 +1074,12 @@ class Project(AristotleObject):
         ``local_file_utils.LEAN_BUILD_FILES``, files that local_file_utils.is_secret_path calls credentials, by name or
         by folder, result archives an earlier run saved, and files whose names aren't UTF-8; the ``aristotle`` logger
         names which tracked files, which credential files, which result archives and which names that aren't UTF-8 it
-        left out, and, without ``block``, the Verilog sources an ignore rule leaves out when none goes up but a .lean,
-        .c or .rs file does.
+        left out, without ``block``, the Verilog sources an ignore rule leaves out when none goes up but a .c or .rs
+        file does, and, when a .lean file other than Lean's build files goes up, that Aristotle doesn't verify Lean.
 
         Args:
             prompt: Tells Aristotle what to do.
-            project_dir: Path to the directory with any supplementary files, e.g. a Verilog, C or Rust project.
+            project_dir: Path to the directory with the code to verify, e.g. a Verilog, C or Rust project.
             agent_questions_setting: Whether the agent can ask questions. By default it can, and waits up to 15
                 minutes for each answer; DISABLED turns questions off.
             name: The project's name, as for create().
@@ -1020,7 +1096,7 @@ class Project(AristotleObject):
         Raises:
             ValueError: If the prompt or the name is empty, or the path is empty or not a directory.
             LeanProjectError: If Aristotle cannot take the directory, nothing in it would go up, or without ``block``
-                an ignore rule leaves out each of its Verilog sources and no .lean, .c or .rs file goes up either, git
+                an ignore rule leaves out each of its Verilog sources and no .c or .rs file goes up either, git
                 cannot say which files it ignores, or the archive is over local_file_utils.MAX_FILE_SIZE_BYTES.
             verilog_bundle.BundleError: If a file of ``block`` changed after it was read, or a .v, .sv, .vh or .svh
                 file in ``project_dir`` that would go up declares a black box beside another design unit.
@@ -1041,34 +1117,8 @@ class Project(AristotleObject):
             # A fixed local name: the folder's, once escaped, may be too long for a file name.
             tar_file_path = Path(temp_dir) / "project.tar.gz"
             archived = build_archive(project_dir, tar_file_path, block, include_ignored=include_ignored)
-            # After the archive, so that a folder with nothing to upload stops before the toolchain's request.
-            if local_file_utils.has_any_lean_files(project_dir):
-                toolchain_version = local_file_utils.get_lean_toolchain_version(project_dir)
-                expected_toolchain = await local_file_utils.get_expected_toolchain()
-
-                warning_message = None
-                if toolchain_version is None:
-                    warning_message = "Your project contains .lean files but no lean-toolchain is present.\n"
-                    if expected_toolchain:
-                        warning_message += f"Aristotle works best with Lean Toolchain {expected_toolchain}\n"
-                elif expected_toolchain and toolchain_version != expected_toolchain:
-                    warning_message = (
-                        f"Your Lean toolchain version ({toolchain_version}) does not match Aristotle's.\n"
-                        f"Aristotle works best with Lean Toolchain {expected_toolchain}\n"
-                    )
-
-                if warning_message:
-                    logger.warning("WARNING: " + warning_message)
-
-                # Check if .lake folder exists - warn if missing since user may have forgotten to lake build
-                lake_folder = project_dir / ".lake"
-                # os.path, not pathlib: before 3.14, Path.is_dir() raises for a path out of reach.
-                if not os.path.isdir(lake_folder):
-                    logger.warning(
-                        "WARNING: Your project contains .lean files but no .lake folder.\n"
-                        "Aristotle works better with access to your project's dependencies.\n"
-                        "Did you forget to run `lake build`?\n"
-                    )
+            if archived.holds_lean():
+                logger.warning(LEAN_FILES_WARNING)
 
             logger.info(archived.summary())
             return await cls.create(
@@ -1241,6 +1291,9 @@ class Project(AristotleObject):
         agent_questions_setting: AgentQuestionsSetting = AgentQuestionsSetting.TIMEOUT_15_MIN,
         *,
         project_dir: Path | str | None = None,
+        send_folder: bool = False,
+        include_ignored: bool = False,
+        block: verilog_bundle.Bundle | None = None,
     ) -> AgentTask:
         """Send a prompt to the project.
 
@@ -1251,23 +1304,52 @@ class Project(AristotleObject):
                 minutes for each answer; DISABLED turns questions off. A running task keeps its own setting.
             project_dir: The local project root, cwd by default. Files keep their paths relative to this root;
                 selecting fewer files never changes it. Files outside it, also through links, are refused.
+            send_folder: Send the whole ``project_dir`` folder instead of files, only when the project is idle, its
+                files picked as create_from_directory picks them, taking only ``block``'s black boxes: each replaces
+                the project's file at the same path or is added, and the project's other files stay.
+            include_ignored: With ``send_folder``, upload the files an ignore rule matches too.
+            block: With ``send_folder``, the Verilog block that the folder's ``aristotle.f`` describes, of which only
+                the black boxes apply: the files they leave out stay out, as create_from_directory leaves them out.
 
         Returns:
-            The agent task that was prompted.
+            The agent task that was prompted; with ``send_folder``, its ``files_applied`` counts the folder's files the
+            server applied.
 
         Raises:
             ValueError: Before anything is sent, if the prompt is empty, the file selection cannot be uploaded
-                under project_dir, or there are files and the project runs a task.
+                under project_dir, send_folder comes without project_dir or with files, the folder is empty or not a
+                directory, or include_ignored or ``block`` comes without send_folder; or if files or the folder come
+                while the project runs a task.
+            LeanProjectError: If Aristotle cannot take the folder send_folder sends, as for create_from_directory.
+            verilog_bundle.BundleError: If a .v, .sv, .vh or .svh file in that folder declares one of ``block``'s
+                black boxes beside another design unit.
+            ArchiveError: If a file of that folder can't be read, or is replaced while it is archived, or the archive
+                written.
+            FolderNotAppliedError: If the server started the task without applying that folder.
         """
         validate_prompt(prompt)
+        folder = None
+        if send_folder:
+            if project_dir is None:
+                raise ValueError("send_folder needs project_dir, the folder to send")
+            if files is not None:
+                raise ValueError("send_folder sends the whole folder, so it takes no files")
+            folder = validate_project_dir(project_dir)
+            if not os.path.isdir(folder):
+                raise ValueError(f"Path is not a directory: {folder}")
+            check_readable(folder)
+            local_file_utils.check_lake_manifest_references_local_deps(folder)
+        elif include_ignored:
+            raise ValueError("include_ignored needs send_folder, which sends the folder whose ignored files it uploads")
+        elif block is not None:
+            raise ValueError("block needs send_folder, which sends the folder whose files its black boxes leave out")
         # Read once: the check and the upload both go through it.
         files = list(files or [])
-        uploads = continuation_uploads(files, project_dir=project_dir) if files or project_dir is not None else []
-        if files:
-            with api_request.before_sending(PROMPT_NOT_SENT):
-                await self.refresh()
-            if self.status != ProjectStatus.IDLE:
-                raise ValueError(files_refused_while_running(self.project_id, "files"))
+        uploads = (
+            continuation_uploads(files, project_dir=project_dir)
+            if files or (project_dir is not None and folder is None)
+            else []
+        )
 
         data = {
             "prompt": prompt,
@@ -1275,6 +1357,17 @@ class Project(AristotleObject):
         }
 
         with ExitStack() as stack:
+            if folder is not None:
+                # Before any request, so that a folder Aristotle can't take stops with nothing sent.
+                archive_path = Path(stack.enter_context(tempfile.TemporaryDirectory())) / "project.tar.gz"
+                archived = build_archive(folder, archive_path, block, include_ignored=include_ignored, follow_up=True)
+            if files or folder is not None:
+                with api_request.before_sending(PROMPT_NOT_SENT):
+                    await self.refresh()
+                if self.status != ProjectStatus.IDLE:
+                    sent = "send_folder" if folder is not None else "files"
+                    raise ValueError(files_refused_while_running(self.project_id, sent))
+
             files_data: list[tuple[str, tuple[Any, ...]]] = []
             # The prompt goes in the same body, as a part beside the files.
             size = len(prompt.encode())
@@ -1282,6 +1375,14 @@ class Project(AristotleObject):
                 f = stack.enter_context(open(file_path, "rb"))
                 size += os.fstat(f.fileno()).st_size
                 files_data.append(("files", (name, f, "application/octet-stream")))
+            if folder is not None:
+                logger.info(archived.summary())
+                if (note := filelist_note(archived, block)) is not None:
+                    logger.info(note)
+                archive = stack.enter_context(open(archive_path, "rb"))
+                size += os.fstat(archive.fileno()).st_size
+                name = local_file_utils.upload_name(_folder_name(folder) or "project")
+                files_data.append(("archive", (f"{name}.tar.gz", archive, "application/gzip")))
 
             async with api_request.AristotleRequestClient() as client:
                 try:
@@ -1304,7 +1405,12 @@ class Project(AristotleObject):
                     raise api_request.AristotleNotProcessedError(
                         f"{e} {PROMPT_NOT_SENT}", e.status_code, e.error_code
                     ) from e
-                return AgentTask.model_validate(response.json())
+                task = AgentTask.model_validate(response.json())
+            if folder is not None:
+                task._files_applied = _files_applied(response)
+                if task._files_applied is None:
+                    raise FolderNotAppliedError(folder, task)
+            return task
 
     async def get_files(self, destination: Path | str | None = None) -> Path:
         """Download the project files.

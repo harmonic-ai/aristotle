@@ -206,6 +206,7 @@ class AgentTask(AristotleObject):
     output_summary: str | None
     # Set for someone else's shared project; the answer endpoint takes the owner only.
     read_only: bool = False
+    _files_applied: int | None = pydantic.PrivateAttr(default=None)
 
     endpoint_prefix = "task"
 
@@ -218,6 +219,12 @@ class AgentTask(AristotleObject):
     @property
     def object_id(self) -> str:
         return self.agent_task_id
+
+    @property
+    def files_applied(self) -> int | None:
+        """How many files of the folder Project.ask's ``send_folder`` sent the server applied, on the task that call
+        returned; None on any other task. It isn't part of the task's JSON."""
+        return self._files_applied
 
     @property
     def live(self) -> bool:

@@ -1,13 +1,14 @@
 ---
 name: aristotle
-description: Formally verify code with Harmonic's Aristotle through the `aristotle` CLI. Submits a project, answers its questions, reports which properties were proved or refuted, and keeps an existing `aristotle.toml`, the properties `aristotle ci` checks, in step with the code. Use when the user asks to prove, formally verify or find a counterexample to a property of Verilog/SystemVerilog, C or Rust code, mentions Aristotle or `aristotle.toml`, or changes code or a spec that an `aristotle.toml` covers.
+description: Formally verify code with Harmonic's Aristotle through the `aristotle` CLI. Submits a project, answers its questions, reports which properties were proved or refuted, and keeps an existing `aristotle.toml`, the properties `aristotle ci` checks, in step with the code. Use when the user asks to prove, formally verify or find a counterexample to a property of Verilog/SystemVerilog or C code, or Rust code where their account has Rust, mentions Aristotle or `aristotle.toml`, or changes code or a spec that an `aristotle.toml` covers.
 ---
 
 # Aristotle
 
 Aristotle formally verifies code. You state a property in plain language, or name an assertion or a function in the
-code, and Aristotle either proves it or finds a counterexample. This skill targets **aristotlelib 3.1.0**. Its
-commands are for POSIX shells; in Windows PowerShell, read [references/windows.md](references/windows.md) first.
+code, and Aristotle either proves it or finds a counterexample. Rust is enabled per account; without it, Aristotle
+leaves Rust code out of the run. This skill targets **aristotlelib 3.2.0**. Its commands are for POSIX shells; in
+Windows PowerShell, read [references/windows.md](references/windows.md) first.
 
 ## Before the first command
 
@@ -59,6 +60,11 @@ commands are for POSIX shells; in Windows PowerShell, read [references/windows.m
 
 ## Ground rules
 
+- Aristotle verifies Verilog and C code, and Rust where the user's account has it. Send the user's code as it is, never
+  Lean you wrote or a translation of the code: Aristotle writes the Lean itself. It doesn't verify pure mathematics or
+  Lean: a project with only Lean files runs, costs money and verifies nothing, so tell the user that rather than
+  submitting one. To verify existing code, always pass `--project-dir`: without it only the prompt goes up, and unless
+  the prompt includes the code itself or asks Aristotle to design new hardware, the run verifies nothing.
 - Every run is a paid agent run that takes tens of minutes, and can take an hour or more. Start one only when the user
   asked for verification or agreed to one, never as a side effect.
 - Many accounts can have only one project in progress: a second exits 6 or waits in a queue. Never cancel, continue
@@ -93,8 +99,9 @@ echo "exit $?"
 - **The prompt:** state each property precisely: the module or function, the file, the signals or variables, the
   assumptions (reset, input ranges, preconditions) and what must hold, as in
   `Prove that <property> for <module or function> in <file>.` Ask for one property, or a few, per run.
-- **The folder:** pass a directory that holds what the proof needs, such as the sources, headers, build files and
-  spec, and nothing secret: files named like credentials stay out, but the check goes by names only.
+- **The folder:** pass the directory that holds the code to verify, as it is, with what the proof needs, such as the
+  headers, build files and spec, and nothing secret: files named like credentials stay out, but the check goes by
+  names only.
   `aristotle submit --dry-run --prompt-file <out>/prompt.md --project-dir <dir>` lists what would go up.
 - **Verilog:** name the top module, the defines and the include directories in the prompt. `submit` reads the
   `aristotle.f` filelist at the folder's root, if there is one, and each filelist that `-f` or `-F` names, uploading
@@ -175,7 +182,7 @@ command again, or resume a run it had already started rather than start another.
 | 3 | The run failed or was cancelled, or the command couldn't finish. | If stderr says nothing was done or no run was started (under `--json`, `{"outcome": "not_processed"}`), run the same command again, after the wait its message asks for, if any; if the files weren't saved, run `aristotle download <id> --destination <out>/result.tar.gz`. Otherwise read `task.status` with `aristotle show <id> --json`: resume a `QUEUED` or `IN_PROGRESS` run, report a `FAILED` or `CANCELED` one, and otherwise retry later. |
 | 4 | Not found, or refused: a closed question or an ended run. | Check the ids, for example with `aristotle questions <id> --json`. Don't retry the same command. |
 | 5 | No API key, or Aristotle rejected it, or it can't be sent (blank, or a space, a control or a non-ASCII character in it). From `aristotle login`, the user denied the login or its code expired. | Ask the user which way to log in (see above). After a denied or expired login, ask before starting another. |
-| 6 | Rate limited: too many projects in progress, or too many requests. Or the organization doesn't have the credits to start a run. | If stderr says the organization needs credits, tell the user that an organization admin can buy them at https://aristotle.harmonic.fun/settings/billing, and run the command again only once that's done, or, when it says each active run needs a credit, once another of the organization's runs has finished. If it says too many runs or projects are in progress, `aristotle list --status RUNNING --json` shows what is running: wait for one to finish and retry, or ask the user whether to cancel one of theirs. Otherwise wait a minute and run the same command again. |
+| 6 | Rate limited: too many projects in progress, or too many requests. Or the organization doesn't have the credits to start a run. | If stderr says the organization needs credits, tell the user what it says: where to buy them, and, when Aristotle names it, which organization needs them. Run the command again only once that's done, or, when it says each active run needs a credit, once another of the organization's runs has finished. If it says too many runs or projects are in progress, `aristotle list --status RUNNING --json` shows what is running: wait for one to finish and retry, or ask the user whether to cancel one of theirs. Otherwise wait a minute and run the same command again. |
 | 7 | The request may have gone through, but its response was lost. | Don't send it again yet: [look for it](#finding-a-run-that-may-exist). If stderr says an earlier copy was still in progress, wait a minute first. |
 | 124, 130 | `timeout` ended a slice (124), or Ctrl-C did (130). | Resume, as under [Long waits](#long-waits). |
 | 141 | stdout or stderr was closed early, for example by `\| head`. | Don't send it again: resume, with stdout going to a file. |
@@ -251,9 +258,8 @@ it reported, and one that failed or was cancelled never checked its proofs: repo
 `true` as unchecked, whatever its status.
 
 To summarize or look up a project's results, read them: `show`, `properties`, `property` and `download` start no run.
-Don't send a `continue` just to ask about them: on an idle project it starts a new run, which can spend hours checking
-the proofs again before it answers. If the user asked for one, read the results instead, say why, and send it only if
-they still want it.
+Don't send a `continue` just to ask about them: on an idle project it starts a new run, which spends credits. If the
+user asked for one, read the results instead, say why, and send it only if they still want it.
 
 To give an idle project another instruction, write it to `<out>/next.md` and run
 `timeout -s INT 540 aristotle continue <id> --prompt-file <out>/next.md --non-interactive > <out>/run.json`. It works
@@ -266,6 +272,8 @@ symlinks, paths containing `..`, and duplicate upload paths exit 2 before any re
 to the current directory or absolute. `download --artifact` preserves paths beneath its destination: use that
 folder as the root when uploading again. Plain `download` saves the archive unchanged; extract it and choose its
 project root first.
+`--send-folder` with `--project-dir <root>` sends that whole folder instead, each file replacing the project's copy,
+even one Aristotle has edited: pass it only when the user asks to send the folder again.
 
 ## Keeping aristotle.toml current
 
@@ -340,7 +348,8 @@ Then check it:
 
 - **3.0.0**, and the pre-releases below, work as described here, except:
   - A refusal for credits exits 3, quoting Aristotle's answer with `OUT_OF_CREDITS`, with nothing on stdout under
-    `--json`: no run was started, so go by the exit-6 row. A `submit` or `continue` whose stderr quotes
+    `--json`: no run was started, so go by the exit-6 row, and tell the user that an organization admin can buy
+    credits at https://aristotle.harmonic.fun/settings/billing. A `submit` or `continue` whose stderr quotes
     `BILLING_UNAVAILABLE` exits 7, though nothing was created: run it again in a few minutes.
   - A run billing stopped says only that it ran out of budget, and results have no `budget_failure_reason`:
     `task.output_summary` says when billing stopped it.

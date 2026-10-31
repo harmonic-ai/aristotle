@@ -83,7 +83,11 @@ before anything is sent, and names the others: move the module to a file of its 
 them too. A header the design includes that declares one stops it too, since the include brings it
 back: drop the `` `include `` and name the file in the filelists instead. So does a black box that
 names the top module. The `aristotle.f` that goes up is then generated, without `--blackbox`, which
-Aristotle doesn't read, so like any generated one it can't use `-y` yet. `aristotle ci` and
+Aristotle doesn't read, so like any generated one it can't use `-y` yet. `aristotle continue
+--send-folder` leaves out the files the black boxes of the folder's `aristotle.f` leave
+out, as `submit` does, though the `aristotle.f` itself goes up only as the folder's other files do, and as
+written; it takes no `--blackbox` of its own, so keep a model that mustn't be sent black-boxed in
+`aristotle.f`. `aristotle ci` and
 `aristotle review` take `--blackbox` in the root `aristotle.f` the same way, and a review verifies
 no file a black box leaves out. `review` reads the block only when it reviews the whole checkout or
 Verilog files, and `aristotle ci setup` never does: those send such a file with the rest of the
