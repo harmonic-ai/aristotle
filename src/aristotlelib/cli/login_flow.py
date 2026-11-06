@@ -38,6 +38,11 @@ logger = logging.getLogger(__name__)
 
 DEVICE_START = "/cli/device/start"
 DEVICE_TOKEN = "/cli/device/token"
+ORGANIZATION = "/organization"
+BILLED_TO_SECONDS = 10
+"""Longest a login or a submit waits to learn who the key's runs are billed to, before leaving that line out."""
+PERSONAL_ORGANIZATION_TYPE = 1
+"""The ``organization_type`` Aristotle gives a personal organization."""
 CLIENT_NAME = "aristotle CLI"
 PREVIOUS_KEY = "previous_api_key"
 """The start request's field for the key a device login stored here before, which collecting the new key may retire."""
@@ -439,6 +444,36 @@ async def _device_login(
         return await _poll(client, device, progress, leftover)
 
 
+async def billed_to(client: api_request.AristotleRequestClient) -> str | None:
+    """Who runs started with the client's key are billed to, to print: the organization's name, its whitespace collapsed,
+    or "your personal organization"; None when Aristotle doesn't say within BILLED_TO_SECONDS, or names nobody fit to
+    print. Retries are logged at debug level."""
+    try:
+        with api_request.quietly(lambda: True):
+            response = await asyncio.wait_for(client.get(ORGANIZATION), BILLED_TO_SECONDS)
+    except (AristotleAPIError, asyncio.TimeoutError):
+        return None
+    organization = _json_object(response)
+    if organization.get("organization_type") == PERSONAL_ORGANIZATION_TYPE:
+        return "your personal organization"
+    name = organization.get("name")
+    if not isinstance(name, str):
+        return None
+    name = " ".join(name.split())
+    return name if _shown(name) else None
+
+
+async def _billed_to_key(api_key: str) -> str | None:
+    """billed_to() for ``api_key``, rather than the key the environment would send."""
+    previous = api_request.API_KEY
+    api_request.set_api_key(api_key)
+    try:
+        async with api_request.AristotleRequestClient() as client:
+            return await billed_to(client)
+    finally:
+        api_request.API_KEY = previous
+
+
 async def _verify(api_key: str) -> None:
     """Make one authenticated request with the key. Raises LoginError if it is not accepted."""
     previous = api_request.API_KEY
@@ -465,18 +500,21 @@ async def login(
     open_browser: bool = True,
     api_key: str | None = None,
     on_pending: Callable[[LoginPending], None] | None = None,
+    on_stored: Callable[[LoginResult], None] | None = None,
 ) -> LoginResult:
     """Verify ``api_key``, or else a key piped to stdin, approved in the browser or, where the server can't do that,
-    pasted; store it, and say where.
+    pasted; store it, and say where and who runs started with it are billed to.
 
     ``on_pending`` receives the code to approve while the login waits for it, in place of a progress line on stderr.
+    ``on_stored`` receives the result as soon as the key is stored, before the login asks who pays.
 
     Raises:
         LoginError: no key was entered or approved, api_request.api_key_problem() refused it, Aristotle did not accept
             it, or it could not be stored.
         KeyboardInterrupt: Ctrl-C before the key was read, or Ctrl-D at the prompt; said on stderr, with where to revoke
-            a key the login may have made, before it is raised.
-        asyncio.CancelledError: Ctrl-C under asyncio.run while the login waits for approval; said on stderr as above.
+            a key the login may have made, before it is raised. Ctrl-C once the key is stored says it stays stored.
+        asyncio.CancelledError: Ctrl-C under asyncio.run while the login waits for approval, or once the key is stored;
+            said on stderr as above.
     """
     leftover = _Leftover()
     try:
@@ -510,14 +548,25 @@ async def login(
     except (KeyboardInterrupt, asyncio.CancelledError):
         _report_cancelled(leftover.note)
         raise
+    result = LoginResult(credentials_path=str(path), key_name=key_name)
     stored = "Key" if key_name is None else f'Key "{key_name}"'
     logger.info(f"Logged in. {stored} stored in {path}.")
+    if on_stored is not None:
+        on_stored(result)
+    try:
+        payer = await _billed_to_key(api_key)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        sys.stderr.write("\nInterrupted. The key stays stored.\n")
+        raise
+    if payer is not None:
+        stop = "" if payer.endswith((".", "!", "?")) else "."
+        logger.info(f"Runs started with this key are billed to {payer}{stop}")
     if os.environ.get("ARISTOTLE_API_KEY"):
         logger.warning(
             "ARISTOTLE_API_KEY is set in this environment and takes precedence over the stored key. "
             "Unset it, and remove it from your shell profile, to use the stored key."
         )
-    return LoginResult(credentials_path=str(path), key_name=key_name)
+    return result
 
 
 def _store(api_key: str, key_name: str | None, device_login: bool) -> Path:

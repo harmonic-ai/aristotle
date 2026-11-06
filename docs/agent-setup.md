@@ -177,6 +177,5 @@ Print one line for each part. Follow every line that isn't ✓ with the next act
 
 ✓ means checked, ⚠ means the user has something to do, and ✗ means a step failed. List every User step that is still
 open, such as `/reload-plugins` or `uv tool update-shell`. Then tell the user what they can ask you for, such as "prove
-that this FIFO never overflows". Aristotle verifies their Verilog and C as it is, and Rust too if their account has it,
-and writes the Lean itself. It doesn't verify pure mathematics or Lean: a project with only Lean files runs and verifies
-nothing. Runs cost money, so you'll confirm with them before starting one.
+that this FIFO never overflows". Aristotle verifies their Verilog and C as it is, and writes the Lean itself. It
+doesn't verify pure mathematics or Lean: a project with only Lean files runs and verifies nothing. Runs cost money, so you'll confirm with them before starting one.

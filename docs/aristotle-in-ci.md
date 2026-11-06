@@ -2,9 +2,8 @@
 
 ## Formal verification as a merge gate
 
-Aristotle proves the properties your team lists in `aristotle.toml` about your Verilog, C, and
-Rust — on every pull request that could affect them, reported the same way your unit tests are.
-Verilog and C are available on every account, and Rust on accounts where it's enabled.
+Aristotle proves the properties your team lists in `aristotle.toml` about your Verilog and C on
+every pull request that could affect them, reported the same way your unit tests are.
 
 No new dashboard to check. No specialist to schedule. If a change breaks a property your
 team cares about, the build goes red and the engineer who wrote the change finds out on
@@ -182,7 +181,7 @@ API key.
 
 The GitLab and Jenkins recipes below pull the image `ghcr.io/harmonic-ai/aristotle:3`, which
 each release publishes. The GitHub Action runs the same image at its own release's version, so
-`harmonic-ai/aristotle@v3` runs the newest 3.x release and `@v3.2.0` stays on 3.2.0. The image is
+`harmonic-ai/aristotle@v3` runs the newest 3.x release and `@v3.3.0` stays on 3.3.0. The image is
 built for x86-64 (`linux/amd64`) only, so a runner on Arm needs x86-64 emulation to run it.
 
 Until Aristotle can re-check results it has already established, every `aristotle ci` run is a
@@ -459,10 +458,11 @@ fails it on them, in progress, unresolved or unchecked.
 One the run has no property under, because Aristotle registered none or withdrew it, is
 without a verdict too, as `not registered`, or `not registered, run cut short` when the run ended before
 registering it: ran out of budget or time, failed or was cancelled. A run that verifies none of the manifest's properties fails
-the build, even under the default `fail-on`, and the log names the likely causes and links the run.
-If Rust isn't enabled for the account, Aristotle leaves that code out of the run. The step can't ask
-Aristotle whether it is, so the log names Rust as a possible cause. Only
-`fail-on: never` lets such a run pass. Aristotle checks a
+the build, even under the default `fail-on`. The JUnit report records it as an error, and the log names the likely
+causes and links the run.
+Aristotle leaves out files in a language the account can't verify, and the step can't always ask
+whether it can, so the log names that as a possible cause. Only `fail-on: never` lets such a run
+pass. Aristotle checks a
 run's results when the run finishes, so a run that runs out of budget, or hits the time budget,
 reports what it reached as unchecked: a proof or refutation it reported has no verdict, labelled
 `proved, unchecked` or `refuted, unchecked`, and the step fails with `3`: for a run the time
@@ -536,7 +536,6 @@ and follows it, exiting `7` if it can't find it.
 |---|---|
 | **Verilog / SystemVerilog** | Temporal properties over module traces — liveness, bounded response, mutual exclusion, no-deadlock, protocol conformance, overflow freedom |
 | **C** | Memory safety, absence of undefined behavior, functional correctness against a specification |
-| **Rust** | Functional correctness, panic freedom, invariants across `unsafe` boundaries |
 
 You choose the properties, and stating one takes a sentence or a name, not a formal
 specification. Aristotle formalizes each one and describes it in plain language, so a reviewer
@@ -687,9 +686,8 @@ aristotle review --scope paths --path 'rtl/core/**'
 aristotle review --scope all         # every source file — for a nightly job
 ```
 
-Source files are Verilog and SystemVerilog (`.v`, `.sv`, `.svh`, `.vh`), C (`.c`, `.h`) and Rust
-(`.rs`, on accounts where Rust is enabled). Aristotle doesn't verify Lean, so a change to a `.lean`
-file is never in a run's scope.
+Source files are Verilog and SystemVerilog (`.v`, `.sv`, `.svh`, `.vh`) and C (`.c`, `.h`).
+Aristotle doesn't verify Lean, so a change to a `.lean` file is never in a run's scope.
 
 `--instructions` (`ARISTOTLE_INSTRUCTIONS`) adds instructions to the run, for example to use the
 assertions already in the repository.
@@ -705,7 +703,8 @@ A CI checkout often holds only the commit being built. When it lacks the history
 the change began, the step fetches the target branch — or the default branch, on a GitLab branch
 pipeline, or the commit before a push — from `origin` itself, deepening a shallow clone as far as
 it needs. If it cannot, it stops with the usage-error code (`2`) rather than guess from the last
-commit alone, whatever `fail-on` is.
+commit alone, whatever `fail-on` is. When the comparison is the last commit alone, the step fetches
+that commit's parent into a shallow clone, and stops the same way if it cannot.
 
 A `paths` or `all` scope that matches no source file exits with the usage-error code (`2`),
 and so does a `--path` pattern that matches no tracked source file, so a mistyped pattern
@@ -723,8 +722,9 @@ as a `paths` or `all` scope of only such files does. To keep such a file out of 
 purpose, as a model that mustn't be sent, give `--path` (`ARISTOTLE_PATHS`) globs that don't match
 it.
 
-Scope is about effort, not exposure: the whole tracked checkout is uploaded either way, so
-that a scoped module can be analyzed against its real dependencies. See
+Scope is about effort, not exposure: whatever the scope, the step uploads the tracked files of
+the folder it checks, the whole checkout or the subproject `--directory` names, so that a scoped
+module can be analyzed against its real dependencies. See
 [Security and data handling](#security-and-data-handling).
 
 ---
@@ -745,8 +745,9 @@ dumps, vendor blobs, local credentials — never leaves the machine. The excepti
 build files (`lakefile.lean`, `lakefile.toml`, `lake-manifest.json` and `lean-toolchain`, in any
 folder), which go up whenever git tracks them, and the design's files that `--allow-untracked`
 lets through.
-The step names each tracked file it holds back, with the rule that matched it and how to upload
-it. With an `aristotle.f` at the root, it, every filelist it names, every file it names or
+The step names each tracked file it holds back, other than a `.lean` file, with the rule that
+matched it and how to upload it.
+With an `aristotle.f` at the root, it, every filelist it names, every file it names or
 includes, and the file any link among them leads to, must be tracked by git in the folder the step
 uploads, neither named like a credential nor in a folder that holds credentials, and none of them
 may use an environment variable: one that breaks this stops the step before anything is sent and
@@ -776,7 +777,8 @@ generated one, derived from it, goes up in its place. A file it leaves out of th
 Verilog files, held back or not, and then verifies each held-back file in its scope that the block
 takes; `aristotle ci setup` and other
 reviews send it with the rest of the checkout. An `` `include`` by absolute path into the
-checkout is rewritten in the uploaded copy, but files otherwise go up as they are. It also leaves out, and names, a tracked file whose name isn't UTF-8, which Aristotle can't
+checkout is rewritten in the uploaded copy, but files otherwise go up as they are. Each file keeps its permissions, but
+not its modification time or the name and id of the user and group that own it. The step also leaves out, and names, a tracked file whose name isn't UTF-8, which Aristotle can't
 take. A symbolic link goes up only when its target does, and a tracked path that isn't a file in the checkout,
 such as a submodule or a file outside a sparse checkout, is left out. Tracked files are dropped too
 when their name, ignoring case, matches one of `.env`, `.env.*`, `.envrc`, `*.pem`, `*.key`,
@@ -911,7 +913,7 @@ names. `aristotle ci` and `aristotle review` take no `--top` or `-D` of their ow
 a simulator reads a filelist, nested `-f` and `-F` files, `+incdir+`, `+define+` and joined
 options included, so the one your flow writes usually works as it is. Every file it names or
 includes goes up, and each must be tracked by git in the folder the step uploads; an environment
-variable in it stops the step. See
+variable in it stops the step, and so does an `aristotle.f` that names no source file. See
 [Verilog build configuration](verilog.md) for what it reads and an
 example.
 

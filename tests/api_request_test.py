@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, Mock, call, patch
 from urllib.request import getproxies_environment
 
 import httpx
+import pydantic
 import pytest
 
 from aristotlelib import api_request, credentials
@@ -31,11 +32,13 @@ from aristotlelib.api_request import (
     set_api_key,
 )
 from tests.conftest import (
+    ACCOUNT_REFUSAL,
     BILLING_PAGE,
     BILLING_UNAVAILABLE,
     BUY_CREDITS,
     FAKE_KEY,
     NAMED_ORGANIZATION,
+    OBJECT_REFUSALS,
     OUT_OF_CREDITS,
     PADDED_KEYS,
     REFUSED_KEYS,
@@ -1364,13 +1367,41 @@ async def test_a_client_error_is_not_retried(status, api_server):
             await client.get("/project")
 
     if status == 403:
-        assert str(info.value) == (
-            "Error: this account doesn't have access (403)\n\n"
-            "Hint: it may be awaiting approval or no longer in the key's organization. Contact aristotle@harmonic.fun."
-        )
+        assert str(info.value) == ACCOUNT_REFUSAL
     else:
         assert str(info.value) == f"API request failed with status {status}: No."
     assert len(requests) == 1
+
+
+@pytest.mark.parametrize(
+    ("detail", "message"),
+    OBJECT_REFUSALS.items(),
+    ids=["an object it can't see or change", "a question it can't answer", "a project of another organization"],
+)
+async def test_a_403_that_refuses_one_object_says_which_refusal_it_is(detail, message, api_server):
+    requests = api_server(_status(403, detail))
+
+    async with AristotleRequestClient() as client:
+        with pytest.raises(AristotleAPIError) as info:
+            await client.get("/project")
+
+    assert (type(info.value), str(info.value), info.value.status_code) == (AristotleAPIError, message, 403)
+    assert len(requests) == 1
+
+
+@pytest.mark.parametrize(
+    "detail",
+    ["forbidden", "Forbidden.", "Not authorized", {"code": None, "message": "Forbidden"}],
+    ids=["another case", "another stop", "another string", "a detail object"],
+)
+async def test_any_other_403_detail_is_the_accounts_refusal(detail, api_server):
+    api_server(httpx.Response(403, json={"detail": detail}))
+
+    async with AristotleRequestClient() as client:
+        with pytest.raises(AristotleAPIError) as info:
+            await client.get("/project")
+
+    assert (type(info.value), str(info.value), info.value.status_code) == (AristotleAPIError, ACCOUNT_REFUSAL, 403)
 
 
 @pytest.mark.parametrize(
@@ -2027,6 +2058,166 @@ async def test_what_a_page_that_isnt_aristotles_says_is_never_shown(api_server, 
             await client.post("/project")
 
     assert "Sign in" not in str(info.value) + caplog.text
+
+
+class _Listing(pydantic.BaseModel):
+    projects: list[str]
+    pagination_key: str | None = None
+
+
+READ_LISTING = api_request.json_as(_Listing)
+
+UNREADABLE_ERROR = (
+    "the answer from https://aristotle.harmonic.fun was 200 OK with JSON this version of aristotlelib can't read "
+    "(projects: Field required): a proxy may have answered instead, or a newer aristotlelib may be needed."
+)
+"""What a request whose ``read`` is READ_LISTING says of a 200 ``{}``, after its request and attempts."""
+
+
+@pytest.mark.parametrize(
+    ("answer", "summary"),
+    [
+        (httpx.Response(200, json={}), "JSON this version can't read (projects: Field required)"),
+        (
+            httpx.Response(200, json={"projects": "p-1"}),
+            "JSON this version can't read (projects: Input should be a valid list)",
+        ),
+        (
+            httpx.Response(200, json={"projects": [], "pagination_key": 2}),
+            "JSON this version can't read (pagination_key: Input should be a valid string)",
+        ),
+        (
+            httpx.Response(200, json={"projects": [1, None]}),
+            "JSON this version can't read (projects.0: Input should be a valid string, and 1 more)",
+        ),
+        (
+            httpx.Response(200, json=[]),
+            "JSON this version can't read (Input should be a valid dictionary or instance of _Listing)",
+        ),
+        (
+            httpx.Response(200, content=b"not JSON", headers={"Content-Type": "application/json"}),
+            "application/json that isn't JSON, not Aristotle's answer",
+        ),
+        (
+            httpx.Response(200, content=b'{"projects": ["\xff"]}', headers={"Content-Type": "application/json"}),
+            "application/json that isn't JSON, not Aristotle's answer",
+        ),
+        (httpx.Response(200, headers={"Content-Type": "application/json"}), "an empty body, not Aristotle's answer"),
+    ],
+    ids=["no key", "wrong type", "bad cursor", "bad items", "not an object", "not JSON", "not UTF-8", "empty"],
+)
+async def test_an_answer_a_read_cant_take_is_retried_and_named(answer, summary, api_server, caplog):
+    requests = api_server(answer, httpx.Response(200, json={"projects": ["p-1"]}))
+
+    async with AristotleRequestClient() as client:
+        listing = await client.get("/project", read=READ_LISTING)
+
+    assert listing == _Listing(projects=["p-1"])
+    assert len(requests) == 2
+    assert caplog.messages == [f"Retrying in 0.0 s after 200 on GET /project: {summary}"]
+
+
+@pytest.mark.usefixtures("frozen_api_clock", "no_proxy_settings")
+async def test_json_a_read_never_takes_ends_the_request_saying_where_it_failed(api_server):
+    requests = api_server(*(lambda request: httpx.Response(200, json={}) for _ in range(api_request.RETRY_ATTEMPTS)))
+
+    async with AristotleRequestClient() as client:
+        with pytest.raises(AristotleAPIError) as info:
+            await client.get("/project", read=READ_LISTING)
+
+    assert str(info.value) == f"GET /project after 5 attempts over 0 s: {UNREADABLE_ERROR}"
+    assert info.value.status_code is None
+    assert type(info.value) is AristotleAPIError
+    assert isinstance(info.value.__cause__, httpx.HTTPStatusError)
+    assert len(requests) == api_request.RETRY_ATTEMPTS
+
+
+@pytest.mark.usefixtures("no_proxy_settings")
+async def test_json_a_read_cant_take_after_a_post_that_isnt_safe_to_repeat_is_an_unknown_outcome(api_server):
+    requests = api_server(httpx.Response(200, json={}))
+
+    async with AristotleRequestClient() as client:
+        with pytest.raises(AristotleOutcomeUnknownError) as info:
+            await client.post("/project", read=READ_LISTING)
+
+    assert str(info.value) == (
+        f"POST /project: {UNREADABLE_ERROR} Aristotle may have acted on it, so it was not sent again."
+    )
+    assert info.value.status_code is None
+    assert len(requests) == 1
+
+
+async def test_json_a_read_cant_take_after_a_post_that_is_safe_to_repeat_is_sent_again(api_server):
+    requests = api_server(httpx.Response(200, json={}), httpx.Response(200, json={"projects": []}))
+
+    async with AristotleRequestClient() as client:
+        listing = await client.post("/project/p-1/rename", idempotent=True, read=READ_LISTING)
+
+    assert listing == _Listing(projects=[])
+    assert len(requests) == 2
+
+
+@pytest.mark.parametrize(
+    ("environment", "error"),
+    [
+        (
+            {"ARISTOTLE_WEB_URL": "http://127.0.0.1:8000"},
+            "the answer from http://127.0.0.1:8000 was 200 OK with JSON this version of aristotlelib can't read "
+            "(projects: Field required): a proxy or a wrong ARISTOTLE_WEB_URL may have answered instead, or a newer "
+            "aristotlelib may be needed.",
+        ),
+        (
+            {"HTTPS_PROXY": "http://proxy-user:proxy-password@proxy.corp:3128"},
+            "the answer from https://aristotle.harmonic.fun through the proxy proxy.corp was 200 OK with JSON this "
+            "version of aristotlelib can't read (projects: Field required): a proxy may have answered instead, or a "
+            "newer aristotlelib may be needed.",
+        ),
+    ],
+    ids=["another origin", "through a proxy"],
+)
+async def test_json_a_read_cant_take_says_where_it_came_from(environment, error, api_server, monkeypatch):
+    for name in (*api_request.PROXY_VARIABLES, "HTTP_PROXY", "http_proxy", "NO_PROXY", "no_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(api_request, "getproxies", getproxies_environment)
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    api_server(httpx.Response(200, json={}))
+
+    async with AristotleRequestClient() as client:
+        with pytest.raises(AristotleOutcomeUnknownError) as info:
+            await client.post("/project", read=READ_LISTING)
+
+    assert str(info.value) == f"POST /project: {error} Aristotle may have acted on it, so it was not sent again."
+
+
+async def test_json_a_read_cant_take_is_never_quoted(api_server, caplog):
+    caplog.set_level(logging.DEBUG)
+    api_server(httpx.Response(200, json={"projects": [{"name": "Sign in to continue"}], "pagination_key": ["Sign"]}))
+
+    async with AristotleRequestClient() as client:
+        with pytest.raises(AristotleOutcomeUnknownError) as info:
+            await client.post("/project", read=READ_LISTING)
+
+    assert "Sign" not in str(info.value) + caplog.text
+
+
+@pytest.mark.parametrize(
+    "error",
+    [KeyError("projects"), httpx.ReadTimeout("the read's own"), httpx.LocalProtocolError("the read's own")],
+    ids=["key error", "httpx timeout", "httpx protocol error"],
+)
+async def test_a_read_that_fails_on_its_own_raises_its_error_unretried(error, api_server):
+    requests = api_server(_ok())
+
+    def read(response: httpx.Response) -> object:
+        raise error
+
+    async with AristotleRequestClient() as client:
+        with pytest.raises(type(error)) as info:
+            await client.get("/project", read=read)
+
+    assert info.value is error
+    assert len(requests) == 1
 
 
 def _key_busy(retry_after: str = "1") -> httpx.Response:

@@ -83,6 +83,28 @@ NAMED_ORGANIZATION = {
 }
 """What a refusal for credits adds to its detail when Aristotle names the organization that needs them."""
 
+OBJECT_REFUSALS = {
+    "Forbidden": (
+        "Error: this account can't see or change this project or task (403)\n\n"
+        "Hint: check its id. Only the project's owner can send it a prompt, with a key from the project's organization."
+    ),
+    "Not authorized to answer this question": (
+        "Error: this account can't answer this question (403)\n\n"
+        "Hint: only the project's owner can answer it, with a key from the project's organization."
+    ),
+    "Cannot continue a project owned by a different organization": (
+        "Error: this project isn't in this key's organization (403)\n\n"
+        "Hint: continue it with a key from the project's organization."
+    ),
+}
+"""Each detail of Aristotle's 403s that refuse one object, and the message the SDK shows instead of it."""
+
+ACCOUNT_REFUSAL = (
+    "Error: this account doesn't have access (403)\n\n"
+    "Hint: it may be awaiting approval or no longer in the key's organization. Contact aristotle@harmonic.fun."
+)
+"""The message for any other 403 in Aristotle's format."""
+
 PADDED_KEYS = [
     pytest.param(f"{padding}{FAKE_KEY}" if leading else f"{FAKE_KEY}{padding}", id=f"{side} {padding!r}")
     for leading, side in ((True, "leading"), (False, "trailing"))
@@ -306,6 +328,37 @@ def frozen_api_clock(monkeypatch: pytest.MonkeyPatch) -> None:
     runner. It stops at 1000 s, not 0, so a figure that is the clock's reading rather than the time since the first
     attempt fails the test. The autouse fixtures leave no pacing or backoff to wait out."""
     monkeypatch.setattr(api_request, "time", Mock(monotonic=lambda: 1000.0))
+
+
+class _Reading:
+    """A mocked AristotleRequestClient whose get() and post() pass their answers through the call's ``read``, as the
+    real client does; the mock it wraps sees each call without ``read``, and gives every other attribute."""
+
+    def __init__(self, client: Any) -> None:
+        self._client = client
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._client, name)
+
+    async def __aenter__(self) -> "_Reading":
+        await self._client.__aenter__()
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        await self._client.__aexit__(*exc_info)
+
+    async def get(self, *args: Any, read: Callable[[Any], Any] | None = None, **kwargs: Any) -> Any:
+        answer = await self._client.get(*args, **kwargs)
+        return answer if read is None else read(answer)
+
+    async def post(self, *args: Any, read: Callable[[Any], Any] | None = None, **kwargs: Any) -> Any:
+        answer = await self._client.post(*args, **kwargs)
+        return answer if read is None else read(answer)
+
+
+def patched_client(client: Any) -> Any:
+    """Patch AristotleRequestClient to make ``client``, a mock, whose answers each request reads as the real client's."""
+    return patch("aristotlelib.api_request.AristotleRequestClient", return_value=_Reading(client))
 
 
 def give_key(source: str, key: str, monkeypatch: pytest.MonkeyPatch, config_dir: Path) -> list[str]:

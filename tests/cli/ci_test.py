@@ -59,7 +59,7 @@ from aristotlelib.exit_codes import (
 from aristotlelib.printable import escape_logged_text
 from aristotlelib.project import Project, ProjectStatus
 from aristotlelib.verilog import bundle, filelist
-from tests.ci.conftest import commit_bare_shaped, git, latin1_name, make_declaration
+from tests.ci.conftest import commit_bare_shaped, git, latin1_name, make_declaration, merge_conflict
 from tests.conftest import (
     BILLING_PAGE,
     BUY_CREDITS,
@@ -256,6 +256,16 @@ async def test_outside_a_repository_ci_says_so_rather_than_that_it_has_no_manife
     assert run.code == EXIT_USAGE_ERROR
     assert caplog.messages[-1].startswith(f"{tmp_path.resolve()} is not a git repository.")
     assert "No aristotle.toml found" not in caplog.text
+    run.submit.assert_not_awaited()
+
+
+async def test_an_unresolved_merge_conflict_stops_ci_before_anything_goes_up(action: CIAction, repo: Path, caplog):
+    merge_conflict(repo, "fifo.v")
+
+    run = await _run(action, ["--directory", str(repo)])
+
+    assert run.code == EXIT_USAGE_ERROR
+    assert caplog.messages[-1].startswith(f"Unresolved merge conflicts in {repo}: fifo.v\n")
     run.submit.assert_not_awaited()
 
 
@@ -712,7 +722,7 @@ def test_a_language_that_is_off_comes_first_and_one_aristotle_cannot_vouch_for_l
         "C is not enabled for this account, so Aristotle left it out",
         "Aristotle registered nothing under some of the manifest's ids",
         DECISION,
-        "Rust is left out if this account can't verify it, which Aristotle gives no way to check",
+        "files in a language this account can't verify are left out, which Aristotle gives no way to check",
     ]
 
 
@@ -1171,6 +1181,35 @@ async def test_project_refuses_a_run_ci_did_not_start(action: CIAction, repo: Pa
         "Project test-123 wasn't started by `aristotle ci`, or was started by an older version that doesn't record "
         f"which files and manifest its run checks. To check this checkout, {FRESH}."
     )
+
+
+async def test_project_compares_a_checkout_with_an_unresolved_merge_conflict_with_the_run(
+    action: CIAction, repo: Path, caplog
+):
+    started = _record(repo)
+    merge_conflict(repo, "fifo.v")
+
+    assert await _refused(action, repo, caplog, _prompt_ending(started)) == (
+        f"Project test-123's run checks other files than this checkout's: it started at commit {started.commit[:12]}, "
+        f"and this checkout is at commit {_head(repo)[:12]}. If it started from a clean checkout, check out commit "
+        f"{started.commit[:12]} to report on it; to check this one, {FRESH}."
+    )
+
+
+async def test_project_reports_from_a_conflicted_checkout_whose_files_are_the_runs(action: CIAction, repo: Path):
+    """A modify/delete conflict leaves this side's file as it was, though git lists it twice."""
+    git(repo, "checkout", "-q", "-b", "theirs")
+    git(repo, "rm", "-q", "fifo.v")
+    git(repo, "commit", "-qm", "theirs")
+    git(repo, "checkout", "-q", "-")
+    _commit(repo, "fifo.v", "module fifo;\n  // ours\nendmodule\n")
+    started = _record(repo)
+    merge = subprocess.run(["git", "-C", str(repo), "merge", "--no-ff", "theirs"], capture_output=True)
+    assert merge.returncode == 1, merge.stdout + merge.stderr
+
+    (run, _) = await _follow(action, ["--directory", str(repo)], prompt=_prompt_ending(started))
+
+    run.wait.assert_awaited_once()
 
 
 PLANTED_BUG = "module fifo;\n  // planted bug\nendmodule\n"
@@ -3410,6 +3449,23 @@ def test_a_tracked_file_sharing_a_black_box_with_another_module_stops(
     assert caplog.messages[-1] == (
         f"{Path('repo', 'vendor', 'sram_1p.v')} ({reason.format(f=f)}) can't be left out for --blackbox sram_1p "
         f"({f}:1): it also declares sram_ctrl. Move sram_1p to a file of its own, {fix}."
+    )
+
+
+@pytest.mark.parametrize("dry_run", [True, False], ids=["--dry-run", "run"])
+async def test_a_root_aristotle_f_of_black_boxes_alone_stops_before_anything_goes_up(
+    action: CIAction, repo: Path, caplog, dry_run: bool
+):
+    """It names no source file, so fifo.v would go up beside an aristotle.f naming none."""
+    _commit(repo, "aristotle.f", "--blackbox sram_1p\n")
+
+    run = await _run(action, ["--directory", str(repo), "--no-junit", *(["--dry-run"] if dry_run else [])])
+
+    assert run.code == EXIT_USAGE_ERROR
+    run.submit.assert_not_awaited()
+    assert caplog.messages[-1] == (
+        f"{Path('repo', 'aristotle.f')} names no source file, so Aristotle would elaborate an empty design. Name the "
+        "design's sources in it."
     )
 
 

@@ -1,5 +1,5 @@
 name: "Aristotle formal verification"
-description: "Prove the properties in aristotle.toml about your Verilog, C and Rust, or review a change, and report each as a test."
+description: "Prove the properties in aristotle.toml about your Verilog and C, or review a change, and report each as a test."
 author: "Harmonic"
 
 branding:
@@ -60,7 +60,7 @@ outputs:
 runs:
   # This release's image, which the release pushes before it moves the `v3` tag.
   using: "docker"
-  image: "docker://ghcr.io/harmonic-ai/aristotle:3.2.0"
+  image: "docker://ghcr.io/harmonic-ai/aristotle:3.3.0"
   # The image has no entrypoint (GitLab and Jenkins start it with their own shell), so it is named here.
   entrypoint: "aristotle"
   args:

@@ -1,9 +1,8 @@
 # Aristotle
 
 Aristotle formally verifies your code. Point it at a project, state the property that must hold, and it returns a proof
-or a counterexample. It verifies Verilog and C, and Rust on accounts where Rust is enabled. Send your code as it is:
-Aristotle writes the Lean itself. It doesn't verify pure mathematics or Lean: a project with only Lean files runs and
-verifies nothing.
+or a counterexample. It verifies Verilog and C. Send your code as it is: Aristotle writes the Lean itself. It doesn't
+verify pure mathematics or Lean: a project with only Lean files runs and verifies nothing.
 
 This package is the `aristotle` command-line tool and the Python library for the Aristotle API. To sign up and read
 the full documentation, go to [aristotle.harmonic.fun](https://aristotle.harmonic.fun).
@@ -52,11 +51,12 @@ aristotle login
 ```
 
 The command prints a link and a code, and opens the link in your browser when it can. Open the link where you're
-signed in to Aristotle, enter the code, check that the page names this machine, and approve.
+signed in to Aristotle, enter the code, check that the page names this machine, and approve. If you belong to more
+than one organization, the page also asks which one the key is for.
 
 Aristotle then creates a key named after this machine. The CLI stores it for every later command, readable only by
 you, in `~/.config/aristotle/credentials.json` (under `$XDG_CONFIG_HOME` if that's set), or in
-`%APPDATA%\aristotle` on Windows.
+`%APPDATA%\aristotle` on Windows. It then says who runs started with the key are billed to.
 
 Over SSH or in a container, open the link on any device where you're signed in. A coding agent can run
 `aristotle login` for you and pass on the link and the code, so the key never appears in the conversation.
@@ -104,6 +104,7 @@ Wherever a command takes a project, you can give its id, the first 8 or more cha
 | `aristotle tasks <project>` | Lists a project's runs. |
 | `aristotle cancel <project>` | Cancels the run in progress. |
 | `aristotle rename <project> "<name>"` | Renames a project. |
+| `aristotle delete <project>` | Deletes a project for good, after asking. Its runs and results go with it, and its shared link stops working. |
 
 During a run, Aristotle may ask how you want your code verified, such as which reset polarity or input ranges to
 assume, and it waits up to 15 minutes for each answer. With `--wait`, the CLI shows each question as it comes, with
@@ -153,7 +154,8 @@ root of the folder you submit. For `aristotle ci`, commit it at the root of the 
 ```
 
 Aristotle reads it the way a simulator reads a filelist, so the one your flow already writes usually works as it is.
-Every file it names or includes is uploaded.
+Name the design's source files in it, or in a filelist it names, as `-F rtl/soc.f` does here. Every file it names or
+includes is uploaded.
 
 `--blackbox` tells Aristotle to treat a module, such as a foundry cell, as a black box with unconstrained outputs. A
 file that declares only black-boxed modules stays out of the upload, whether the filelists name it or it's a `.v`,

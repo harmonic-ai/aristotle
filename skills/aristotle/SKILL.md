@@ -1,13 +1,12 @@
 ---
 name: aristotle
-description: Formally verify code with Harmonic's Aristotle through the `aristotle` CLI. Submits a project, answers its questions, reports which properties were proved or refuted, and keeps an existing `aristotle.toml`, the properties `aristotle ci` checks, in step with the code. Use when the user asks to prove, formally verify or find a counterexample to a property of Verilog/SystemVerilog or C code, or Rust code where their account has Rust, mentions Aristotle or `aristotle.toml`, or changes code or a spec that an `aristotle.toml` covers.
+description: Formally verify code with Harmonic's Aristotle through the `aristotle` CLI. Submits a project, answers its questions, reports which properties were proved or refuted, and keeps an existing `aristotle.toml`, the properties `aristotle ci` checks, in step with the code. Use when the user asks to prove, formally verify or find a counterexample to a property of their code, mentions Aristotle or `aristotle.toml`, or changes code or a spec that an `aristotle.toml` covers.
 ---
 
 # Aristotle
 
 Aristotle formally verifies code. You state a property in plain language, or name an assertion or a function in the
-code, and Aristotle either proves it or finds a counterexample. Rust is enabled per account; without it, Aristotle
-leaves Rust code out of the run. This skill targets **aristotlelib 3.2.0**. Its commands are for POSIX shells; in
+code, and Aristotle either proves it or finds a counterexample. This skill targets **aristotlelib 3.3.0**. Its commands are for POSIX shells; in
 Windows PowerShell, read [references/windows.md](references/windows.md) first.
 
 ## Before the first command
@@ -60,11 +59,11 @@ Windows PowerShell, read [references/windows.md](references/windows.md) first.
 
 ## Ground rules
 
-- Aristotle verifies Verilog and C code, and Rust where the user's account has it. Send the user's code as it is, never
-  Lean you wrote or a translation of the code: Aristotle writes the Lean itself. It doesn't verify pure mathematics or
-  Lean: a project with only Lean files runs, costs money and verifies nothing, so tell the user that rather than
-  submitting one. To verify existing code, always pass `--project-dir`: without it only the prompt goes up, and unless
-  the prompt includes the code itself or asks Aristotle to design new hardware, the run verifies nothing.
+- Send the user's code as it is, whatever its language, never Lean you wrote or a translation of the code: Aristotle
+  writes the Lean itself, and if the account can't verify a language, the run says so. It doesn't verify pure
+  mathematics or Lean: a project with only Lean files runs, costs money and verifies nothing, so tell the user that
+  rather than submitting one. To verify existing code, always pass `--project-dir`: without it only the prompt goes up,
+  and unless the prompt includes the code itself or asks Aristotle to design new hardware, the run verifies nothing.
 - Every run is a paid agent run that takes tens of minutes, and can take an hour or more. Start one only when the user
   asked for verification or agreed to one, never as a side effect.
 - Many accounts can have only one project in progress: a second exits 6 or waits in a queue. Never cancel, continue
@@ -148,6 +147,9 @@ Exit 124 or 130 means the slice ended. Then, by `task.status` in `run.json`:
 Stopping `submit`, `show` or `continue` leaves the run going, but stopping `aristotle ci` cancels its run (see step 3
 under [Keeping aristotle.toml current](#keeping-aristotletoml-current)). To stop a run you started by mistake, run
 `aristotle cancel <project-id>`, which exits 4 if the run had already finished (0 if it was already cancelled).
+Never delete a project the user didn't ask you to delete. `--yes` skips the prompt, so you ask in its place: tell the
+user the project's id and name (its `description` in `aristotle show <project> --json`), and wait for their yes
+before running `aristotle delete <full project-id> --yes`, which can't be undone.
 
 Where `timeout` is missing (exit 127; on macOS it may be `gtimeout`, from `brew install coreutils`), start the run
 with `--json` in place of `--non-interactive`, and without `timeout` or `--destination`, so it returns once the run
@@ -315,7 +317,7 @@ Then check it:
 2. Make sure git tracks every file the properties depend on, since `aristotle ci` uploads only tracked files, as they
    are on disk: `git add` each new one your change adds, such as a new source, `aristotle.toml` or `aristotle.f`, and
    stage nothing else; ask before you stage the user's own files (if your sandbox can't write to `.git`, ask the user
-   to). The dry run names each tracked file an ignore rule holds back.
+   to). The dry run names each tracked file an ignore rule holds back, other than `.lean` files.
 3. Run the real check when the user wants the gate confirmed. Each run proves every property from scratch.
    **Never stop it with a signal or a shell timeout: that cancels its run.** Give it a budget under your shell's time
    limit instead, and let the run go on when the budget runs out:

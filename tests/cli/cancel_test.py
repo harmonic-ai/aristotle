@@ -120,6 +120,22 @@ async def test_cancel_action_fallback_to_task():
     mock_task.cancel.assert_called_once()
 
 
+async def test_cancelling_a_deleted_project_says_it_was_deleted_without_trying_a_task():
+    parser = argparse.ArgumentParser()
+    action = CancelAction(parser.add_subparsers())
+    action.add_action_arguments()
+    deleted = AristotleNotFoundError("project", TASK_ID, 410, f"Project {TASK_ID} was deleted.")
+
+    with (
+        patch("aristotlelib.cli.command.cancel.Project.from_id", side_effect=deleted),
+        patch("aristotlelib.cli.command.cancel.AgentTask.from_id") as task_from_id,
+        pytest.raises(AristotleNotFoundError, match=f"Project {TASK_ID} was deleted."),
+    ):
+        await action.run_action(action.parser.parse_args([TASK_ID]))
+
+    task_from_id.assert_not_called()
+
+
 async def test_cancel_resolves_a_project_reference_and_never_tries_it_as_a_task(resolve_project):
     parser = argparse.ArgumentParser()
     action = CancelAction(parser.add_subparsers())

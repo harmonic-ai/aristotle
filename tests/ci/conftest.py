@@ -88,6 +88,21 @@ def commit_bare_shaped(repo: Path, name: str = "hw") -> Path:
     return folder
 
 
+def merge_conflict(repo: Path, name: str) -> None:
+    """Leave ``repo`` in a merge whose conflict on its committed file ``name`` isn't resolved."""
+    path = repo / name
+    original = path.read_bytes()
+    git(repo, "checkout", "-q", "-b", "theirs")
+    path.write_bytes(original + b"// theirs\n")
+    git(repo, "commit", "-qam", "theirs")
+    git(repo, "checkout", "-q", "-")
+    path.write_bytes(original + b"// ours\n")
+    git(repo, "commit", "-qam", "ours")
+    # --no-ff: a merge.ff=only in the global config refuses the merge instead of stopping on the conflict.
+    merge = subprocess.run(["git", "-C", str(repo), "merge", "--no-ff", "theirs"], capture_output=True)
+    assert merge.returncode == 1, merge.stdout + merge.stderr
+
+
 def recording_git(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
     """The command line of every git command run from now on, as subprocess.run() gets it."""
     calls: list[list[str]] = []

@@ -2,6 +2,7 @@
 
 from typing import Any, Literal
 
+import httpx
 import pydantic
 from pydantic.functional_validators import ModelWrapValidatorHandler
 
@@ -77,9 +78,12 @@ class Question(pydantic.BaseModel):
         Raises:
             AristotleAPIError: with status 404 or 405 when the server has no questions endpoint.
         """
+
+        def read(response: httpx.Response) -> list["Question"]:
+            return [cls.model_validate(item) for item in _LISTING.validate_python(response.json())]
+
         async with api_request.AristotleRequestClient() as client:
-            response = await client.get(f"/task/{agent_task_id}/questions")
-            questions: list[Question] = [cls.model_validate(item) for item in response.json()]
+            questions = await client.get(f"/task/{agent_task_id}/questions", read=read)
         for question in questions:
             question._run_live = run_live
         # The server does not promise an order.
@@ -94,7 +98,11 @@ class Question(pydantic.BaseModel):
         """
         async with api_request.AristotleRequestClient() as client:
             try:
-                response = await client.post(f"/question/{self.question_id}/answer", json={"answer": answer})
+                updated = await client.post(
+                    f"/question/{self.question_id}/answer",
+                    json={"answer": answer},
+                    read=api_request.json_as(type(self)),
+                )
             except api_request.AristotleOutcomeUnknownError as e:
                 raise api_request.AristotleOutcomeUnknownError(
                     f"{e} If it did, the question was answered: check `aristotle questions {self.project_id} --json`, "
@@ -107,6 +115,22 @@ class Question(pydantic.BaseModel):
                 if e.status_code == 409:
                     raise QuestionClosed("This question is already closed") from e
                 raise
-        updated = self.model_validate(response.json())
         for field_name in type(self).model_fields:
             setattr(self, field_name, getattr(updated, field_name))
+
+
+_LISTING = pydantic.TypeAdapter(list[dict[str, Any]])
+
+
+def _question_notice(question: Question, read_only: bool = False) -> str:
+    asked = f"Aristotle asked: {question.content}"
+    if question.answered:
+        who = "The project's owner" if read_only else "You"
+        return f"{asked}\n{who} answered: {question.response}"
+    if question.ignored:
+        return f"{asked}\nThe question was closed without an answer."
+    if question.state == "UNANSWERED":
+        return f"{asked}\nThe run has ended, so no answer can reach Aristotle now."
+    if read_only:
+        return f"{asked}\nWaiting for an answer; only the project's owner can answer."
+    return f"{asked}\nWaiting for an answer; answer with: aristotle questions {question.project_id}"

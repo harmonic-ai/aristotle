@@ -312,6 +312,13 @@ class DownloadResult(pydantic.BaseModel):
     result_path: str
 
 
+class DeleteResult(pydantic.BaseModel):
+    """``aristotle delete --json``: the project deleted."""
+
+    project_id: str
+    deleted: bool
+
+
 class SavedArtifact(pydantic.BaseModel):
     """A file ``aristotle download --artifact`` saved."""
 

@@ -2,15 +2,16 @@ import argparse
 import asyncio
 import sys
 
+import pydantic
+
 from aristotlelib.cli.api_action import EXIT_INTERRUPTED, APIAction, print_json
 from aristotlelib.cli.login_flow import LoginError, login
 from aristotlelib.printable import printable
-from aristotlelib.results import LoginPending
 
 
-def _print_pending(pending: LoginPending) -> None:
-    """Print the code to approve as JSON at once, for a program that reads it while the login waits."""
-    print_json(pending)
+def _print_now(result: pydantic.BaseModel) -> None:
+    """Print a result as JSON at once, for a program that reads it while the login goes on."""
+    print_json(result)
     sys.stdout.flush()
 
 
@@ -59,8 +60,11 @@ class LoginAction(APIAction):
     async def run_action(self, args: argparse.Namespace) -> int | None:
         api_key = getattr(args, "api_key", None)
         try:
-            result = await login(
-                open_browser=not args.no_browser, api_key=api_key, on_pending=_print_pending if args.json else None
+            await login(
+                open_browser=not args.no_browser,
+                api_key=api_key,
+                on_pending=_print_now if args.json else None,
+                on_stored=_print_now if args.json else None,
             )
         except (KeyboardInterrupt, asyncio.CancelledError):
             # login() has said so. Returned, not raised as SystemExit: asyncio.run may be cancelling this task.
@@ -68,7 +72,4 @@ class LoginAction(APIAction):
             return EXIT_INTERRUPTED
         except LoginError as e:
             self.parser.exit(e.exit_code, printable(f"{e}\n"))
-
-        if args.json:
-            print_json(result)
         return None

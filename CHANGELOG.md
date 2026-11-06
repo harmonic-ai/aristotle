@@ -4,6 +4,119 @@ All notable changes to `aristotlelib`, the Aristotle Python SDK and `aristotle` 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.3.0] - 2026-11-06
+
+### Added
+
+- `aristotle delete <project>` deletes a project for good, after asking at a terminal: its runs and results go with it,
+  its shared link stops working, and your organization's billing page still lists the credits its runs used. A run
+  still going must end first, or `delete` exits 4 with the command that cancels it. Without a terminal, and with
+  `--json`, which prints `{"project_id", "deleted"}`, it needs `--yes`. In the SDK, `Project.delete_by_id` and
+  `Project.delete` delete a project, and `aristotlelib.results.DeleteResult` is what `delete --json` prints. (#362)
+- `aristotle login` says who runs started with the key are billed to, after where it stored the key: `Runs started
+  with this key are billed to Acme Robotics.`, or `... billed to your personal organization.` `aristotle submit` says
+  `This run is billed to ...` after the project's link. Someone in several organizations can then tell at once which
+  one pays. Both lines go to stderr, so `--json` output is unchanged. Each is left out when Aristotle doesn't say
+  within 10 seconds, as a server without the organization endpoint doesn't. (#365)
+- In the SDK, `AristotleRequestClient.get()` and `post()` take `read`, a function of the answer whose result they
+  return. It runs inside the retries: a pydantic `ValidationError` it raises makes the answer one this version can't
+  read, and a `json.JSONDecodeError` or `UnicodeDecodeError` one that isn't Aristotle's. Either is retried as a server
+  error is when the request is safe to repeat, and raises `AristotleOutcomeUnknownError` when it isn't.
+  `aristotlelib.api_request.json_as(model)` gives a `read` that validates the answer's JSON as the pydantic model
+  `model`. (#373)
+- In the SDK, `aristotlelib.local_file_utils.ARCHIVED_MTIME` holds the one modification time, 2000-01-01, that every
+  file copied from your disk into an upload's archive carries. (#374)
+
+### Changed
+
+- Reading a deleted project, as `show`, `tasks`, `cancel` or `Project.from_id` do, raises `AristotleNotFoundError`
+  saying the project was deleted, and exits 4, where it was a generic error. (#362)
+- `submit`, `continue --send-folder`, `aristotle ci` and `aristotle review` no longer name a tracked `.lean` file that
+  an ignore rule holds back, or say how to upload it, since Aristotle doesn't verify Lean. They still name every other
+  tracked file held back, with its rule and how to upload it, and `submit` still counts the `.lean` file among those an
+  ignore rule left out and lists it under `--dry-run`. In the SDK, `Project.create_from_directory()` and
+  `Project.ask(send_folder=True)` no longer name one either. (#360)
+- The CI guide says which files `aristotle review` uploads whatever its scope: the tracked files of the folder it
+  checks, which is the subproject `--directory` names when it names one. It said the whole tracked checkout. (#360)
+- The README, the CI and agent setup guides, and the CLI's help and messages name the languages every account has,
+  Verilog and C. The skill names no language: it tells agents to send the user's code in whatever language it's in, and
+  that the run says if the account can't verify it. When a manifest run verifies nothing and the upload holds code in a
+  language the account may not have, `aristotle ci` says files in a language the account can't verify are left out,
+  without naming it. (#366)
+- `continue --project-dir` without `--files` or `--send-folder` exits 2 before anything is sent, and says to add
+  `--send-folder` to send the whole folder or `--files` to send some of its files, or to drop `--project-dir` to send
+  the prompt alone. It sent the prompt alone without saying so, though `submit --project-dir` sends the folder, so a
+  run could start without the files the prompt was about. `--files` naming no file still sends the prompt alone.
+  For a project running a task, the refusal of `--files` or `--send-folder` says to leave out `--project-dir` and
+  `--include-ignored` too, where they were given. (#379)
+
+### Fixed
+
+- When `aristotle logout` can't remove the stored key, as from a folder `sudo aristotle login` made root's, it says so,
+  names the file and the reason, and exits 3. It ended in a traceback that didn't say whether the key had been removed.
+  (#369)
+- A 200 answer in JSON that isn't in the shape this version reads, such as a project listing without its projects or a
+  project without `has_files`, ends the command with one line saying where it failed, after the retries a server error
+  gets: `GET /project after 5 attempts over 21 s: the answer from https://aristotle.harmonic.fun was 200 OK with JSON
+  this version of aristotlelib can't read (projects: Field required): a proxy may have answered instead, or a newer
+  aristotlelib may be needed.` An answer typed as JSON that isn't JSON is reported as an answer that isn't Aristotle's.
+  A create, a prompt or an answer it answers may have reached Aristotle first, so `submit`, `continue` and
+  `questions --answer` exit 7 for it, and `submit --json` and `continue --json` print `"outcome": "unknown"`. Every
+  command crashed with a traceback, a `KeyError`, `TypeError`, `AttributeError` or pydantic `ValidationError`, and
+  `--json` printed nothing. In the SDK, `Project`, `AgentTask`, `Event`, `Question` and `Declaration` methods raise
+  `AristotleAPIError` for such an answer, or `AristotleOutcomeUnknownError` for a request that isn't safe to repeat,
+  such as `Project.create()`, `Project.ask()` or `Question.answer()`. (#373)
+- In the SDK, a question's event from `AgentTask.get_events()` prints the question Aristotle asked and what became of
+  it, as `aristotle show` does, and `Event.answer()` answers the question while it waits. The event itself only says
+  "Asked a question", so printing it said that Aristotle timed out and went with its best guess, and `Event.answer()`
+  raised "This question timed out", even while the question waited for an answer. A refusal now says why: the question
+  was already answered or closed without an answer, its run has ended, or only the project's owner can answer it. The
+  CLI reference no longer says that an event's `status` 2 means a question awaits an answer. (#358)
+- `show --task` with an older task no longer prints the property counts while the project's latest task is queued or
+  running, since that task may still change them. It says the counts come once that task has ended. `--json` already
+  gave `property_counts` as `null` until then. For a project whose latest task is in a status this version doesn't
+  know, `show` prints the same line in place of the counts, as `--json` gives `null` there too. (#367)
+- `aristotle ci`, `aristotle review` and `aristotle ci setup` stop with exit 2 while a merge conflict in the folder they
+  upload isn't resolved, and name the conflicted files. They uploaded such a file once for each version the merge held
+  and counted every copy, so a file both sides changed went up three times, conflict markers and all, and `review` said
+  it was verifying 3 files for one. Once each conflict is marked resolved with `git add` or `git rm`, they run as
+  before, though the merge isn't committed yet. (#359)
+- `submit --wait` and `submit --non-interactive` without `--destination` check that the current folder, where they
+  save the result archive, can be written to before submitting anything, and exit 2 if it can't, as they do for a
+  `--destination`. They submitted all the same and waited for the whole run, said it was complete, and then failed to
+  save the archive and exited 3. (#368)
+- A run of `aristotle ci` that verified none of the manifest's properties is an error in its JUnit report, the
+  `Aristotle run` test case, which says so and carries the run's summary. The step already failed, but the report held
+  only skipped tests, so GitLab's merge request widget and Jenkins' test view showed no failure on a red build. (#370)
+- `aristotle review` fetches the previous commit from `origin` into a shallow clone when it compares the last commit
+  alone, as for a new branch or tag, a merge queue, or a scheduled or manual run in a depth-1 checkout. It stopped with
+  exit 2, saying there was no parent commit. It fetches that one commit, not `origin`'s other branches. (#370)
+- `aristotle ci`, `aristotle review` and `aristotle ci setup` upload a tracked file whose name holds a carriage return,
+  such as macOS's `Icon\r`, and `review` verifies one that is a source file. They read git's output as text, which
+  turned the carriage return into a line end, so they left the file out and blamed a submodule. (#370)
+- `submit --project-dir`, `aristotle ci` and `aristotle review` stop with exit 2 before anything goes up when the
+  `aristotle.f` they read names no source file, such as one holding only `--blackbox` lines, and name it, unless a `-f`
+  or `-F` on `submit`'s command line names the sources. They sent an `aristotle.f` that named no file for Aristotle to
+  use as the commands file, so the run started from an empty design. (#372)
+- Aristotle's 403 for one project, task or question says what it refused, with a hint, as the CLI reference lists. A
+  project or task the key can't see or change, where a command doesn't report it as not found or not accessible, such
+  as someone else's project that `continue` or `Project.ask()` sends a prompt to, reads
+  `Error: this account can't see or change this project or task (403)`. An answer to someone else's question that
+  Aristotle refuses, such as one `Question.answer()` sends, reads
+  `Error: this account can't answer this question (403)`, and a `continue` that Aristotle refuses because the project
+  is in another organization than the key's reads `Error: this project isn't in this key's organization (403)`. All
+  three said `Error: this account doesn't have access (403)`, with a hint that the account may be awaiting approval,
+  as any other 403 in Aristotle's format still does. The messages are the SDK's own: the server's text still isn't
+  shown. (#361)
+- The archive that `submit`, `continue --send-folder`, `aristotle ci`, `aristotle review` and `aristotle ci setup`
+  upload no longer carries your local user and group names, their ids, or each file's modification time, which Aristotle
+  doesn't use: every file it copies from your disk keeps its permissions, and goes up with owner ids 0, no owner names
+  and one fixed time, 2000-01-01. Building the archive is about three to four times faster for a folder of many small
+  files, since the CLI no longer compiles its built-in ignore patterns again for each file or looks up the owner's
+  names: a `submit --dry-run` of 20,000 files of 20 bytes took about 30 s, and takes about 7 s. In the SDK,
+  `Project.create_from_directory()` and `Project.ask(send_folder=True)` build it the same way, and
+  `local_file_utils.ARCHIVED_MTIME` holds the fixed time. (#374)
+
 ## [3.2.0] - 2026-10-31
 
 ### Added

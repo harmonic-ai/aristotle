@@ -23,7 +23,15 @@ from aristotlelib.cli.command.logout import LogoutAction
 from aristotlelib.cli.controller import main
 from aristotlelib.cli.login_flow import EXPIRED, LoginError
 from aristotlelib.results import LoginResult
-from tests.cli.conftest import APPROVED_KEY, DEVICE_CODE, KEY_NAME, USER_CODE, approved, token_error
+from tests.cli.conftest import (
+    APPROVED_KEY,
+    DEVICE_CODE,
+    KEY_NAME,
+    USER_CODE,
+    approved,
+    ctrl_c_before_answering,
+    token_error,
+)
 from tests.conftest import user_agent_of
 
 NOT_FOUND = httpx.Response(404, json={"detail": "Not Found"})
@@ -217,6 +225,38 @@ async def test_logout_without_a_stored_key_is_not_an_error(caplog):
     assert "No stored API key" in caplog.text
 
 
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="POSIX permission bits, which root bypasses")
+async def test_logout_that_cannot_remove_the_key_says_so_and_exits_3(caplog):
+    path = credentials.write_api_key("stored-key")
+    action = _action(LogoutAction)
+    path.parent.chmod(0o500)
+
+    try:
+        code = await action.run_action(action.parser.parse_args([]))
+    finally:
+        path.parent.chmod(0o700)
+
+    assert code == 3
+    message = f"Could not remove the stored API key at {path}: Permission denied. Nothing was removed."
+    assert caplog.record_tuples == [("root", logging.ERROR, message)]
+    assert credentials.read_api_key() == "stored-key"
+
+
+async def test_logout_with_a_folder_in_the_files_place_says_so_and_exits_3(caplog):
+    path = credentials.credentials_path()
+    path.mkdir(parents=True)
+    action = _action(LogoutAction)
+
+    code = await action.run_action(action.parser.parse_args([]))
+
+    assert code == 3
+    [record] = caplog.records
+    assert record.levelno == logging.ERROR
+    assert record.getMessage().startswith(f"Could not remove the stored API key at {path}: ")
+    assert record.getMessage().endswith(". Nothing was removed.")
+    assert path.is_dir()
+
+
 class _Stub(APIAction):
     """A command that exists only to exercise the base class's key handling."""
 
@@ -341,6 +381,7 @@ def test_login_checks_and_stores_the_key_given_with_api_key(argv: list[str], mon
     monkeypatch.setattr("sys.argv", ["aristotle", *argv])
     verify = AsyncMock()
     monkeypatch.setattr("aristotlelib.cli.login_flow._verify", verify)
+    monkeypatch.setattr("aristotlelib.cli.login_flow._billed_to_key", AsyncMock(return_value=None))
 
     assert main() == 0
     verify.assert_awaited_once_with("given-key")
@@ -399,8 +440,9 @@ def test_the_device_logins_requests_name_the_cli_in_their_user_agent(monkeypatch
         "/api/v3/cli/device/token",
         "/api/v3/cli/device/token",
         "/api/v3/project",
+        "/api/v3/organization",
     ]
-    assert [request.headers["User-Agent"] for request in requests] == [user_agent_of("cli")] * 4
+    assert [request.headers["User-Agent"] for request in requests] == [user_agent_of("cli")] * 5
 
 
 def test_login_json_with_a_given_key_prints_only_where_it_went(monkeypatch, capsys, caplog, device_server):
@@ -412,8 +454,23 @@ def test_login_json_with_a_given_key_prints_only_where_it_went(monkeypatch, caps
 
     out, err = capsys.readouterr()
     assert json.loads(out) == {"credentials_path": str(credentials.credentials_path()), "key_name": None}
-    assert [request.url.path for request in requests] == ["/api/v3/project"]
+    assert [request.url.path for request in requests] == ["/api/v3/project", "/api/v3/organization"]
     assert APPROVED_KEY not in out + err + caplog.text
+
+
+def test_ctrl_c_while_asking_who_pays_keeps_the_key_and_says_so(monkeypatch, capsys, caplog, device_server):
+    caplog.set_level(logging.INFO)
+    device_server(organization=ctrl_c_before_answering)
+    _login_as_an_agent(monkeypatch, "--json", "--api-key", APPROVED_KEY)
+
+    assert main() == 130
+    gc.collect()
+    assert "never retrieved" not in caplog.text
+    out, err = capsys.readouterr()
+    assert json.loads(out) == {"credentials_path": str(credentials.credentials_path()), "key_name": None}
+    assert err == "\nInterrupted. The key stays stored.\n"
+    assert f"Logged in. Key stored in {credentials.credentials_path()}." in caplog.messages
+    assert credentials.read_api_key() == APPROVED_KEY
 
 
 def test_ctrl_c_while_login_waits_for_approval_exits_130(monkeypatch, capsys, device_server, ctrl_c_while_waiting):

@@ -32,7 +32,7 @@ from aristotlelib.declaration import (
 from aristotlelib.project import ARCHIVE_FILES_HEADER, AgentQuestionsSetting, Project, ProjectStatus
 from aristotlelib.question import Question
 from tests.cli.conftest import LOOKUP_FAILURES, mockable_project
-from tests.conftest import BUY_CREDITS, OUT_OF_CREDITS, SIGNUP_GRANT_PENDING, multipart_parts
+from tests.conftest import BUY_CREDITS, OBJECT_REFUSALS, OUT_OF_CREDITS, SIGNUP_GRANT_PENDING, multipart_parts
 
 
 @pytest.fixture(autouse=True)
@@ -642,10 +642,10 @@ async def test_files_on_a_running_project_are_refused_before_the_upload(tmp_path
 
     assert exited.value.code == 2
     assert capsys.readouterr().err.endswith(
-        "error: Files can't be added to project project-123 while it runs a task. Send the prompt without --files to "
-        "reach that task: its agent reads it right away. Or wait for the task to finish (`aristotle show project-123 "
-        "--wait`), then send the prompt with --files. Cancelling the task first would lose the prompts it was given, "
-        "except the project's first.\n"
+        "error: Files can't be added to project project-123 while it runs a task. Send the prompt without --files and "
+        "--project-dir to reach that task: its agent reads it right away. Or wait for the task to finish (`aristotle "
+        "show project-123 --wait`), then send the prompt with --files. Cancelling the task first would lose the "
+        "prompts it was given, except the project's first.\n"
     )
     ask.assert_not_called()
 
@@ -1010,6 +1010,24 @@ def test_a_continue_billing_refuses_says_the_prompt_was_not_sent(
     assert caplog.messages[-1] == error
     out = capsys.readouterr().out
     assert (json.loads(out) if flags else out) == ({"outcome": "not_processed", "error": error} if flags else "")
+
+
+@pytest.mark.parametrize(
+    "detail",
+    ["Forbidden", "Cannot continue a project owned by a different organization"],
+    ids=["someone else's project", "a project of another organization"],
+)
+def test_a_continue_refused_for_its_project_says_why_and_exits_4(detail, api_server, caplog):
+    project_id = "3f1002f7-0b6c-4c1e-9d8e-2a4b5c6d7e8f"
+    project = mockable_project(project_id)
+    refused = httpx.Response(403, json={"detail": detail})
+    requests = api_server(httpx.Response(200, json=project.model_dump(mode="json")), refused)
+
+    with patch("sys.argv", ["aristotle", "continue", project_id, "Go on"]):
+        assert main() == 4
+
+    assert [request.method for request in requests] == ["GET", "POST"]
+    assert caplog.messages[-1] == OBJECT_REFUSALS[detail]
 
 
 @pytest.mark.usefixtures("frozen_api_clock", "project_lookup")
@@ -1667,15 +1685,14 @@ def test_files_under_project_dir_go_up_alone_at_their_paths(json_flag, tmp_path,
     assert (json.loads(out)["files_applied"] if json_flag else out) == (None if json_flag else "")
 
 
-@pytest.mark.parametrize("files", [[], ["--files"]], ids=["no --files", "empty --files"])
 @pytest.mark.parametrize("status", [ProjectStatus.IDLE, ProjectStatus.RUNNING], ids=["idle", "running"])
-def test_without_send_folder_project_dir_is_only_a_root_and_the_prompt_goes_alone(status, files, tmp_path, api_server):
+def test_project_dir_with_files_naming_none_is_only_a_root_and_the_prompt_goes_alone(status, tmp_path, api_server):
     rtl = _rtl(tmp_path)
     # The project, the follow-up, and for a running task the listing of its questions.
     unlisted = httpx.Response(404, json={"detail": "Not Found"})
     requests = api_server(_folder_project(status), _follow_up(None), unlisted)
 
-    assert _continue("Use these", "--project-dir", str(rtl), *files) == 0
+    assert _continue("Use these", "--project-dir", str(rtl), "--files") == 0
 
     assert [request.method for request in requests][:2] == ["GET", "POST"]
     assert not [part for part in multipart_parts(requests[1]) if part[0] in ("files", "archive")]
@@ -2016,6 +2033,34 @@ def test_a_black_box_submit_would_refuse_stops_continue_with_its_message(
 
 
 @pytest.mark.parametrize("dry_run", [False, True], ids=["continue", "--dry-run"])
+def test_a_follow_up_takes_the_black_boxes_of_an_aristotle_f_that_names_no_source(
+    dry_run, tmp_path, api_server, monkeypatch, caplog
+):
+    """submit refuses it, as its prompt would point Aristotle at it; a follow-up sends it only as a folder file."""
+    caplog.set_level(logging.INFO)
+    soc = _soc(tmp_path)
+    (soc / "aristotle.f").write_bytes(b"--blackbox sram_1p\n")
+    (soc / ".gitignore").write_bytes(b"aristotle.f\n")
+    monkeypatch.chdir(tmp_path)
+    requests = api_server(_folder_project(), _folder_project(), _follow_up("4"))
+
+    with patch("sys.argv", ["aristotle", "submit", "Prove it", "--project-dir", "soc", "--dry-run"]):
+        assert main() == 2
+    assert caplog.messages[-1].startswith(f"{os.path.join('soc', 'aristotle.f')} names no source file")
+    assert (
+        _continue("Use the new sources", "--project-dir", "soc", "--send-folder", *(["--dry-run"] if dry_run else []))
+        == 0
+    )
+
+    expected = [".gitignore", "README.md", "rtl/soc.f", "rtl/soc_top.v"]
+    if dry_run:
+        assert requests == []
+        assert "The folder's 4 files that go up:\n  " + "\n  ".join(expected) in caplog.messages
+    else:
+        assert sorted(_archive_in(requests[2])) == expected
+
+
+@pytest.mark.parametrize("dry_run", [False, True], ids=["continue", "--dry-run"])
 def test_a_folder_file_that_cant_be_read_exits_3_with_nothing_sent(dry_run, tmp_path, api_server, caplog):
     rtl = _rtl(tmp_path)
     gone = FileNotFoundError(2, "No such file or directory", str(rtl / "fifo.v"))
@@ -2098,6 +2143,12 @@ def test_a_folder_refused_for_too_many_runs_exits_6_and_says_the_prompt_was_not_
     assert (json.loads(out) if flags else out) == ({"outcome": "not_processed", "error": error} if flags else "")
 
 
+PROJECT_DIR_ALONE = (
+    "--project-dir needs --send-folder, to send the whole folder, or --files, to send some of its files. To send the "
+    "prompt alone, drop --project-dir."
+)
+
+
 @pytest.mark.parametrize(
     ("argv", "error"),
     [
@@ -2122,6 +2173,9 @@ def test_a_folder_refused_for_too_many_runs_exits_6_and_says_the_prompt_was_not_
             ["--project-dir", "{rtl}", "--dry-run"],
             "--dry-run needs --send-folder, which sends the folder whose files it lists.",
         ),
+        (["--project-dir", "{rtl}"], PROJECT_DIR_ALONE),
+        (["--project-dir", "{rtl}", "--json"], PROJECT_DIR_ALONE),
+        (["--project-dir", "{rtl}", "--non-interactive"], PROJECT_DIR_ALONE),
         (
             ["--project-dir", "{rtl}", "--send-folder", "--dry-run", "--wait"],
             "--dry-run sends nothing, so there is nothing to wait for.",
@@ -2153,17 +2207,36 @@ def test_a_folder_option_misused_is_a_usage_error_before_any_request(argv, error
     assert capsys.readouterr().err.endswith(f"error: {error.format(**paths)}\n")
 
 
+def test_project_dir_alone_is_refused_before_the_key_is_read(tmp_path, api_server, monkeypatch, capsys):
+    rtl = _rtl(tmp_path)
+    requests = api_server()
+    monkeypatch.setattr(api_request, "API_KEY", None)
+    monkeypatch.delenv("ARISTOTLE_API_KEY", raising=False)
+    monkeypatch.setattr("aristotlelib.cli.api_action.get_api_key", Mock(side_effect=AssertionError("no key needed")))
+
+    with pytest.raises(SystemExit) as exited:
+        _continue("Use the new reports", "--project-dir", str(rtl))
+
+    assert exited.value.code == 2
+    assert requests == []
+    assert capsys.readouterr().err.endswith(f"error: {PROJECT_DIR_ALONE}\n")
+
+
+IGNORED_TOO = ["--project-dir", "{rtl}", "--send-folder", "--include-ignored"]
+
+
 @pytest.mark.parametrize(
-    ("argv", "named"),
+    ("argv", "without", "named"),
     [
-        (["--project-dir", "{rtl}", "--send-folder"], "--send-folder"),
-        (["--files", "{notes}", "--project-dir", "{rtl}"], "--files"),
-        (["--files", "{notes}"], "--files"),
+        (["--project-dir", "{rtl}", "--send-folder"], "--send-folder and --project-dir", "--send-folder"),
+        (IGNORED_TOO, "--send-folder, --include-ignored and --project-dir", "--send-folder"),
+        (["--files", "{notes}", "--project-dir", "{rtl}"], "--files and --project-dir", "--files"),
+        (["--files", "{notes}"], "--files", "--files"),
     ],
-    ids=["folder", "files under the folder", "files under the current folder"],
+    ids=["folder", "folder with ignored files", "files under the folder", "files under the current folder"],
 )
 def test_a_folder_for_a_running_project_is_refused_before_the_upload(
-    argv, named, tmp_path, api_server, monkeypatch, capsys
+    argv, without, named, tmp_path, api_server, monkeypatch, capsys
 ):
     rtl = _rtl(tmp_path)
     monkeypatch.chdir(rtl)
@@ -2178,22 +2251,23 @@ def test_a_folder_for_a_running_project_is_refused_before_the_upload(
     assert [request.method for request in requests] == ["GET"]
     assert capsys.readouterr().err.endswith(
         f"error: Files can't be added to project {FOLDER_PROJECT} while it runs a task. Send the prompt without "
-        f"{named} to reach that task: its agent reads it right away. Or wait for the task to finish (`aristotle show "
+        f"{without} to reach that task: its agent reads it right away. Or wait for the task to finish (`aristotle show "
         f"{FOLDER_PROJECT} --wait`), then send the prompt with {named}. Cancelling the task first would lose the "
         "prompts it was given, except the project's first.\n"
     )
 
 
 @pytest.mark.parametrize(
-    ("argv", "named"),
+    ("argv", "without", "named"),
     [
-        (["--project-dir", "{rtl}", "--send-folder"], "--send-folder"),
-        (["--files", "{notes}", "--project-dir", "{rtl}"], "--files"),
+        (["--project-dir", "{rtl}", "--send-folder"], "--send-folder and --project-dir", "--send-folder"),
+        (IGNORED_TOO, "--send-folder, --include-ignored and --project-dir", "--send-folder"),
+        (["--files", "{notes}", "--project-dir", "{rtl}"], "--files and --project-dir", "--files"),
     ],
-    ids=["folder", "files under the folder"],
+    ids=["folder", "folder with ignored files", "files under the folder"],
 )
 def test_a_task_started_while_the_folder_is_archived_is_refused_with_nothing_sent(
-    argv, named, tmp_path, api_server, capsys
+    argv, without, named, tmp_path, api_server, capsys
 ):
     rtl = _rtl(tmp_path)
     notes = rtl / "notes.md"
@@ -2208,21 +2282,46 @@ def test_a_task_started_while_the_folder_is_archived_is_refused_with_nothing_sen
     assert [request.method for request in requests] == ["GET", "GET"]
     assert capsys.readouterr().err.endswith(
         f"error: Files can't be added to project {FOLDER_PROJECT} while it runs a task. Send the prompt without "
-        f"{named} to reach that task: its agent reads it right away. Or wait for the task to finish (`aristotle show "
+        f"{without} to reach that task: its agent reads it right away. Or wait for the task to finish (`aristotle show "
         f"{FOLDER_PROJECT} --wait`), then send the prompt with {named}. Cancelling the task first would lose the "
         "prompts it was given, except the project's first.\n"
     )
 
 
-def test_a_reply_that_cant_be_read_after_a_folder_went_up_is_no_usage_error(tmp_path, api_server, capsys):
+def test_a_reply_that_cant_be_read_after_a_folder_went_up_may_have_sent_the_prompt(
+    tmp_path, api_server, monkeypatch, capsys, caplog
+):
+    monkeypatch.setattr(api_request, "getproxies", dict)
     rtl = _rtl(tmp_path)
     unreadable = httpx.Response(200, content=b"not JSON", headers={"content-type": "application/json"})
     requests = api_server(_folder_project(), _folder_project(), unreadable)
 
-    assert _continue("Use the new reports", "--project-dir", str(rtl), "--send-folder") == 3
+    assert _continue("Use the new reports", "--project-dir", str(rtl), "--send-folder") == 7
 
     assert [request.method for request in requests] == ["GET", "GET", "POST"]
-    assert "JSONDecodeError" in capsys.readouterr().err
+    assert caplog.messages[-1].startswith(
+        f"POST /project/{FOLDER_PROJECT}/ask: the answer from https://aristotle.harmonic.fun was 200 OK with "
+        "application/json that isn't JSON, not Aristotle's: a captive portal or a proxy may have answered instead. "
+        "Aristotle may have acted on it, so it was not sent again."
+    )
+    assert "Traceback" not in capsys.readouterr().err
+
+
+@pytest.mark.usefixtures("frozen_api_clock")
+def test_a_lookup_answered_by_json_this_version_cant_read_sends_no_prompt(api_server, monkeypatch, capsys):
+    monkeypatch.setattr(api_request, "getproxies", dict)
+    requests = api_server(*(lambda request: httpx.Response(200, json={}) for _ in range(api_request.RETRY_ATTEMPTS)))
+
+    assert _continue("Use the new reports", "--json") == 3
+
+    assert [request.method for request in requests] == ["GET"] * api_request.RETRY_ATTEMPTS
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["outcome"] == "not_processed"
+    assert printed["error"].startswith(
+        f"GET /project/{FOLDER_PROJECT} after 5 attempts over 0 s: the answer from https://aristotle.harmonic.fun was "
+        "200 OK with JSON this version of aristotlelib can't read ("
+    )
+    assert printed["error"].endswith("The prompt was not sent, so it is safe to send it again.")
 
 
 def test_a_folder_with_nothing_to_upload_exits_2_with_nothing_sent(tmp_path, api_server, caplog):

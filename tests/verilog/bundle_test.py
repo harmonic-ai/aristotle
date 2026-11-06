@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from aristotlelib import local_file_utils
 from aristotlelib.project import ArchiveError, build_archive
 from aristotlelib.verilog import bundle, filelist
 from aristotlelib.verilog.bundle import BundleError
@@ -793,6 +794,41 @@ def test_black_boxes_that_leave_out_every_named_file_stop(tmp_path: Path):
         _read(f, tmp_path)
 
 
+@pytest.mark.parametrize(
+    "text",
+    ["--blackbox cell\n", "", "# the block\n", "--top top\n+incdir+rtl\n", "-y rtl\n", "-F ip/ip.f\n"],
+    ids=["black boxes", "empty", "comments", "options", "a library folder", "a nested filelist of black boxes"],
+)
+def test_a_filelist_that_names_no_source_file_stops(tmp_path: Path, text: str):
+    """The aristotle.f that goes up would name no file, and the prompt would still point Aristotle at it."""
+    _write(tmp_path / "rtl" / "top.v", "module top; cell u(); endmodule\n")
+    _write(tmp_path / "rtl" / "cell.v", "module cell; endmodule\n")
+    _write(tmp_path / "ip" / "ip.f", "--blackbox cell\n")
+    f = _write(tmp_path / "aristotle.f", text)
+    with pytest.raises(BundleError) as e:
+        _read(f, tmp_path)
+    assert str(e.value) == (
+        f"{f} names no source file, so Aristotle would elaborate an empty design. Name the design's sources in it."
+    )
+
+
+def test_a_block_read_for_its_black_boxes_alone_may_name_no_source_file(tmp_path: Path):
+    _write(tmp_path / "cell.v", "module cell; endmodule\n")
+    f = _write(tmp_path / "aristotle.f", "--blackbox cell\n")
+    result = bundle.build(filelist.read(f, {}), tmp_path, committed=f, blackboxes_only=True)
+    assert result.members == []
+    assert [b.name for b in result.blackboxes] == ["cell"]
+
+
+def test_a_block_from_the_command_line_that_names_no_source_file_stops(tmp_path: Path):
+    reader = filelist.Reader({})
+    reader.read_arguments(["--top", "top", "--blackbox", "cell"], tmp_path)
+    with pytest.raises(
+        BundleError, match=r"^The Verilog block names no source file, so Aristotle would elaborate an empty design\.$"
+    ):
+        bundle.build(reader.result, tmp_path)
+
+
 def test_a_library_file_of_black_boxes_is_left_out_and_needs_no_top(tmp_path: Path):
     """-v files follow the same rule; with the only one left out, nothing in the upload is a library file."""
     _write(tmp_path / "top.v", "module top; sram_1p u(); endmodule\n")
@@ -1135,6 +1171,23 @@ def test_each_name_a_block_reaches_goes_up_as_a_file_holding_its_content(tmp_pat
         "d.vh": solo,
         "aristotle.f": (tarfile.REGTYPE, b"top.v\n"),
     }
+
+
+def test_a_blocks_files_go_up_without_their_mtime_or_owner(tmp_path: Path):
+    """A file whose include is rewritten too."""
+    header = _write(tmp_path / "gen" / "types.vh", "`define W 8\n")
+    root = tmp_path / "block"
+    _write(root / "top.v", f'`include "{header.as_posix()}"\nmodule top; endmodule\n')
+    block = _read(_write(root / "aristotle.f", "top.v\n"), root)
+
+    build_archive(None, tmp_path / "upload.tar.gz", block)
+
+    with tarfile.open(tmp_path / "upload.tar.gz", encoding="utf-8") as tar:
+        headers = {m.name: (m.mtime, m.uid, m.gid, m.uname, m.gname) for m in tar.getmembers()}
+        assert tar.extractfile("top.v").read() == b'`include "_ext/gen/types.vh"\nmodule top; endmodule\n'
+    assert headers == dict.fromkeys(
+        ["top.v", "_ext/gen/types.vh", "aristotle.f"], (local_file_utils.ARCHIVED_MTIME, 0, 0, "", "")
+    )
 
 
 @pytest.mark.parametrize("name", ["top.v", "aristotle.f"], ids=["a file it names", "its committed aristotle.f"])

@@ -4,19 +4,23 @@ import errno
 import logging
 import os
 import signal
+import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 import httpx
+import pathspec
 import pytest
 
 from aristotlelib import local_file_utils
 from aristotlelib.local_file_utils import (
+    ARCHIVED_MTIME,
     MATHLIB_INCLUDED_STD_PACKAGES,
     MAX_FILE_SIZE_BYTES,
     SECRET_FILE_PATTERNS,
@@ -368,6 +372,32 @@ def test_should_skip_input_file_olean():
     file_path = Path("test.olean")
     result = should_skip_input_file(file_path)
     assert result is True
+
+
+def test_should_skip_input_file_compiles_its_patterns_once_per_thread():
+    should_skip_input_file(Path("test.olean"))
+    with patch.object(pathspec.PathSpec, "from_lines", side_effect=AssertionError("compiled again")):
+        assert should_skip_input_file(Path("test.olean")) is True
+        assert should_skip_input_file(Path("Test.lean")) is False
+
+
+def test_should_skip_input_file_matches_with_patterns_its_own_thread_compiled():
+    """pathspec's hyperscan backend can't match in two threads at once."""
+    specs: list[Mock] = []
+
+    def from_lines(*args, **kwargs):
+        spec = Mock(**{"match_file.return_value": False})
+        specs.append(spec)
+        return spec
+
+    with patch.object(pathspec.PathSpec, "from_lines", side_effect=from_lines):
+        threads = [threading.Thread(target=should_skip_input_file, args=(Path("Test.lean"),)) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+    assert [spec.match_file.call_count for spec in specs] == [1, 1]
 
 
 def test_should_skip_input_file_ds_store():
@@ -737,7 +767,7 @@ def test_each_name_of_a_hard_linked_file_goes_in_as_a_file_holding_its_content(t
     (tmp_path / "a.sv").write_bytes(b"module a; endmodule\n")
     hard_link(tmp_path / "a.sv", tmp_path / "b.sv")
 
-    with tarfile.open(tmp_path / "upload.tar", "w", dereference=True) as tar:
+    with tarfile.open(tmp_path / "upload.tar", "w") as tar:
         for name in ("a.sv", "b.sv"):
             add_file(tar, tmp_path / name, name, os.lstat(tmp_path / name))
 
@@ -746,6 +776,40 @@ def test_each_name_of_a_hard_linked_file_goes_in_as_a_file_holding_its_content(t
             ("a.sv", tarfile.REGTYPE, b"module a; endmodule\n"),
             ("b.sv", tarfile.REGTYPE, b"module a; endmodule\n"),
         ]
+
+
+def _headers(tar_path: Path) -> list[tuple[object, ...]]:
+    with tarfile.open(tar_path) as tar:
+        return [
+            (m.name, m.size, m.mode, m.mtime, m.uid, m.gid, m.uname, m.gname, m.pax_headers) for m in tar.getmembers()
+        ]
+
+
+def test_a_member_has_the_files_size_and_permissions_but_not_its_mtime_or_owner(tmp_path):
+    (tmp_path / "a.sv").write_bytes(b"module a; endmodule\n")
+    os.utime(tmp_path / "a.sv", (1_700_000_000.75, 1_700_000_000.75))
+    checked = os.lstat(tmp_path / "a.sv")
+
+    with tarfile.open(tmp_path / "upload.tar", "w") as tar:
+        add_file(tar, tmp_path / "a.sv", str(Path("sub", "a.sv")), checked)
+
+    assert _headers(tmp_path / "upload.tar") == [
+        ("sub/a.sv", 20, stat.S_IMODE(checked.st_mode), ARCHIVED_MTIME, 0, 0, "", "", {})
+    ]
+
+
+def test_a_symlinked_member_has_its_targets_size_and_permissions_but_not_its_mtime_or_owner(tmp_path):
+    (tmp_path / "a.sv").write_bytes(b"module a; endmodule\n")
+    os.utime(tmp_path / "a.sv", (1_700_000_000.75, 1_700_000_000.75))
+    _symlink(tmp_path / "notes", "a.sv")
+    target = os.stat(tmp_path / "a.sv")
+
+    with tarfile.open(tmp_path / "upload.tar", "w") as tar:
+        add_symlinked_file(tar, tmp_path / "notes", "notes", {file_identity(target)})
+
+    assert _headers(tmp_path / "upload.tar") == [
+        ("notes", 20, stat.S_IMODE(target.st_mode), ARCHIVED_MTIME, 0, 0, "", "", {})
+    ]
 
 
 NO_FOLLOW = pytest.mark.parametrize("no_follow", [True, False], ids=["O_NOFOLLOW", "without O_NOFOLLOW, as on Windows"])
@@ -772,7 +836,7 @@ def test_a_file_swapped_for_a_link_before_it_is_opened_is_refused_not_followed(n
     (tmp_path / "id_ed25519").write_bytes(b"private key\n")
     checked = os.lstat(tmp_path / "a.sv")
 
-    with tarfile.open(tmp_path / "upload.tar", "w", dereference=True) as tar:
+    with tarfile.open(tmp_path / "upload.tar", "w") as tar:
         with (
             swapped_for_a_link(tmp_path / "a.sv", tmp_path / "id_ed25519"),
             pytest.raises(FileChangedError) as raised,
@@ -801,7 +865,7 @@ def test_a_file_replaced_by_another_before_it_is_opened_goes_in_only_where_the_o
         os.replace(tmp_path / "a.sv.new", tmp_path / "a.sv")
         return real_open(path, flags, *args)
 
-    with tarfile.open(tmp_path / "upload.tar", "w", dereference=True) as tar:
+    with tarfile.open(tmp_path / "upload.tar", "w") as tar:
         with (
             patch.object(os, "open", side_effect=open_),
             nullcontext() if no_follow else pytest.raises(FileChangedError),
@@ -821,7 +885,7 @@ def test_a_file_whose_descriptor_gives_another_device_and_inode_goes_in_only_whe
     checked = os.lstat(tmp_path / "a.sv")
     monkeypatch.setattr(os, "fstat", fstat_on_another_device(os.fstat))
 
-    with tarfile.open(tmp_path / "upload.tar", "w", dereference=True) as tar:
+    with tarfile.open(tmp_path / "upload.tar", "w") as tar:
         with nullcontext() if no_follow else pytest.raises(FileChangedError):
             add_file(tar, tmp_path / "a.sv", "a.sv", checked)
 
@@ -841,7 +905,7 @@ def test_a_file_a_lease_holds_is_opened_again_waiting_for_the_holder(tmp_path):
             raise BlockingIOError(errno.EAGAIN, "Resource temporarily unavailable", str(path))
         return real_open(path, flags, *args)
 
-    with tarfile.open(tmp_path / "upload.tar", "w", dereference=True) as tar:
+    with tarfile.open(tmp_path / "upload.tar", "w") as tar:
         with patch.object(os, "open", side_effect=open_):
             add_file(tar, tmp_path / "a.sv", "a.sv", os.lstat(tmp_path / "a.sv"))
 
@@ -861,7 +925,7 @@ def test_a_file_a_lease_holds_that_turns_into_a_named_pipe_is_refused_without_a_
         os.mkfifo(path)
         raise BlockingIOError(errno.EAGAIN, "Resource temporarily unavailable", str(path))
 
-    with tarfile.open(tmp_path / "upload.tar", "w", dereference=True) as tar:
+    with tarfile.open(tmp_path / "upload.tar", "w") as tar:
         with patch.object(os, "open", side_effect=open_), pytest.raises(FileChangedError):
             add_file(tar, tmp_path / "a.sv", "a.sv", checked)
         assert tar.getnames() == []
@@ -1060,6 +1124,21 @@ def test_a_tracked_file_that_a_gitignore_rule_matches_is_ignored_and_named(tmp_p
     ]
 
 
+@pytest.mark.parametrize("beside", [True, False], ids=["beside another held-back file", "alone"])
+def test_a_tracked_lean_file_that_a_gitignore_rule_matches_is_ignored_but_not_named(tmp_path, caplog, beside: bool):
+    repo = _repository(tmp_path)
+    files = _write(repo, "Spec.lean", "notes.log", "top.sv")
+    git(repo, "add", "-A")
+    (repo / ".gitignore").write_text("*.lean\n*.log\n" if beside else "*.lean\n")
+
+    with caplog.at_level(logging.WARNING, logger="aristotle"):
+        ignored = gitignored_files(repo, files)
+
+    assert ignored == ({Path("Spec.lean"), Path("notes.log")} if beside else {Path("Spec.lean")})
+    rules = {Path("notes.log"): ".gitignore:2: *.log"}
+    assert caplog.messages == ([local_file_utils.held_back_warning(rules, include_ignored=True)] if beside else [])
+
+
 def test_the_held_back_warning_names_every_file_with_its_rule_and_how_to_upload_it():
     rules = {Path("docs/spec.json"): "hw/docs/.gitignore:1: *.json", Path("build/keep.h"): ""}
 
@@ -1179,6 +1258,26 @@ def test_in_a_folder_that_git_ignores_a_tracked_file_its_own_gitignore_matches_i
     assert caplog.messages == [
         local_file_utils.held_back_warning({Path("kept.log"): "scratch/demo/.gitignore"}, include_ignored=True)
     ]
+
+
+@pytest.mark.parametrize("beside", [True, False], ids=["beside another held-back file", "alone"])
+def test_in_a_folder_that_git_ignores_a_tracked_lean_file_its_own_gitignore_matches_is_not_named(
+    tmp_path, caplog, beside: bool
+):
+    repo = _repository(tmp_path)
+    (repo / ".gitignore").write_text("scratch/\n")
+    project = repo / "scratch" / "demo"
+    project.mkdir(parents=True)
+    (project / ".gitignore").write_text("*.lean\n*.log\n" if beside else "*.lean\n")
+    files = _write(project, "top.sv", "Spec.lean", "kept.log")
+    git(repo, "add", "-f", "scratch/demo/Spec.lean", "scratch/demo/kept.log")
+
+    with caplog.at_level(logging.WARNING, logger="aristotle"):
+        ignored = gitignored_files(project, files)
+
+    assert ignored == ({Path("Spec.lean"), Path("kept.log")} if beside else {Path("Spec.lean")})
+    rules = {Path("kept.log"): "scratch/demo/.gitignore"}
+    assert caplog.messages == ([local_file_utils.held_back_warning(rules, include_ignored=True)] if beside else [])
 
 
 def test_a_folder_whose_contents_a_rule_ignores_is_not_itself_ignored(tmp_path):

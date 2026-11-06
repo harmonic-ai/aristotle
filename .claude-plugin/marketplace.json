@@ -8,11 +8,11 @@
   "plugins": [
     {
       "name": "aristotle",
-      "version": "3.2.0",
+      "version": "3.3.0",
       "source": {
         "source": "url",
         "url": "https://github.com/harmonic-ai/aristotle.git",
-        "ref": "v3.2.0"
+        "ref": "v3.3.0"
       },
       "strict": false,
       "skills": [

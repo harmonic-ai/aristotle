@@ -57,7 +57,7 @@ from aristotlelib.project import (
     validate_destination,
 )
 from aristotlelib.question import Question
-from tests.ci.conftest import git, latin1_name
+from tests.ci.conftest import git, latin1_name, make_declaration
 from tests.conftest import (
     BILLING_PAGE,
     BUY_CREDITS,
@@ -66,6 +66,7 @@ from tests.conftest import (
     fstat_on_another_device,
     hard_link,
     multipart_parts,
+    patched_client,
     swapped_for_a_link,
 )
 
@@ -88,7 +89,7 @@ async def test_project_from_id():
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=None)
 
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=mock_client):
+    with patched_client(mock_client):
         project = await Project.from_id("test-123")
 
     assert project.project_id == "test-123"
@@ -109,7 +110,7 @@ def _client_raising(error: Exception) -> AsyncMock:
 async def test_project_from_id_raises_not_found_on_403_and_404(status_code):
     client = _client_raising(AristotleAPIError("Forbidden", status_code=status_code))
 
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=client):
+    with patched_client(client):
         with pytest.raises(AristotleAPIError) as info:
             await Project.from_id("p-1")
 
@@ -119,10 +120,21 @@ async def test_project_from_id_raises_not_found_on_403_and_404(status_code):
     client.get.assert_awaited_once_with("/project/p-1")
 
 
+async def test_project_from_id_says_a_deleted_project_was_deleted():
+    client = _client_raising(AristotleAPIError("This project was deleted", status_code=410))
+
+    with patched_client(client):
+        with pytest.raises(AristotleNotFoundError) as info:
+            await Project.from_id("p-1")
+
+    assert str(info.value) == "Project p-1 was deleted."
+    assert info.value.status_code == 410
+
+
 async def test_task_from_id_not_found_names_the_task():
     client = _client_raising(AristotleAPIError("Forbidden", status_code=403))
 
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=client):
+    with patched_client(client):
         with pytest.raises(AristotleNotFoundError) as info:
             await AgentTask.from_id("t-1")
 
@@ -136,7 +148,7 @@ async def test_from_id_passes_other_api_errors_through(status_code):
     error = AristotleAPIError("boom", status_code=status_code)
     client = _client_raising(error)
 
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=client):
+    with patched_client(client):
         with pytest.raises(AristotleAPIError) as info:
             await Project.from_id("p-1")
 
@@ -146,7 +158,7 @@ async def test_from_id_passes_other_api_errors_through(status_code):
 async def test_from_id_sends_the_id_as_one_path_segment():
     client = _client_raising(AristotleAPIError("Not Found", status_code=404))
 
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=client):
+    with patched_client(client):
         with pytest.raises(AristotleNotFoundError):
             await Project.from_id("p-1?limit=1#x %")
 
@@ -157,7 +169,7 @@ async def test_from_id_sends_the_id_as_one_path_segment():
 async def test_from_id_rejects_an_id_that_cannot_be_one_path_segment_without_a_request(object_id):
     client = _client_raising(AssertionError("must not request"))
 
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=client):
+    with patched_client(client):
         with pytest.raises(AristotleNotFoundError) as info:
             await Project.from_id(object_id)
 
@@ -227,7 +239,7 @@ def _serving(*pages: list[Project]) -> AsyncMock:
 
 def _lookup(client: AsyncMock) -> ExitStack:
     stack = ExitStack()
-    stack.enter_context(patch("aristotlelib.api_request.AristotleRequestClient", return_value=client))
+    stack.enter_context(patched_client(client))
     stack.enter_context(patch("aristotlelib.project._LOOKUP_PAGE_INTERVAL", 0))
     return stack
 
@@ -362,7 +374,7 @@ async def test_resolve_id_reads_every_page_over_one_connection_with_the_previous
     client = _serving([_listed(OTHER_ID, "other")], [_listed(FIFO_ID, "fifo")])
 
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=client) as new_client,
+        patched_client(client) as new_client,
         patch("aristotlelib.project._LOOKUP_PAGE_INTERVAL", 0),
     ):
         assert await Project.resolve_id("fifo") == FIFO_ID
@@ -399,7 +411,7 @@ async def _page_starts(request_seconds: float, refused_on: int | None = None) ->
 
     client.get = get
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=client),
+        patched_client(client),
         patch("aristotlelib.project.time", Mock(monotonic=lambda: now[0])),
         patch("aristotlelib.project.asyncio.sleep", sleep),
     ):
@@ -596,7 +608,7 @@ async def test_project_from_id_accepts_a_uuid():
     client.__aenter__ = AsyncMock(return_value=client)
     client.__aexit__ = AsyncMock(return_value=None)
 
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=client):
+    with patched_client(client):
         project = await Project.from_id(project_id)
 
     assert project.project_id == str(project_id)
@@ -621,7 +633,7 @@ async def test_project_create_without_file():
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=None)
 
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=mock_client):
+    with patched_client(mock_client):
         project = await Project.create(prompt="Test prompt")
 
     assert project.project_id == "new-project-123"
@@ -657,7 +669,7 @@ async def test_project_create_with_tar_file():
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=None)
 
-        with patch("aristotlelib.api_request.AristotleRequestClient", return_value=mock_client):
+        with patched_client(mock_client):
             project = await Project.create(prompt="Test with file", tar_file_path=tar_path)
 
         assert project.project_id == "new-project-456"
@@ -699,7 +711,7 @@ async def test_project_create_from_directory():
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=None)
 
-        with patch("aristotlelib.api_request.AristotleRequestClient", return_value=mock_client):
+        with patched_client(mock_client):
             project = await Project.create_from_directory(prompt="Process directory", project_dir=temp_path)
 
         assert project.project_id == "dir-project-789"
@@ -719,7 +731,7 @@ async def test_project_create_from_directory_not_a_directory():
 async def test_project_create_rejects_empty_prompt():
     """Test that create rejects an empty prompt without calling the API."""
     mock_client = AsyncMock()
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=mock_client):
+    with patched_client(mock_client):
         with pytest.raises(ValueError) as exc_info:
             await Project.create(prompt="")
 
@@ -730,7 +742,7 @@ async def test_project_create_rejects_empty_prompt():
 async def test_project_create_rejects_whitespace_prompt():
     """Test that create rejects a whitespace-only prompt without calling the API."""
     mock_client = AsyncMock()
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=mock_client):
+    with patched_client(mock_client):
         with pytest.raises(ValueError) as exc_info:
             await Project.create(prompt="   \n\t")
 
@@ -760,7 +772,7 @@ async def test_project_ask_rejects_empty_prompt():
     )
 
     mock_client = AsyncMock()
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=mock_client):
+    with patched_client(mock_client):
         with pytest.raises(ValueError) as exc_info:
             await project.ask("")
 
@@ -796,7 +808,7 @@ async def test_project_refresh():
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=None)
 
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=mock_client):
+    with patched_client(mock_client):
         await project.refresh()
 
     assert project.status == ProjectStatus.IDLE
@@ -839,7 +851,7 @@ def _unnamed_project() -> Project:
 async def test_project_rename_by_id_posts_the_trimmed_name_to_the_canonical_id():
     mock_client = _rename_client("solana proj")
 
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=mock_client):
+    with patched_client(mock_client):
         project = await Project.rename_by_id("{" + RENAMED_ID.upper() + "}", "  solana proj\n")
 
     mock_client.post.assert_called_once_with(
@@ -849,11 +861,22 @@ async def test_project_rename_by_id_posts_the_trimmed_name_to_the_canonical_id()
     assert project.description == "solana proj"
 
 
+async def test_project_delete_by_id_deletes_the_canonical_id():
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+
+    with patched_client(mock_client):
+        await Project.delete_by_id("{" + RENAMED_ID.upper() + "}")
+
+    mock_client.delete.assert_awaited_once_with(f"/project/{RENAMED_ID}")
+
+
 async def test_project_rename_updates_the_instance():
     project = _unnamed_project()
     mock_client = _rename_client("solana proj")
 
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=mock_client):
+    with patched_client(mock_client):
         await project.rename("solana proj")
 
     mock_client.post.assert_called_once_with(
@@ -868,7 +891,7 @@ async def test_project_rename_failure_leaves_the_instance_unchanged():
     mock_client = _rename_client("unused")
     mock_client.post = AsyncMock(side_effect=AristotleAPIError("Project not found", status_code=404))
 
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=mock_client):
+    with patched_client(mock_client):
         with pytest.raises(AristotleAPIError):
             await project.rename("solana proj")
 
@@ -887,7 +910,7 @@ async def test_project_rename_failure_leaves_the_instance_unchanged():
 async def test_project_rename_by_id_rejects_bad_input_without_calling_the_api(project_id: str, name: str, error: str):
     mock_client = AsyncMock()
 
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=mock_client):
+    with patched_client(mock_client):
         with pytest.raises(ValueError, match=error):
             await Project.rename_by_id(project_id, name)
 
@@ -926,7 +949,7 @@ async def test_task_cancel():
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=None)
 
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=mock_client):
+    with patched_client(mock_client):
         await task.cancel()
 
     assert task.status == TaskStatus.CANCELED
@@ -964,7 +987,7 @@ async def test_project_list_projects():
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=None)
 
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=mock_client):
+    with patched_client(mock_client):
         projects, pagination_key = await Project.list_projects(limit=10)
 
     assert len(projects) == 2
@@ -988,7 +1011,7 @@ async def test_project_list_projects_with_status_filter():
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=None)
 
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=mock_client):
+    with patched_client(mock_client):
         projects, _ = await Project.list_projects(status=ProjectStatus.IDLE, limit=20)
 
     # Verify status filter was passed
@@ -1011,7 +1034,7 @@ async def test_project_list_projects_with_multiple_statuses():
 
     statuses = [ProjectStatus.IDLE, ProjectStatus.RUNNING]
 
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=mock_client):
+    with patched_client(mock_client):
         await Project.list_projects(status=statuses, limit=30)
 
     call_args = mock_client.get.call_args
@@ -1026,7 +1049,7 @@ async def test_project_list_projects_by_latest_run_status():
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=None)
 
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=mock_client):
+    with patched_client(mock_client):
         await Project.list_projects(latest_run_status=[TaskStatus.QUEUED, TaskStatus.IN_PROGRESS])
 
     assert mock_client.get.call_args[1]["params"]["latest_run_status"] == ["QUEUED", "IN_PROGRESS"]
@@ -1067,7 +1090,7 @@ async def test_project_get_files():
     with tempfile.TemporaryDirectory() as temp_dir:
         destination = Path(temp_dir) / "output.tar.gz"
 
-        with patch("aristotlelib.api_request.AristotleRequestClient", return_value=mock_client):
+        with patched_client(mock_client):
             result_path = await project.get_files(destination=destination)
 
         assert result_path == destination
@@ -1107,7 +1130,7 @@ async def test_project_get_files_default_filename(tmp_path, monkeypatch):
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=None)
 
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=mock_client):
+    with patched_client(mock_client):
         result_path = await project.get_files()
 
     assert result_path.name == "solution.tar.gz"
@@ -1141,7 +1164,7 @@ async def test_get_files_of_a_project_without_files_raises_without_downloading()
     mock_client.__aexit__ = AsyncMock(return_value=None)
 
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=mock_client),
+        patched_client(mock_client),
         pytest.raises(ProjectHasNoFilesError, match="^Project test-empty has no files to download yet.$") as raised,
     ):
         await project.get_files()
@@ -1207,7 +1230,7 @@ async def _get_files(
         has_files=True,
     )
     client = _archive_client(content_disposition, description)
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=client):
+    with patched_client(client):
         return await project.get_files(destination=destination)
 
 
@@ -1227,7 +1250,7 @@ async def test_get_files_writes_the_archive_once_its_requests_are_closed(tmp_pat
         has_files=True,
     )
 
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=client):
+    with patched_client(client):
         assert await project.get_files(destination=destination) == destination
 
     # The refresh's client, then the download's.
@@ -2209,7 +2232,7 @@ async def test_save_files_reads_every_file_over_one_connection(tmp_path: Path):
     client.__aenter__ = AsyncMock(return_value=client)
     client.__aexit__ = AsyncMock(return_value=None)
 
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=client) as connect:
+    with patched_client(client) as connect:
         await _save(["a.vcd", "b.vcd", "c.vcd"], tmp_path)
 
     connect.assert_called_once_with()
@@ -2340,7 +2363,7 @@ async def test_project_get_tasks():
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=None)
 
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=mock_client):
+    with patched_client(mock_client):
         tasks, pagination_key = await project.get_tasks(limit=10)
 
     assert len(tasks) == 1
@@ -2380,7 +2403,7 @@ async def test_project_ask():
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=None)
 
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=mock_client):
+    with patched_client(mock_client):
         task = await project.ask("Continue with the next step")
 
     assert task.agent_task_id == "new-task-123"
@@ -2409,7 +2432,7 @@ async def test_task_status_unknown_handling():
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=None)
 
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=mock_client):
+    with patched_client(mock_client):
         task = await AgentTask.from_id("task-unknown")
 
     # Should be mapped to UNKNOWN status
@@ -2595,7 +2618,7 @@ async def test_task_wait_for_completion_already_complete():
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=None)
 
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=mock_client):
+    with patched_client(mock_client):
         with patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])):
             with patch("aristotlelib.progress_utils.clear_progress_lines"):
                 with patch("aristotlelib.progress_utils.print_progress_lines"):
@@ -2641,7 +2664,7 @@ async def test_task_get_events(event_type):
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=None)
 
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=mock_client):
+    with patched_client(mock_client):
         events, pagination_key = await task.get_events(limit=10)
 
     assert len(events) == 1
@@ -2679,7 +2702,7 @@ def _upload_mock_client():
 async def _uploaded(project_dir: Path, include_ignored: bool = False) -> tuple[str, bytes]:
     """The file name and the archive that creating a project from ``project_dir`` uploads."""
     client = _upload_mock_client()
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=client):
+    with patched_client(client):
         await Project.create_from_directory(
             prompt="Verify this", project_dir=project_dir, include_ignored=include_ignored
         )
@@ -2699,7 +2722,7 @@ async def _refused_upload(project_dir: Path) -> tuple[str, AsyncMock]:
     """The error creating a project from ``project_dir`` raises, and the mock of the create."""
     client = _upload_mock_client()
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=client),
+        patched_client(client),
         pytest.raises(LeanProjectError) as info,
     ):
         await Project.create_from_directory(prompt="Verify this", project_dir=project_dir)
@@ -2997,7 +3020,10 @@ async def test_a_group_name_that_is_not_utf8_does_not_stop_a_utf8_name_going_up(
     monkeypatch.setattr(tarfile.TarFile, "encoding", "ascii")
     monkeypatch.setattr(tarfile, "grp", Mock(getgrgid=lambda gid: ("dom\udcc3\udca4nen-benutzer",)))
 
-    assert list(await _upload(tmp_path)) == ["naïve.v"]
+    _, archive = await _uploaded(tmp_path)
+
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz", encoding="utf-8") as tar:
+        assert [(m.name, m.uname, m.gname) for m in tar.getmembers()] == [("naïve.v", "", "")]
 
 
 @pytest.mark.parametrize(
@@ -3883,7 +3909,7 @@ async def test_git_failing_to_say_what_it_ignores_uploads_nothing(tmp_path):
     failure = LeanProjectError("Could not ask git which files in it ignores: fatal: index file corrupt")
 
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=client),
+        patched_client(client),
         patch.object(local_file_utils, "gitignored_files", side_effect=failure),
         pytest.raises(LeanProjectError, match="index file corrupt"),
     ):
@@ -3896,7 +3922,7 @@ async def test_an_empty_project_dir_is_refused_rather_than_read_as_the_current_d
     client = _upload_mock_client()
 
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=client),
+        patched_client(client),
         pytest.raises(ValueError, match="Project directory cannot be empty"),
     ):
         await Project.create_from_directory(prompt="Verify this", project_dir="")
@@ -4002,7 +4028,7 @@ async def test_wait_for_completion_displays_follow_up_without_prompting():
     follow_up["event_type"] = 18
 
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=_streaming_client([follow_up])),
+        patched_client(_streaming_client([follow_up])),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
         patch("aristotlelib.agent_task.can_prompt", return_value=True),
         patch("aristotlelib.agent_task.run_question_flow", new=AsyncMock()) as flow,
@@ -4024,9 +4050,8 @@ async def test_a_wait_given_a_title_heads_its_display_with_it(capsys):
     task.description = "This is an automated verification run"
 
     with (
-        patch(
-            "aristotlelib.api_request.AristotleRequestClient",
-            return_value=_streaming_client([_plain_event("event-1", "Summing up")]),
+        patched_client(
+            _streaming_client([_plain_event("event-1", "Summing up")]),
         ),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
         patch("aristotlelib.progress_utils.stdout_is_terminal", return_value=True),
@@ -4055,9 +4080,8 @@ async def test_a_finished_wait_leaves_its_final_frame_on_a_terminal(capsys, capl
     task = _waiting_task()
 
     with (
-        patch(
-            "aristotlelib.api_request.AristotleRequestClient",
-            return_value=_streaming_client([_plain_event("event-1", "Summing up")]),
+        patched_client(
+            _streaming_client([_plain_event("event-1", "Summing up")]),
         ),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
         patch("aristotlelib.progress_utils.stdout_is_terminal", return_value=True),
@@ -4087,7 +4111,7 @@ async def test_a_wait_says_a_run_cancelled_in_the_queue_was_submitted_not_starte
     )
 
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=client),
+        patched_client(client),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
         patch("aristotlelib.progress_utils.stdout_is_terminal", return_value=True),
     ):
@@ -4117,7 +4141,7 @@ async def test_a_wait_reads_a_cancelled_run_by_its_start_time_from_a_server_that
 
     client.get = AsyncMock(side_effect=without_progress)
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=client),
+        patched_client(client),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
         patch("aristotlelib.progress_utils.stdout_is_terminal", return_value=True),
     ):
@@ -4140,7 +4164,7 @@ async def test_an_incomplete_run_points_at_its_summary_not_at_the_prompt(caplog)
 
     client.get = AsyncMock(side_effect=incomplete)
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=client),
+        patched_client(client),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
         caplog.at_level(logging.INFO, logger="aristotle"),
     ):
@@ -4159,7 +4183,7 @@ async def test_a_caller_that_says_how_an_incomplete_run_ended_gets_only_the_othe
     """As ci setup, whose run proposes properties without proving them."""
     client = _streaming_client([_plain_event("event-1", "Stopping")], end_status=status)
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=client),
+        patched_client(client),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
         caplog.at_level(logging.INFO, logger="aristotle"),
     ):
@@ -4201,7 +4225,7 @@ async def test_a_wait_that_ends_badly_names_the_command_that_resumes_it(status, 
 
     client.get = AsyncMock(side_effect=ended)
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=client),
+        patched_client(client),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
         caplog.at_level(logging.INFO, logger="aristotle"),
     ):
@@ -4223,7 +4247,7 @@ async def test_a_caller_with_its_own_next_step_gets_no_continue_command(caplog):
 
     client.get = AsyncMock(side_effect=failed)
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=client),
+        patched_client(client),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
         caplog.at_level(logging.INFO, logger="aristotle"),
     ):
@@ -4246,7 +4270,7 @@ async def test_a_wait_names_the_commands_its_caller_resumes_it_with(caplog):
     client.get = AsyncMock(side_effect=canceled)
     resume = [["aristotle", "continue", "proj-wait", "Continue", "--wait", "--json"]]
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=client),
+        patched_client(client),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
         caplog.at_level(logging.INFO, logger="aristotle"),
     ):
@@ -4337,7 +4361,7 @@ async def test_a_wait_on_a_task_billing_stopped_prints_aristotles_message_then_w
 
     client.get = AsyncMock(side_effect=stopped)
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=client),
+        patched_client(client),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
         caplog.at_level(logging.INFO, logger="aristotle"),
     ):
@@ -4387,7 +4411,7 @@ async def test_a_wait_writes_no_escape_codes_when_stdout_is_not_a_terminal(capsy
     events = [_plain_event("event-1", "Summing up"), _question_event("event-legacy", status=2, content="Which reset?")]
 
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=_streaming_client(events)),
+        patched_client(_streaming_client(events)),
         patch(
             "aristotlelib.agent_task.Question.list_for_task",
             new=AsyncMock(side_effect=AristotleAPIError("not found", status_code=404)),
@@ -4414,7 +4438,7 @@ async def test_a_wait_with_default_arguments_leaves_the_terminal_alone_and_logs_
     )
 
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=_streaming_client(events)),
+        patched_client(_streaming_client(events)),
         patch("aristotlelib.agent_task.Question.list_for_task", new=listing),
         patch("aristotlelib.progress_utils.stdout_is_terminal", return_value=True),
         patch("aristotlelib.agent_task.can_prompt", return_value=True),
@@ -4440,7 +4464,7 @@ async def test_a_wait_that_breaks_off_leaves_the_last_frame_on_a_terminal(error,
     task = _waiting_task()
 
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=_streaming_client([])),
+        patched_client(_streaming_client([])),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(side_effect=error)),
         patch("aristotlelib.progress_utils.stdout_is_terminal", return_value=True),
         outcome,
@@ -4471,7 +4495,7 @@ async def _frames_of_a_wait(
 ) -> list[list[str]]:
     """The frames a wait draws through ``client``, the project's properties listed by ``list_properties``."""
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=client),
+        patched_client(client),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
         patch("aristotlelib.agent_task.Declaration.list_all_for_project", new=list_properties),
         patch("aristotlelib.progress_utils.print_progress_lines") as shown,
@@ -4676,9 +4700,8 @@ async def test_wait_for_completion_presents_the_pending_questions_as_a_set():
     remaining, list_for_task = _listing([], [q1, q2, answered], [answered])
 
     with (
-        patch(
-            "aristotlelib.api_request.AristotleRequestClient",
-            return_value=_streaming_client([_question_event("event-q1")]),
+        patched_client(
+            _streaming_client([_question_event("event-q1")]),
         ),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(side_effect=list_for_task)),
         patch(
@@ -4706,7 +4729,7 @@ async def test_a_non_interactive_wait_logs_questions_and_never_touches_stdout(ca
     events = [_question_event("event-q1"), _question_event("event-legacy", status=2, content="Which reset?")]
 
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=_streaming_client(events)),
+        patched_client(_streaming_client(events)),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[q1])),
         patch("aristotlelib.agent_task.run_question_flow", new=AsyncMock()) as flow,
         patch("aristotlelib.agent_task.read_stdin_line", new=AsyncMock()) as read_line,
@@ -4729,7 +4752,7 @@ async def test_stop_on_questions_hands_back_questions_already_pending_when_the_w
     q1, q2 = _pending_question(1), _pending_question(2)
 
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=_streaming_client([])),
+        patched_client(_streaming_client([])),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[q1, q2])),
         caplog.at_level(logging.INFO, logger="aristotle"),
     ):
@@ -4745,9 +4768,8 @@ async def test_stop_on_questions_hands_back_a_question_asked_during_the_wait():
     listings = iter([[], [q1]])
 
     with (
-        patch(
-            "aristotlelib.api_request.AristotleRequestClient",
-            return_value=_streaming_client([_question_event("event-q1"), _question_event("event-late")]),
+        patched_client(
+            _streaming_client([_question_event("event-q1"), _question_event("event-late")]),
         ),
         patch(
             "aristotlelib.agent_task.Question.list_for_task",
@@ -4765,9 +4787,8 @@ async def test_stop_on_questions_hands_back_a_question_found_by_a_timed_refresh(
     listings = iter([[], [], []])
 
     with (
-        patch(
-            "aristotlelib.api_request.AristotleRequestClient",
-            return_value=_quiet_client([_question_event("event-q1")], quiet_seconds=0.4),
+        patched_client(
+            _quiet_client([_question_event("event-q1")], quiet_seconds=0.4),
         ),
         patch(
             "aristotlelib.agent_task.Question.list_for_task",
@@ -4781,7 +4802,7 @@ async def test_stop_on_questions_waits_to_the_end_when_nothing_is_asked(caplog):
     task = _waiting_task()
 
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=_streaming_client([])),
+        patched_client(_streaming_client([])),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
         caplog.at_level(logging.INFO, logger="aristotle"),
     ):
@@ -4795,7 +4816,7 @@ async def test_stop_on_questions_does_not_stop_for_questions_only_the_owner_can_
     task.read_only = True
 
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=_streaming_client([], read_only=True)),
+        patched_client(_streaming_client([], read_only=True)),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[_pending_question(1)])),
     ):
         assert await task.wait_for_completion(interactive=False, stop_on_questions=True) == []
@@ -4810,7 +4831,7 @@ async def test_stop_on_questions_does_not_stop_for_the_questions_of_an_ended_run
     client.stream_ended = True
 
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=client),
+        patched_client(client),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[_pending_question(1)])),
     ):
         assert await task.wait_for_completion(interactive=False, stop_on_questions=True) == []
@@ -4822,7 +4843,7 @@ async def test_wait_for_completion_does_not_reopen_the_flow_for_events_of_the_sa
     events = [_question_event("event-q1"), _question_event("event-q2"), _question_event("event-q1")]
 
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=_streaming_client(events)),
+        patched_client(_streaming_client(events)),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[q1, q2])),
         patch(
             "aristotlelib.agent_task.run_question_flow", new=AsyncMock(return_value=FlowResult(answered=[q1, q2]))
@@ -4845,7 +4866,7 @@ async def test_wait_for_completion_reopens_the_flow_when_a_new_question_arrives(
     listings = [[q1], [q1], [q1, q2]]
 
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=_streaming_client(events)),
+        patched_client(_streaming_client(events)),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(side_effect=lambda _id: listings.pop(0))),
         patch(
             "aristotlelib.agent_task.run_question_flow",
@@ -4870,7 +4891,7 @@ async def test_wait_for_completion_falls_back_to_the_event_when_there_is_no_ques
     ]
 
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=_streaming_client(events)),
+        patched_client(_streaming_client(events)),
         patch(
             "aristotlelib.agent_task.Question.list_for_task",
             new=AsyncMock(side_effect=AristotleAPIError("not found", status_code=404)),
@@ -4896,7 +4917,7 @@ async def test_wait_for_completion_uses_the_event_for_a_question_the_list_does_n
     events = [_question_event("event-legacy", status=2, content="Which polarity?")]
 
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=_streaming_client(events)),
+        patched_client(_streaming_client(events)),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[durable])),
         patch("aristotlelib.agent_task.run_question_flow", new=AsyncMock()) as flow,
         patch.object(AgentTask, "_prompt_for_answer", new=AsyncMock()) as prompt,
@@ -4915,9 +4936,8 @@ async def test_wait_for_completion_pins_a_footer_while_questions_stay_pending():
     q1, q2 = _pending_question(1), _pending_question(2)
 
     with (
-        patch(
-            "aristotlelib.api_request.AristotleRequestClient",
-            return_value=_streaming_client([_question_event("event-q1")]),
+        patched_client(
+            _streaming_client([_question_event("event-q1")]),
         ),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[q1, q2])),
         patch(
@@ -4944,9 +4964,8 @@ async def test_wait_for_completion_clears_the_footer_once_answered_elsewhere():
     listings = [[q1], [_pending_question(1, response="Yes")]]
 
     with (
-        patch(
-            "aristotlelib.api_request.AristotleRequestClient",
-            return_value=_streaming_client([_question_event("event-q1")]),
+        patched_client(
+            _streaming_client([_question_event("event-q1")]),
         ),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(side_effect=lambda _id: listings.pop(0))),
         patch("aristotlelib.agent_task.run_question_flow", new=AsyncMock(return_value=FlowResult(unanswered=[q1]))),
@@ -4965,9 +4984,8 @@ async def test_wait_for_completion_does_not_prompt_without_a_terminal(caplog):
     q1 = _pending_question(1)
 
     with (
-        patch(
-            "aristotlelib.api_request.AristotleRequestClient",
-            return_value=_streaming_client([_question_event("event-q1")]),
+        patched_client(
+            _streaming_client([_question_event("event-q1")]),
         ),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[q1])),
         patch("aristotlelib.agent_task.run_question_flow", new=AsyncMock()) as flow,
@@ -5018,9 +5036,8 @@ async def test_wait_for_completion_keeps_using_the_questions_endpoint_after_a_tr
     remaining, list_for_task = _listing([], AristotleAPIError("API request failed with status 500: boom", 500), [q1])
 
     with (
-        patch(
-            "aristotlelib.api_request.AristotleRequestClient",
-            return_value=_streaming_client([_question_event("event-q1")]),
+        patched_client(
+            _streaming_client([_question_event("event-q1")]),
         ),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(side_effect=list_for_task)),
         patch(
@@ -5045,9 +5062,8 @@ async def test_wait_for_completion_presents_a_question_whose_row_was_not_visible
     remaining, list_for_task = _listing([], [], [q1])
 
     with (
-        patch(
-            "aristotlelib.api_request.AristotleRequestClient",
-            return_value=_streaming_client([_question_event("event-q1")]),
+        patched_client(
+            _streaming_client([_question_event("event-q1")]),
         ),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(side_effect=list_for_task)),
         patch(
@@ -5071,9 +5087,8 @@ async def test_wait_for_completion_keeps_the_footer_when_a_re_count_fails():
     remaining, list_for_task = _listing([q1], AristotleAPIError("API request failed with status 500: boom", 500))
 
     with (
-        patch(
-            "aristotlelib.api_request.AristotleRequestClient",
-            return_value=_streaming_client([_question_event("event-q1")]),
+        patched_client(
+            _streaming_client([_question_event("event-q1")]),
         ),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(side_effect=list_for_task)),
         patch("aristotlelib.agent_task.run_question_flow", new=AsyncMock(return_value=FlowResult(unanswered=[q1]))),
@@ -5093,7 +5108,7 @@ async def test_wait_for_completion_legacy_fallback_never_reads_a_pipe_as_the_ans
     events = [_question_event("event-legacy", status=2, content="Which polarity?")]
 
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=_streaming_client(events)),
+        patched_client(_streaming_client(events)),
         patch(
             "aristotlelib.agent_task.Question.list_for_task",
             new=AsyncMock(side_effect=AristotleAPIError("not found", status_code=404)),
@@ -5121,7 +5136,7 @@ async def test_wait_for_completion_does_not_prompt_for_a_durable_question_answer
     events = [_question_event("event-q1", status=2, content="Question number 1?")]
 
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=_streaming_client(events)),
+        patched_client(_streaming_client(events)),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[answered])),
         patch("aristotlelib.agent_task.run_question_flow", new=AsyncMock()) as flow,
         patch.object(AgentTask, "_prompt_for_answer", new=AsyncMock()) as prompt,
@@ -5141,7 +5156,7 @@ async def test_wait_for_completion_still_shows_a_timed_out_question_from_an_olde
     events = [_question_event("event-timed-out", status=1, content="Which width?")]
 
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=_streaming_client(events)),
+        patched_client(_streaming_client(events)),
         patch(
             "aristotlelib.agent_task.Question.list_for_task",
             new=AsyncMock(side_effect=AristotleAPIError("not found", status_code=404)),
@@ -5177,7 +5192,7 @@ async def test_wait_for_completion_shows_the_timed_out_notice_for_a_question_it_
     ]
 
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=_streaming_client(events)),
+        patched_client(_streaming_client(events)),
         patch("aristotlelib.agent_task.Question.list_for_task", new=listing),
         patch.object(AgentTask, "_prompt_for_answer", new=AsyncMock()) as prompt,
         patch("aristotlelib.progress_utils.clear_progress_lines"),
@@ -5203,7 +5218,7 @@ async def test_wait_for_completion_keeps_the_flow_outcome_on_the_display():
     remaining, list_for_task = _listing([q1, q2], [_pending_question(1, response="Yes"), q2])
 
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=_streaming_client(events)),
+        patched_client(_streaming_client(events)),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(side_effect=list_for_task)),
         patch(
             "aristotlelib.agent_task.run_question_flow",
@@ -5231,9 +5246,8 @@ async def test_wait_for_completion_reports_a_skipped_question_the_agent_gave_up_
     remaining, list_for_task = _listing([q1], [ignored])
 
     with (
-        patch(
-            "aristotlelib.api_request.AristotleRequestClient",
-            return_value=_streaming_client([_question_event("event-q1")]),
+        patched_client(
+            _streaming_client([_question_event("event-q1")]),
         ),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(side_effect=list_for_task)),
         patch("aristotlelib.agent_task.run_question_flow", new=AsyncMock(return_value=FlowResult(unanswered=[q1]))),
@@ -5274,9 +5288,8 @@ async def test_wait_for_completion_refreshes_on_a_quiet_stream(monkeypatch):
     list_for_task = AsyncMock(side_effect=lambda _task_id: next(listings, [q1]))
 
     with (
-        patch(
-            "aristotlelib.api_request.AristotleRequestClient",
-            return_value=_quiet_client([_question_event("event-q1")], quiet_seconds=0.4),
+        patched_client(
+            _quiet_client([_question_event("event-q1")], quiet_seconds=0.4),
         ),
         patch("aristotlelib.agent_task.Question.list_for_task", new=list_for_task),
         patch(
@@ -5299,9 +5312,8 @@ async def test_a_lagging_question_row_is_not_reported_as_timed_out():
     remaining, list_for_task = _listing([], [], [q1])
 
     with (
-        patch(
-            "aristotlelib.api_request.AristotleRequestClient",
-            return_value=_streaming_client([_question_event("event-q1")]),
+        patched_client(
+            _streaming_client([_question_event("event-q1")]),
         ),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(side_effect=list_for_task)),
         patch("aristotlelib.agent_task.run_question_flow", new=AsyncMock(return_value=FlowResult(answered=[q1]))),
@@ -5322,9 +5334,8 @@ async def test_a_placeholder_no_record_ever_claims_is_shown_without_a_timeout_cl
     list_for_task = AsyncMock(return_value=[])
 
     with (
-        patch(
-            "aristotlelib.api_request.AristotleRequestClient",
-            return_value=_quiet_client([_question_event("event-orphan", content="Which clock?")], quiet_seconds=0.3),
+        patched_client(
+            _quiet_client([_question_event("event-orphan", content="Which clock?")], quiet_seconds=0.3),
         ),
         patch("aristotlelib.agent_task.Question.list_for_task", new=list_for_task),
         patch("aristotlelib.agent_task.can_prompt", return_value=True),
@@ -5380,7 +5391,7 @@ def _showing_client(events: list[dict], questions: list[dict] | Exception) -> As
 async def _shown_events(task: AgentTask, client: AsyncMock, caplog) -> list[str]:
     """What task.show() logs for its events through ``client``, after its status."""
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=client),
+        patched_client(client),
         caplog.at_level(logging.INFO, logger="aristotle"),
     ):
         await task.show(num_events=10)
@@ -5472,6 +5483,23 @@ async def test_show_says_no_question_it_cannot_settle_timed_out(listing, caplog)
     assert "timed out" not in caplog.text
 
 
+async def test_get_events_prints_each_question_event_as_its_listed_question():
+    client = _showing_client(
+        [_question_event("event-q1"), _plain_event("event-1", "Summing up"), _question_event("event-unclaimed")],
+        [_question_record()],
+    )
+
+    with patched_client(client):
+        events, _ = await _waiting_task().get_events(limit=10)
+
+    assert [str(event) for event in events] == [
+        "Aristotle asked: Asked a question",
+        "MESSAGE: Summing up",
+        "Aristotle asked: Which width?\nWaiting for an answer; answer with: aristotle questions proj-wait",
+    ]
+    assert _listings(client) == 1
+
+
 async def test_a_failed_task_refresh_on_a_quiet_stream_does_not_end_the_wait(monkeypatch, caplog):
     monkeypatch.setattr("aristotlelib.agent_task.QUESTION_REFRESH_SECONDS", 0.05)
     task = _waiting_task()
@@ -5489,7 +5517,7 @@ async def test_a_failed_task_refresh_on_a_quiet_stream_does_not_end_the_wait(mon
     client.get = AsyncMock(side_effect=get)
 
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=client),
+        patched_client(client),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
         patch("aristotlelib.progress_utils.clear_progress_lines"),
         patch("aristotlelib.progress_utils.print_progress_lines"),
@@ -5518,7 +5546,7 @@ async def test_a_stream_that_fails_is_one_error_line(failure, carry_on, caplog):
     client.stream_sse = fails
 
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=client),
+        patched_client(client),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
         patch("aristotlelib.progress_utils.clear_progress_lines"),
         patch("aristotlelib.progress_utils.print_progress_lines"),
@@ -5547,7 +5575,7 @@ async def test_a_stream_that_gives_up_on_a_retryable_status_is_one_error_line(st
     client.stream_sse = fails
 
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=client),
+        patched_client(client),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
         patch("aristotlelib.progress_utils.clear_progress_lines"),
         patch("aristotlelib.progress_utils.print_progress_lines"),
@@ -5577,7 +5605,7 @@ async def test_a_wait_whose_stream_keeps_failing_ends_once_a_refresh_sees_the_ru
     client.stream_sse = keeps_failing
 
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=client),
+        patched_client(client),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
         patch("aristotlelib.progress_utils.clear_progress_lines"),
         patch("aristotlelib.progress_utils.print_progress_lines"),
@@ -5633,7 +5661,7 @@ async def test_a_wait_says_once_that_the_connection_failed_and_once_that_it_is_b
     client.get = AsyncMock(side_effect=refresh)
     client.stream_sse = outage_then_back
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=client),
+        patched_client(client),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(side_effect=list_questions)),
         caplog.at_level(logging.INFO, logger="aristotle"),
     ):
@@ -5669,7 +5697,7 @@ async def test_a_wait_that_stops_for_a_question_in_an_outage_says_the_connection
 
     client.stream_sse = outage_without_end
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=client),
+        patched_client(client),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(side_effect=list_questions)),
         caplog.at_level(logging.INFO, logger="aristotle"),
     ):
@@ -5711,7 +5739,7 @@ async def test_a_refresh_under_way_when_the_outage_is_reported_goes_quiet_from_t
     client.get = AsyncMock(side_effect=refresh)
     client.stream_sse = outage_then_back
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=client),
+        patched_client(client),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
         caplog.at_level(logging.INFO, logger="aristotle"),
     ):
@@ -5743,7 +5771,7 @@ async def test_a_refresh_after_a_clean_end_runs_quietly(caplog):
     working = client.get.side_effect
     client.stream_sse = ends_cleanly
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=client),
+        patched_client(client),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
         caplog.at_level(logging.INFO, logger="aristotle"),
     ):
@@ -5790,7 +5818,7 @@ async def test_a_wait_at_a_terminal_shows_the_outage_while_it_lasts(monkeypatch,
     client.stream_sse = outage_then_back
     during: list[list[str]] = []
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=client),
+        patched_client(client),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
         patch("aristotlelib.progress_utils.clear_progress_lines"),
         patch("aristotlelib.progress_utils.print_progress_lines") as shown,
@@ -5821,7 +5849,7 @@ async def test_a_run_that_ends_in_an_outage_leaves_no_outage_in_the_last_frame(c
 
     client.stream_sse = outage_then_ends
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=client),
+        patched_client(client),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
         patch("aristotlelib.progress_utils.clear_progress_lines"),
         patch("aristotlelib.progress_utils.print_progress_lines") as shown,
@@ -5865,7 +5893,7 @@ async def test_an_outage_names_what_failed_in_one_sentence(error, says, caplog):
 
     client.stream_sse = fails_then_ends
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=client),
+        patched_client(client),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
         caplog.at_level(logging.INFO, logger="aristotle"),
     ):
@@ -5888,7 +5916,7 @@ async def test_a_stream_refused_with_a_final_status_raises_it():
     client.stream_sse = refuses
 
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=client),
+        patched_client(client),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
         patch("aristotlelib.progress_utils.clear_progress_lines"),
         patch("aristotlelib.progress_utils.print_progress_lines"),
@@ -6056,7 +6084,7 @@ async def test_a_stream_that_ends_before_the_task_does_is_reported(caplog):
     client.stream_sse = closes_early
 
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=client),
+        patched_client(client),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
         patch("aristotlelib.progress_utils.clear_progress_lines"),
         patch("aristotlelib.progress_utils.print_progress_lines"),
@@ -6090,7 +6118,7 @@ async def test_a_stream_that_ends_with_the_status_out_of_reach_still_names_the_n
     client.get = AsyncMock(side_effect=unreachable_once_ended)
 
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=client),
+        patched_client(client),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
         patch("aristotlelib.progress_utils.clear_progress_lines"),
         patch("aristotlelib.progress_utils.print_progress_lines"),
@@ -6117,7 +6145,7 @@ async def test_a_stream_that_ends_before_a_queued_run_starts_says_it_never_start
     client.stream_sse = closes_early
 
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=client),
+        patched_client(client),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
         patch("aristotlelib.progress_utils.clear_progress_lines"),
         patch("aristotlelib.progress_utils.print_progress_lines"),
@@ -6170,7 +6198,7 @@ async def test_a_failed_final_refresh_ends_the_wait_with_a_warning(caplog):
     client.get = AsyncMock(side_effect=AristotleAPIError("bad gateway", status_code=502))
 
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=client),
+        patched_client(client),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
         patch("aristotlelib.progress_utils.clear_progress_lines"),
         patch("aristotlelib.progress_utils.print_progress_lines"),
@@ -6232,9 +6260,7 @@ async def test_the_per_event_prompt_does_not_read_for_a_shared_projects_viewer(c
     events = [_question_event("event-legacy", status=2, content="Which polarity?")]
 
     with (
-        patch(
-            "aristotlelib.api_request.AristotleRequestClient", return_value=_streaming_client(events, read_only=True)
-        ),
+        patched_client(_streaming_client(events, read_only=True)),
         patch(
             "aristotlelib.agent_task.Question.list_for_task",
             new=AsyncMock(side_effect=AristotleAPIError("not found", status_code=404)),
@@ -6261,7 +6287,7 @@ async def test_an_interrupted_wait_says_the_task_is_still_running_and_re_raises(
     task = _waiting_task()
 
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=_streaming_client([])),
+        patched_client(_streaming_client([])),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(side_effect=interrupt)),
         patch("aristotlelib.progress_utils.clear_progress_lines"),
         patch("aristotlelib.progress_utils.print_progress_lines"),
@@ -6279,9 +6305,7 @@ async def test_an_interrupted_wait_on_a_queued_run_says_it_has_not_started(inter
     task.status = TaskStatus.QUEUED
 
     with (
-        patch(
-            "aristotlelib.api_request.AristotleRequestClient", return_value=_streaming_client([], live_status="QUEUED")
-        ),
+        patched_client(_streaming_client([], live_status="QUEUED")),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(side_effect=interrupt)),
         patch("aristotlelib.progress_utils.clear_progress_lines"),
         patch("aristotlelib.progress_utils.print_progress_lines"),
@@ -6304,9 +6328,8 @@ async def test_an_interrupted_wait_on_someone_elses_queued_run_names_its_owner_a
     task.read_only = True
 
     with (
-        patch(
-            "aristotlelib.api_request.AristotleRequestClient",
-            return_value=_streaming_client([], read_only=True, live_status="QUEUED"),
+        patched_client(
+            _streaming_client([], read_only=True, live_status="QUEUED"),
         ),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(side_effect=KeyboardInterrupt)),
         patch("aristotlelib.progress_utils.clear_progress_lines"),
@@ -6329,7 +6352,7 @@ async def test_an_interrupted_wait_on_a_run_that_has_since_started_says_it_is_ru
     task.status = TaskStatus.QUEUED
 
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=_streaming_client([])),
+        patched_client(_streaming_client([])),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(side_effect=KeyboardInterrupt)),
         patch("aristotlelib.progress_utils.clear_progress_lines"),
         patch("aristotlelib.progress_utils.print_progress_lines"),
@@ -6349,7 +6372,7 @@ async def test_an_interrupted_wait_names_the_callers_command_to_carry_on(caplog)
     task = _waiting_task()
 
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=_streaming_client([])),
+        patched_client(_streaming_client([])),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(side_effect=KeyboardInterrupt)),
         patch("aristotlelib.progress_utils.clear_progress_lines"),
         patch("aristotlelib.progress_utils.print_progress_lines"),
@@ -6370,7 +6393,7 @@ async def test_an_interrupted_wait_whose_refresh_fails_claims_no_status_and_says
     client.get = AsyncMock(side_effect=AristotleAPIError("unavailable", status_code=503))
 
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=client),
+        patched_client(client),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(side_effect=KeyboardInterrupt)),
         patch("aristotlelib.progress_utils.clear_progress_lines"),
         patch("aristotlelib.progress_utils.print_progress_lines"),
@@ -6396,9 +6419,8 @@ async def test_an_interrupt_after_the_stream_ended_during_a_flow_leaves_no_unret
         raise KeyboardInterrupt
 
     with (
-        patch(
-            "aristotlelib.api_request.AristotleRequestClient",
-            return_value=_streaming_client([_question_event("event-q1")]),
+        patched_client(
+            _streaming_client([_question_event("event-q1")]),
         ),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(side_effect=[[], [q1]])),
         patch("aristotlelib.agent_task.run_question_flow", new=AsyncMock(side_effect=interrupted_flow)),
@@ -6419,7 +6441,7 @@ async def test_a_question_asked_before_the_wait_attached_is_presented():
     q1 = _pending_question(1)
 
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=_streaming_client([])),
+        patched_client(_streaming_client([])),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[q1])),
         patch(
             "aristotlelib.agent_task.run_question_flow", new=AsyncMock(return_value=FlowResult(answered=[q1]))
@@ -6443,7 +6465,7 @@ async def test_a_quiet_stream_is_polled_for_questions_without_any_question_event
     list_for_task = AsyncMock(side_effect=lambda _task_id: next(listings, [q1]))
 
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=_quiet_client([], quiet_seconds=0.3)),
+        patched_client(_quiet_client([], quiet_seconds=0.3)),
         patch("aristotlelib.agent_task.Question.list_for_task", new=list_for_task),
         patch(
             "aristotlelib.agent_task.run_question_flow", new=AsyncMock(return_value=FlowResult(answered=[q1]))
@@ -6466,7 +6488,7 @@ async def test_a_question_of_an_ended_run_is_shown_without_opening_the_flow():
     client.stream_ended = True
 
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=client),
+        patched_client(client),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[q1])),
         patch("aristotlelib.agent_task.run_question_flow", new=AsyncMock()) as flow,
         patch("aristotlelib.agent_task.can_prompt", return_value=True),
@@ -6498,7 +6520,7 @@ async def test_a_failed_refresh_before_the_flow_keeps_the_last_known_status():
     client.get = AsyncMock(side_effect=get)
 
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=client),
+        patched_client(client),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[q1])),
         patch("aristotlelib.agent_task.run_question_flow", new=AsyncMock(return_value=FlowResult())) as flow,
         patch("aristotlelib.agent_task.can_prompt", return_value=True),
@@ -6516,7 +6538,7 @@ async def test_no_footer_after_a_flow_that_found_the_run_ended():
     ended = FlowResult(unanswered=[q1], run_ended=True, summary=["The run has ended, so nothing was sent."])
 
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=_streaming_client([])),
+        patched_client(_streaming_client([])),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[q1])),
         patch("aristotlelib.agent_task.run_question_flow", new=AsyncMock(return_value=ended)),
         patch("aristotlelib.agent_task.can_prompt", return_value=True),
@@ -6543,7 +6565,7 @@ async def test_the_footer_clears_once_the_run_has_ended(monkeypatch):
         return FlowResult(unanswered=[q1])
 
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=client),
+        patched_client(client),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[q1])),
         patch("aristotlelib.agent_task.run_question_flow", new=AsyncMock(side_effect=skipped)),
         patch("aristotlelib.agent_task.can_prompt", return_value=True),
@@ -6564,7 +6586,7 @@ async def test_a_viewer_of_a_shared_project_is_not_prompted(caplog):
     q1 = _pending_question(1)
 
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=_streaming_client([], read_only=True)),
+        patched_client(_streaming_client([], read_only=True)),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[q1])),
         patch("aristotlelib.agent_task.run_question_flow", new=AsyncMock()) as flow,
         patch("aristotlelib.agent_task.can_prompt", return_value=True),
@@ -7749,9 +7771,12 @@ async def test_a_cancel_refused_for_a_finished_task_says_it_has_finished(api_ser
 
 TIMED_OUT = [lambda request: httpx.ReadTimeout("")] * api_request.RETRY_ATTEMPTS
 UNAVAILABLE = [lambda request: httpx.Response(503, json={"detail": "Service Unavailable"})] * api_request.RETRY_ATTEMPTS
+UNREADABLE = [lambda request: httpx.Response(200, json={})] * api_request.RETRY_ATTEMPTS
 
 
-@pytest.mark.parametrize("failures", [TIMED_OUT, UNAVAILABLE], ids=["timed out", "server error"])
+@pytest.mark.parametrize(
+    "failures", [TIMED_OUT, UNAVAILABLE, UNREADABLE], ids=["timed out", "server error", "json it can't read"]
+)
 async def test_a_cancel_that_fails_counts_as_done_when_the_task_then_reads_cancelled(failures, api_server):
     requests = api_server(*failures, _task_in("CANCELED"))
     task = AgentTask.model_validate(TASK)
@@ -7796,3 +7821,128 @@ async def test_a_task_last_read_cancelled_counts_as_cancelled_when_it_cannot_be_
 
     assert caplog.messages[-1].startswith("Could not refresh the task status: GET /task/task-1 after 5 attempts")
     assert task.status == TaskStatus.CANCELED
+
+
+def _without_has_files() -> dict[str, object]:
+    record = _listed(CREATED_ID, "Prove it").model_dump(mode="json")
+    del record["has_files"]
+    return record
+
+
+@pytest.mark.usefixtures("frozen_api_clock")
+@pytest.mark.parametrize(
+    ("read", "answer", "problem"),
+    [
+        (lambda: Project.list_projects(), {}, "projects: Field required"),
+        (lambda: Project.from_id(CREATED_ID), _without_has_files(), "has_files: Field required"),
+        (
+            lambda: _listed(CREATED_ID, "Prove it").get_tasks(),
+            {"agent_tasks": [TASK], "pagination_key": 7},
+            "pagination_key: Input should be a valid string",
+        ),
+        (lambda: AgentTask.model_validate(TASK).get_events(), {"events": None}, "events: Input should be a valid list"),
+        (
+            lambda: Declaration.list_all_for_project(CREATED_ID),
+            {"declarations": [5]},
+            "declarations.0: Input should be a valid dictionary",
+        ),
+        (lambda: Question.list_for_task("task-1"), {}, "Input should be a valid list"),
+    ],
+    ids=["projects", "project", "tasks", "events", "declarations", "questions"],
+)
+async def test_a_read_answered_by_json_this_version_cant_read_fails_once_the_retries_run_out(
+    read, answer, problem, api_server, monkeypatch
+):
+    monkeypatch.setattr(api_request, "getproxies", dict)
+    requests = api_server(
+        *(lambda request: httpx.Response(200, json=answer) for _ in range(api_request.RETRY_ATTEMPTS))
+    )
+
+    with pytest.raises(AristotleAPIError) as info:
+        await read()
+
+    assert str(info.value).endswith(
+        " after 5 attempts over 0 s: the answer from https://aristotle.harmonic.fun was 200 OK with JSON this version "
+        f"of aristotlelib can't read ({problem}): a proxy may have answered instead, or a newer aristotlelib may be "
+        "needed."
+    )
+    assert info.value.status_code is None
+    assert len(requests) == api_request.RETRY_ATTEMPTS
+
+
+async def test_a_read_answered_once_by_json_this_version_cant_read_takes_the_next_answer(api_server):
+    requests = api_server(httpx.Response(200, json=_without_has_files()), _record())
+
+    project = await Project.from_id(CREATED_ID)
+
+    assert project.project_id == CREATED_ID
+    assert len(requests) == 2
+
+
+async def test_a_prompt_answered_by_json_this_version_cant_read_may_have_been_sent(api_server, monkeypatch):
+    monkeypatch.setattr(api_request, "getproxies", dict)
+    requests = api_server(httpx.Response(200, json={"agent_task_id": "task-1"}))
+
+    with pytest.raises(api_request.AristotleOutcomeUnknownError) as info:
+        await _listed(CREATED_ID, "Prove it").ask("Carry on")
+
+    assert len(requests) == 1
+    assert str(info.value) == (
+        f"POST /project/{CREATED_ID}/ask: the answer from https://aristotle.harmonic.fun was 200 OK with JSON this "
+        "version of aristotlelib can't read (project_id: Field required, and 6 more): a proxy may have answered "
+        f"instead, or a newer aristotlelib may be needed. {LOST} If it did, the prompt was sent, though its task may "
+        f"take a few minutes to show up: check `aristotle tasks {CREATED_ID}` before sending it again."
+    )
+
+
+async def test_an_answer_answered_by_json_this_version_cant_read_may_have_been_taken(api_server, monkeypatch):
+    monkeypatch.setattr(api_request, "getproxies", dict)
+    requests = api_server(httpx.Response(200, json={}))
+
+    with pytest.raises(api_request.AristotleOutcomeUnknownError) as info:
+        await _pending_question(1).answer("Yes")
+
+    assert len(requests) == 1
+    assert str(info.value).startswith("POST /question/q-1/answer: the answer from https://aristotle.harmonic.fun")
+    assert str(info.value).endswith(
+        f"{LOST} If it did, the question was answered: check `aristotle questions proj-wait --json`, where an "
+        "answered question has `response` set, before answering it again."
+    )
+
+
+class _OwnProject(Project):
+    pass
+
+
+class _OwnQuestion(Question):
+    pass
+
+
+class _OwnDeclaration(Declaration):
+    pass
+
+
+@pytest.mark.parametrize(
+    ("listing", "answer", "kind"),
+    [
+        (
+            lambda: _OwnProject.list_projects(),
+            {"projects": [_listed(CREATED_ID, "Prove it").model_dump(mode="json")]},
+            _OwnProject,
+        ),
+        (lambda: _OwnQuestion.list_for_task("task-1"), [_pending_question(1).model_dump(mode="json")], _OwnQuestion),
+        (
+            lambda: _OwnDeclaration.list_all_for_project(CREATED_ID),
+            {"declarations": [make_declaration().model_dump(mode="json")]},
+            _OwnDeclaration,
+        ),
+    ],
+    ids=["projects", "questions", "declarations"],
+)
+async def test_a_subclass_lists_instances_of_itself(listing, answer, kind, api_server):
+    api_server(httpx.Response(200, json=answer))
+
+    listed = await listing()
+
+    items = listed[0] if isinstance(listed, tuple) else listed
+    assert [type(item) for item in items] == [kind]

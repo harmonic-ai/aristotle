@@ -98,8 +98,8 @@ class ContinueAction(APIAction):
             "--project-dir",
             help=(
                 "Root for uploaded paths; default: the current directory. Only --files are uploaded, unless "
-                "--send-folder sends the whole directory. Files outside this directory, also through links, and paths "
-                "containing .. are refused."
+                "--send-folder sends the whole directory, so it needs --files or --send-folder. Files outside this "
+                "directory, also through links, and paths containing .. are refused."
             ),
         )
         self.parser.add_argument(
@@ -195,6 +195,11 @@ class ContinueAction(APIAction):
             )
         elif args.dry_run:
             self.parser.error("--dry-run needs --send-folder, which sends the folder whose files it lists.")
+        elif args.project_dir is not None and args.files is None:
+            self.parser.error(
+                "--project-dir needs --send-folder, to send the whole folder, or --files, to send some of its files. "
+                "To send the prompt alone, drop --project-dir."
+            )
         if args.dry_run and (args.wait or args.non_interactive):
             self.parser.error("--dry-run sends nothing, so there is nothing to wait for.")
         if not args.send_folder and (args.files or args.project_dir is not None):
@@ -224,7 +229,7 @@ class ContinueAction(APIAction):
         else:
             sending = "--send-folder" if folder is not None else ""
         if sending and project.status != ProjectStatus.IDLE:
-            self.parser.error(files_refused_while_running(args.project_id, sending))
+            self.parser.error(files_refused_while_running(args.project_id, sending, without=_left_out(sending, args)))
         no_questions_ignored = args.no_questions and project.status != ProjectStatus.IDLE
         if no_questions_ignored:
             logging.warning(
@@ -239,7 +244,7 @@ class ContinueAction(APIAction):
             try:
                 # submit's checks and reader, for the black boxes whose files stay out of the upload.
                 check_readable(folder)
-                block = read_block(folder, [], report=False)
+                block = read_block(folder, [], report=False, blackboxes_only=True)
             except (LeanProjectError, FilelistError, verilog_bundle.BundleError) as e:
                 logging.error(str(e))
                 return EXIT_USAGE_ERROR
@@ -270,7 +275,7 @@ class ContinueAction(APIAction):
             # Project.ask's refusal when its refresh finds a task started since the check above; else a real error.
             if not sending or project.status == ProjectStatus.IDLE:
                 raise
-            self.parser.error(files_refused_while_running(args.project_id, sending))
+            self.parser.error(files_refused_while_running(args.project_id, sending, without=_left_out(sending, args)))
         logging.info(f"Prompt submitted to project {args.project_id}, task {task.agent_task_id}")
         if args.files:
             logging.info(_uploaded([name for _, name in uploads], size))
@@ -338,7 +343,7 @@ class ContinueAction(APIAction):
         try:
             # In a send's order: the folder's block, then Project.ask's checks and its archive.
             check_readable(args.project_dir)
-            block = read_block(args.project_dir, [], report=False)
+            block = read_block(args.project_dir, [], report=False, blackboxes_only=True)
             local_file_utils.check_lake_manifest_references_local_deps(args.project_dir)
             with tempfile.TemporaryDirectory() as temp_dir:
                 archive = Path(temp_dir) / "project.tar.gz"
@@ -373,6 +378,17 @@ async def _answer_hint(project_id: str, task: AgentTask, *, running: bool) -> st
         if any(question.pending for question in questions):
             return f"Aristotle is waiting for answers. Answer with:\n  aristotle questions {project_id}"
     return f"If Aristotle asks anything, answer with:\n  aristotle questions {project_id}"
+
+
+def _left_out(sending: str, args: argparse.Namespace) -> str:
+    """The options to leave out to send the prompt alone to a running task: ``sending``, plus --include-ignored and
+    --project-dir where given, since preflight refuses those without it."""
+    if args.include_ignored:
+        # --include-ignored needs --send-folder, which needs --project-dir, so both are set.
+        return f"{sending}, --include-ignored and --project-dir"
+    if args.project_dir is not None:
+        return f"{sending} and --project-dir"
+    return sending
 
 
 def _uploaded(files: list[str], size: int) -> str:

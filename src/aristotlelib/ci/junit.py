@@ -123,22 +123,27 @@ def _add_testcase(suite: ET.Element, result: PropertyResult, results: RunResults
 
 
 def _run_error(results: RunResults) -> tuple[str, str, str] | None:
-    """The type, message and text of the error a run records that stopped short of checked verdicts: one cut short,
-    failed, cancelled, never started or stopped for questions; None for a run that finished."""
+    """The type, message and text of the error a run records that stopped short of checked verdicts, one cut short,
+    failed, cancelled, never started or stopped for questions, or that verified none of the manifest's properties;
+    None for any other run."""
     if results.stopped_summary is not None:
         return "stopped", STOPPED_REASON, f"{results.stop_hint}\n\n{excerpt(results.stopped_summary)}"
     if results.never_started:
         return "never started", NEVER_STARTED_REASON, ""
     reason = results.unchecked_reason
-    if reason is None:
+    if results.nothing_verified:
+        kind, reason = "nothing verified", "No property in the manifest was verified."
+        notes = ["The job log names the likely causes."]
+    elif reason is None:
         return None
-    if results.task_failed or results.canceled:
-        kind, note = ("failed" if results.task_failed else "cancelled"), UNCHECKED_PROOFS_NOTE
-    elif results.budget_failure_reason is not None:
-        kind, note = "billing", UNCHECKED_NOTE
     else:
-        kind, note = ("out of budget" if results.out_of_budget else "time budget"), UNCHECKED_NOTE
-    notes = [] if results.nothing_registered else [note]
+        if results.task_failed or results.canceled:
+            kind, note = ("failed" if results.task_failed else "cancelled"), UNCHECKED_PROOFS_NOTE
+        elif results.budget_failure_reason is not None:
+            kind, note = "billing", UNCHECKED_NOTE
+        else:
+            kind, note = ("out of budget" if results.out_of_budget else "time budget"), UNCHECKED_NOTE
+        notes = [] if results.nothing_registered else [note]
     if summary := results.run_summary_excerpt:
         notes.append(f"Aristotle's summary of the run:\n{summary}")
     return kind, reason, "\n\n".join(notes)
@@ -164,7 +169,8 @@ def build_root(results: RunResults, workspace: Path | None = None) -> ET.Element
         ET.SubElement(properties, "property", {"name": "aristotle.project_url", "value": results.project_url})
 
     if run_error is not None:
-        # The run stopped short of checked verdicts: an error saying why, under a name no manifest id can have.
+        # The run stopped short of checked verdicts or verified none of the manifest's properties: an error saying why,
+        # under a name no manifest id can have.
         kind, message, text = run_error
         stop = ET.SubElement(suite, "testcase", {"name": "Aristotle run", "classname": SUITE_NAME})
         error = ET.SubElement(stop, "error", {"message": message, "type": kind})

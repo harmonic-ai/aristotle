@@ -1,6 +1,7 @@
 """Fixtures shared by the CLI tests."""
 
 import asyncio
+import inspect
 import signal
 from collections.abc import Callable, Generator
 from datetime import datetime
@@ -36,6 +37,25 @@ LOOKUP_FAILURES = [
     ),
 ]
 """A lookup's every attempt failing, its exit code, and its error, for the request it names."""
+
+
+async def ctrl_c_before_answering(request: httpx.Request) -> httpx.Response:
+    """Raise KeyboardInterrupt in the event loop, where a signal raises it, while the request waits for its answer."""
+
+    def interrupt() -> None:
+        raise KeyboardInterrupt
+
+    asyncio.get_running_loop().call_soon(interrupt)
+    await asyncio.Event().wait()
+    return httpx.Response(204)
+
+
+@pytest.fixture(autouse=True)
+def billed_to() -> Generator[AsyncMock, None, None]:
+    """Patch submit's read of who the new run is billed to, which names nobody unless a test sets its return value, so
+    a test that serves submit's requests in order needn't serve that one."""
+    with patch("aristotlelib.cli.command.submit.billed_to", AsyncMock(return_value=None)) as mock:
+        yield mock
 
 
 @pytest.fixture(autouse=True)
@@ -182,14 +202,17 @@ def ctrl_c_while_waiting(
 def device_server(monkeypatch: pytest.MonkeyPatch, poll_clock: list[float]) -> Callable[..., list[httpx.Request]]:
     """Serve the device login and the key check through httpx's MockTransport, on poll_clock.
 
-    Call it with the token answers in order, the last repeated once they run out, ``start`` for the start answer and
-    ``check`` for the key check's, which by default accepts APPROVED_KEY only: each a response, an exception for the
-    transport to raise, or a function of the request that returns or raises one. It returns the requests received; each
-    token request carries the clock's reading as ``request.extensions["polled_at"]``.
+    Call it with the token answers in order, the last repeated once they run out, ``start`` for the start answer,
+    ``check`` for the key check's, which by default accepts APPROVED_KEY only, and ``organization`` for the key's
+    organization, by default 404: each a response, an exception for the transport to raise, or a function of the request
+    that returns or raises one, or awaits it. It returns the requests received; each token request carries the clock's
+    reading as ``request.extensions["polled_at"]``.
     """
     requests: list[httpx.Request] = []
 
-    def serve(*tokens: object, start: object = None, check: object = None) -> list[httpx.Request]:
+    def serve(
+        *tokens: object, start: object = None, check: object = None, organization: object = None
+    ) -> list[httpx.Request]:
         def handle(request: httpx.Request) -> httpx.Response:
             requests.append(request)
             path = request.url.path.removeprefix(f"/api/v{api_request.API_VERSION}")
@@ -204,12 +227,17 @@ def device_server(monkeypatch: pytest.MonkeyPatch, poll_clock: list[float]) -> C
             elif path == "/project":
                 accepted = request.headers.get("X-API-Key") == APPROVED_KEY
                 outcome = httpx.Response(200 if accepted else 401, json={"results": []})
+            elif path == login_flow.ORGANIZATION and organization is not None:
+                outcome = organization
             else:
                 outcome = httpx.Response(404, json={"detail": "Not Found"})
             if callable(outcome):
                 outcome = outcome(request)
             if isinstance(outcome, Exception):
                 raise outcome
+            if inspect.isawaitable(outcome):
+                # MockTransport awaits it.
+                return outcome  # type: ignore[return-value]
             assert isinstance(outcome, httpx.Response)
             return outcome
 

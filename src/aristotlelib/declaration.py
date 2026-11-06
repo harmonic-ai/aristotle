@@ -8,6 +8,7 @@ import time
 import uuid
 from typing import Any
 
+import httpx
 import pydantic
 
 from aristotlelib import api_request
@@ -114,6 +115,19 @@ class Declaration(pydantic.BaseModel):
     """Paths in the project of the files Aristotle linked to it, such as a counterexample's trace; a null reads as []."""
     created_at: UTCDatetime
     last_updated: UTCDatetime
+
+    @pydantic.model_validator(mode="before")
+    @classmethod
+    def _legacy_refutation(cls, data: Any, info: pydantic.ValidationInfo) -> Any:
+        """Read an older API node's status 2 for a negation proof and 5 for a counterexample, without evidence, as
+        REFUTED with that evidence."""
+        if info.context is not _API_RESPONSE or not isinstance(data, dict) or data.get("status") not in (2, 5):
+            return data
+        evidence = data.get("evidence")
+        if evidence is None:
+            legacy = data["status"] == 2
+            evidence = DeclarationEvidence.NEGATION_PROVED if legacy else DeclarationEvidence.COUNTEREXAMPLE
+        return {**data, "status": DeclarationStatus.REFUTED, "evidence": evidence}
 
     @pydantic.model_validator(mode="after")
     def _refutation_has_evidence(self) -> "Declaration":
@@ -227,25 +241,20 @@ class Declaration(pydantic.BaseModel):
         params: dict[str, Any] = {"limit": limit, "pagination_key": pagination_key}
         if declaration_type is not None:
             params["declaration_type"] = declaration_type.value
-        response = await client.get(f"/project/{project_uuid}/declarations", params=params)
-        response_data = response.json()
-        declarations: list[Declaration] = []
-        for data in response_data["declarations"]:
-            # Older API nodes return 2 for a negation proof and 5 for a counterexample, without evidence.
-            if data.get("status") in (2, 5):
-                evidence = data.get("evidence")
-                if evidence is None:
-                    evidence = (
-                        DeclarationEvidence.NEGATION_PROVED
-                        if data["status"] == 2
-                        else DeclarationEvidence.COUNTEREXAMPLE
-                    )
-                data = {**data, "status": DeclarationStatus.REFUTED, "evidence": evidence}
-            declarations.append(cls.model_validate(data, context=_API_RESPONSE))
-        new_pagination_key = response_data.get("pagination_key")
-        if new_pagination_key is not None and not isinstance(new_pagination_key, str):
-            raise TypeError("pagination_key must be a string or None")
-        return declarations, new_pagination_key
+
+        def read(response: httpx.Response) -> tuple[list["Declaration"], str | None]:
+            page = _DeclarationPage.model_validate(response.json())
+            declarations: list[Declaration] = [
+                cls.model_validate(data, context=_API_RESPONSE) for data in page.declarations
+            ]
+            return declarations, page.pagination_key
+
+        return await client.get(f"/project/{project_uuid}/declarations", params=params, read=read)
+
+
+class _DeclarationPage(pydantic.BaseModel):
+    declarations: list[dict[str, Any]]
+    pagination_key: str | None = None
 
 
 def _project_uuid(project_id: str) -> uuid.UUID:

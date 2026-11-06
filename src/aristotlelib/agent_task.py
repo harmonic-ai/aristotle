@@ -22,7 +22,7 @@ from aristotlelib.date_utils import UTCDatetime, format_elapsed_time
 from aristotlelib.declaration import Declaration, DeclarationType
 from aristotlelib.event import Event, EventStatus, EventType
 from aristotlelib.printable import print_line, printable
-from aristotlelib.question import Question
+from aristotlelib.question import Question, _question_notice
 from aristotlelib.shell import shell_hint
 
 logger = logging.getLogger("aristotle")
@@ -99,20 +99,6 @@ def _failure(error: Exception) -> str:
 def _prompt_line(text: str) -> None:
     """Print a line of the per-event prompt on stderr, made printable(), whether or not logging is set up."""
     print(printable(text), file=sys.stderr)
-
-
-def _question_notice(question: Question, read_only: bool = False) -> str:
-    asked = f"Aristotle asked: {question.content}"
-    if question.answered:
-        who = "The project's owner" if read_only else "You"
-        return f"{asked}\n{who} answered: {question.response}"
-    if question.ignored:
-        return f"{asked}\nThe question was closed without an answer."
-    if question.state == "UNANSWERED":
-        return f"{asked}\nThe run has ended, so no answer can reach Aristotle now."
-    if read_only:
-        return f"{asked}\nWaiting for an answer; only the project's owner can answer."
-    return f"{asked}\nWaiting for an answer; answer with: aristotle questions {question.project_id}"
 
 
 def follow_hint(project_id: str, read_only: bool = False, carry_on: str | None = None) -> str:
@@ -262,7 +248,8 @@ class AgentTask(AristotleObject):
     async def get_events(
         self, pagination_key: str | None = None, limit: int = 50, newest_first: bool = True
     ) -> tuple[list[Event], str | None]:
-        """List task events, ordered by creation date.
+        """List task events, ordered by creation date; a question event without an answer prints its question's text
+        and state, from the task's questions listing.
 
         Args:
             pagination_key: Key to start from when paginating through events.
@@ -277,13 +264,12 @@ class AgentTask(AristotleObject):
 
         params: dict[str, Any] = {"pagination_key": pagination_key, "limit": limit, "ascending": not newest_first}
         async with api_request.AristotleRequestClient() as client:
-            response = await client.get(f"/{self.endpoint_prefix}/{self.agent_task_id}/events", params=params)
-            response_data = response.json()
-            events: list[Event] = [Event.model_validate(event) for event in response_data["events"]]
-            pagination_key = response_data.get("pagination_key")
-            if pagination_key is not None and not isinstance(pagination_key, str):
-                raise TypeError("pagination_key must be a string or None")
-            return events, pagination_key
+            path = f"/{self.endpoint_prefix}/{self.agent_task_id}/events"
+            page = await client.get(path, params=params, read=api_request.json_as(_EventPage))
+        notices = await self._question_notices(page.events)
+        for event in page.events:
+            event._notice = notices.get(event.event_id)
+        return page.events, page.pagination_key
 
     async def cancel(self) -> None:
         """Cancel the task if it is in progress or queued; a task that reads CANCELED once the request has failed
@@ -291,11 +277,12 @@ class AgentTask(AristotleObject):
         async with api_request.AristotleRequestClient() as client:
             try:
                 # Sending it twice cancels once, so a lost reply is sent again like a GET's.
-                response = await client.post(f"/{self.endpoint_prefix}/{self.agent_task_id}/cancel", idempotent=True)
+                path = f"/{self.endpoint_prefix}/{self.agent_task_id}/cancel"
+                cancelled = await client.post(path, idempotent=True, read=api_request.json_as(type(self)))
             except api_request.AristotleAPIError as e:
                 failure = e
             else:
-                self._update_from_response(response.json())
+                self._adopt(cancelled)
                 return
         if failure.status_code == 404:
             # Aristotle refuses with a 404 any task no longer in progress or queued, one this cancel ended included.
@@ -324,9 +311,8 @@ class AgentTask(AristotleObject):
             return None
 
         events, next_pagination_key = await self.get_events(limit=num_events, pagination_key=pagination_key)
-        notices = await self._question_notices(events)
         for event in reversed(events):
-            logger.info(notices.get(event.event_id, event))
+            logger.info(event)
         if next_pagination_key:
             logger.info(f"Pagination key for next page: {next_pagination_key}")
         return next_pagination_key
@@ -852,3 +838,8 @@ class _QuestionWatcher:
         self.pending = [] if result.run_ended else result.unanswered
         # One display entry, so the outcome scrolls off together.
         return ["\n".join(result.summary)] if result.summary else []
+
+
+class _EventPage(pydantic.BaseModel):
+    events: list[Event]
+    pagination_key: str | None = None

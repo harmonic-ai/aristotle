@@ -4,6 +4,7 @@ import logging
 from aristotlelib import credentials
 from aristotlelib.api_request import get_web_url
 from aristotlelib.cli.api_action import APIAction
+from aristotlelib.exit_codes import EXIT_INFRASTRUCTURE_ERROR
 
 
 class LogoutAction(APIAction):
@@ -28,12 +29,21 @@ class LogoutAction(APIAction):
     def add_action_arguments(self) -> None:
         pass
 
-    async def run_action(self, args: argparse.Namespace) -> None:
-        if not credentials.delete_credentials():
+    async def run_action(self, args: argparse.Namespace) -> int | None:
+        try:
+            removed = credentials.delete_credentials()
+        except OSError as e:
+            logging.error(
+                f"Could not remove the stored API key at {credentials.credentials_path()}: {e.strerror or e}. "
+                "Nothing was removed."
+            )
+            return EXIT_INFRASTRUCTURE_ERROR
+        if not removed:
             logging.info("No stored API key to remove.")
-            return
+            return None
 
         logging.info(f"Removed the stored API key ({credentials.credentials_path()}).")
         # Deleting the file does not revoke anything: the key still works for anyone who has
         # it, and only the web app can revoke it.
         logging.info(f"The key itself stays valid until you revoke it at {get_web_url()}/keys.")
+        return None

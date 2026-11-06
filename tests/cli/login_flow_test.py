@@ -1,6 +1,7 @@
 """Tests for the login flow: the device login, and the paste-based login a server without it falls back to."""
 
 import asyncio
+import gc
 import io
 import json
 import logging
@@ -9,7 +10,7 @@ import signal
 import sys
 from collections.abc import Callable
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 from urllib.request import getproxies_environment
 
 import httpx
@@ -25,6 +26,7 @@ from tests.cli.conftest import (
     KEY_NAME,
     USER_CODE,
     approved,
+    ctrl_c_before_answering,
     device_started,
     token_error,
 )
@@ -74,8 +76,8 @@ async def test_a_piped_key_is_verified_and_stored(server):
 
     assert result.credentials_path == str(credentials.credentials_path())
     assert credentials.read_api_key() == "piped-key"
-    assert seen == ["piped-key"]
-    client.get.assert_awaited_once_with("/project", params={"limit": 1})
+    assert seen == ["piped-key", "piped-key"]
+    assert client.get.await_args_list == [call("/project", params={"limit": 1}), call(login_flow.ORGANIZATION)]
 
 
 async def test_a_given_key_is_verified_and_stored_without_asking(server, caplog):
@@ -91,7 +93,7 @@ async def test_a_given_key_is_verified_and_stored_without_asking(server, caplog)
 
     assert result.credentials_path == str(credentials.credentials_path())
     assert credentials.read_api_key() == "given-key"
-    assert seen == ["given-key"]
+    assert seen == ["given-key", "given-key"]
     client.post.assert_not_awaited()
     opened.assert_not_called()
     assert "Create an API key" not in caplog.text
@@ -171,8 +173,11 @@ async def test_configured_origin_login_preserves_default_credentials(monkeypatch
 
     assert configured_path != default_path
     assert configured_path.exists()
-    assert [str(request.url) for request in requests] == [f"{WEB_URL}/api/v3/project?limit=1"]
-    assert requests[0].headers["X-API-Key"] == "configured-key"
+    assert [str(request.url) for request in requests] == [
+        f"{WEB_URL}/api/v3/project?limit=1",
+        f"{WEB_URL}/api/v3/organization",
+    ]
+    assert [request.headers["X-API-Key"] for request in requests] == ["configured-key", "configured-key"]
     assert api_request.API_KEY is None
     assert credentials.read_api_key() == "configured-key"
 
@@ -227,7 +232,7 @@ async def test_the_pasted_key_is_verified_even_when_the_environment_has_another(
     with _stdin("pasted-key\n"):
         await login_flow.login()
 
-    assert seen == ["pasted-key"]
+    assert seen == ["pasted-key", "pasted-key"]
 
 
 async def test_a_rejected_key_is_not_stored(server):
@@ -393,8 +398,14 @@ async def test_an_approved_device_login_stores_the_key_under_its_name(device_ser
     assert json.loads(credentials.credentials_path().read_text())["name"] == KEY_NAME
     assert credentials.read_device_api_key() == APPROVED_KEY
     assert api_request.API_KEY is None
-    assert _paths(requests) == ["/cli/device/start", "/cli/device/token", "/cli/device/token", "/project"]
-    start, *polls, check = requests
+    assert _paths(requests) == [
+        "/cli/device/start",
+        "/cli/device/token",
+        "/cli/device/token",
+        "/project",
+        "/organization",
+    ]
+    start, *polls, check, organization = requests
     assert json.loads(start.content) == {
         "client_name": "aristotle CLI",
         "client_version": login_flow.get_version(),
@@ -403,7 +414,7 @@ async def test_an_approved_device_login_stores_the_key_under_its_name(device_ser
     }
     assert [json.loads(poll.content) for poll in polls] == [{"device_code": DEVICE_CODE}] * 2
     assert all("X-API-Key" not in request.headers for request in [start, *polls])
-    assert check.headers["X-API-Key"] == APPROVED_KEY
+    assert (check.headers["X-API-Key"], organization.headers["X-API-Key"]) == (APPROVED_KEY, APPROVED_KEY)
     assert f"To log in, open {WEB_URL}/device and enter this code:\n  {USER_CODE}\n" in caplog.text
     assert "The code expires in 10 minutes." in caplog.text
     assert f'Logged in. Key "{KEY_NAME}" stored in {credentials.credentials_path()}.' in caplog.text
@@ -615,7 +626,7 @@ async def test_a_server_without_device_login_takes_a_pasted_key(device_server, s
     prompt.assert_called_once()
     assert result.key_name is None
     assert credentials.read_api_key() == APPROVED_KEY
-    assert _paths(requests) == ["/cli/device/start", "/project"]
+    assert _paths(requests) == ["/cli/device/start", "/project", "/organization"]
     assert f"Create an API key at {WEB_URL}/keys" in caplog.text
     assert "enter this code" not in caplog.text
 
@@ -811,7 +822,7 @@ async def test_a_piped_key_is_checked_without_a_device_login(device_server):
     with _stdin(f"{APPROVED_KEY}\n"):
         result = await login_flow.login()
 
-    assert _paths(requests) == ["/project"]
+    assert _paths(requests) == ["/project", "/organization"]
     assert result.key_name is None
     assert credentials.read_api_key() == APPROVED_KEY
     assert credentials.read_device_api_key() is None
@@ -967,6 +978,19 @@ def test_an_interrupt_while_checking_the_key_names_the_key_to_revoke(device_serv
         f"{WEB_URL}/keys.\n"
     )
     assert credentials.read_api_key() is None
+
+
+def test_an_interrupt_while_asking_who_pays_keeps_the_stored_key(device_server, capsys, caplog):
+    caplog.set_level(logging.INFO)
+    device_server(approved(), organization=ctrl_c_before_answering)
+    with _stdin(""), pytest.raises(KeyboardInterrupt):
+        asyncio.run(login_flow.login())
+
+    gc.collect()
+    assert "never retrieved" not in caplog.text
+    assert credentials.read_api_key() == APPROVED_KEY
+    assert capsys.readouterr().err == "\nInterrupted. The key stays stored.\n"
+    assert _login_lines(caplog)[-1] == f'Logged in. Key "{KEY_NAME}" stored in {credentials.credentials_path()}.'
 
 
 def test_stdin_would_wait_only_for_a_pipe_with_nothing_in_it_yet(tmp_path):
@@ -1226,3 +1250,81 @@ async def test_a_refusals_verbose_report_shows_neither_the_stored_key_nor_the_de
     out, err = capsys.readouterr()
     for secret in (KEY_FROM_BEFORE, DEVICE_CODE):
         assert secret not in str(raised.value) + out + err + caplog.text
+
+
+def _login_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """What the login logged itself, without the HTTP client's lines."""
+    return [record.getMessage() for record in caplog.records if record.name == login_flow.logger.name]
+
+
+COMPANY = {"organization_id": "org-acme", "name": " Acme Robotics ", "organization_type": 2}
+PERSONAL = {"organization_id": "org-sam", "name": "Sam Example", "organization_type": 1}
+
+
+@pytest.mark.parametrize(
+    ("organization", "billed"),
+    [
+        (COMPANY, "Acme Robotics."),
+        (PERSONAL, "your personal organization."),
+        ({**COMPANY, "name": "Acme Inc."}, "Acme Inc."),
+        ({**COMPANY, "name": "Acme\u00a0Robotics\nGmbH"}, "Acme Robotics GmbH."),
+    ],
+    ids=["company", "personal", "a name that ends a sentence", "a name with other whitespace"],
+)
+async def test_a_login_says_who_runs_started_with_the_key_are_billed_to(device_server, caplog, organization, billed):
+    caplog.set_level(logging.INFO)
+    requests = device_server(approved(), organization=httpx.Response(200, json=organization))
+    with _stdin(""):
+        await login_flow.login()
+
+    assert _login_lines(caplog)[-2:] == [
+        f'Logged in. Key "{KEY_NAME}" stored in {credentials.credentials_path()}.',
+        f"Runs started with this key are billed to {billed}",
+    ]
+    (asked,) = [r for r in requests if r.url.path.endswith(login_flow.ORGANIZATION)]
+    assert asked.headers["X-API-Key"] == APPROVED_KEY
+
+
+@pytest.mark.parametrize(
+    "organization",
+    [
+        httpx.Response(502, text="Bad Gateway"),
+        httpx.Response(200, json=["Acme Robotics"]),
+        httpx.Response(200, text="<html>Acme Robotics</html>"),
+        httpx.Response(200, json={**COMPANY, "name": " "}),
+        httpx.Response(200, json={**COMPANY, "name": None}),
+        httpx.Response(200, json={**COMPANY, "name": "Acme \u202erobotics"}),
+        None,
+    ],
+    ids=["server error", "not an object", "not json", "blank name", "no name", "bidi override", "404"],
+)
+async def test_a_login_leaves_the_billing_line_out_when_aristotle_names_no_payer(device_server, caplog, organization):
+    caplog.set_level(logging.DEBUG)
+    device_server(approved(), organization=organization)
+    with _stdin(""):
+        await login_flow.login()
+
+    assert credentials.read_api_key() == APPROVED_KEY
+    assert _login_lines(caplog)[-1] == f'Logged in. Key "{KEY_NAME}" stored in {credentials.credentials_path()}.'
+    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
+async def test_a_login_waits_for_who_pays_only_as_long_as_billed_to_seconds(caplog, monkeypatch):
+    caplog.set_level(logging.INFO)
+    monkeypatch.setattr(login_flow, "BILLED_TO_SECONDS", 0.05)
+    asked = asyncio.Event()
+
+    async def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith(login_flow.ORGANIZATION):
+            asked.set()
+            await asyncio.Event().wait()
+        return httpx.Response(200, json={"results": []})
+
+    real_client = httpx.AsyncClient
+    transport = httpx.MockTransport(handle)
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: real_client(transport=transport, **kwargs))
+    await login_flow.login(api_key="given-key")
+
+    assert asked.is_set()
+    assert credentials.read_api_key() == "given-key"
+    assert _login_lines(caplog)[-1] == f"Logged in. Key stored in {credentials.credentials_path()}."

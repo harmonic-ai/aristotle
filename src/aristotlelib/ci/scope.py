@@ -122,7 +122,7 @@ class ScopeResult:
     """The Verilog block the root ``aristotle.f`` describes, whose files and filelist go up too."""
 
     held_back: list[Path] = dataclasses.field(default_factory=list)
-    """Tracked files an ignore rule keeps out of the upload, which warn_held_back names."""
+    """Tracked files an ignore rule keeps out of the upload, which warn_held_back names but for .lean files."""
 
     held_back_focus: list[Path] = dataclasses.field(default_factory=list)
     """Source files in scope, by the change or by --path, that an ignore rule keeps out of the upload: verified only if
@@ -171,14 +171,12 @@ def _run_git(root: Path, *args: str, timeout: float = GIT_TIMEOUT_SECONDS, write
         as_owner = {"user": owner[0], "group": owner[1], "extra_groups": []}
         env["HOME"] = tempfile.gettempdir()
     try:
+        # Bytes: text mode's universal newlines would read a carriage return in a file name as a line end.
         result = local_file_utils.run_git(
             root,
             *args,
             capture_output=True,
             stdin=subprocess.DEVNULL,
-            # As os.fsdecode decodes a path on POSIX, so that each name maps back to its bytes on disk.
-            encoding=sys.getfilesystemencoding(),
-            errors="surrogateescape",
             timeout=timeout,
             check=True,
             env=env,
@@ -189,10 +187,16 @@ def _run_git(root: Path, *args: str, timeout: float = GIT_TIMEOUT_SECONDS, write
     except subprocess.TimeoutExpired as e:
         raise ScopeError(f"git {' '.join(args)} timed out after {timeout:g}s.") from e
     except subprocess.CalledProcessError as e:
-        raise GitError(f"git {' '.join(args)} failed: {e.stderr.strip()}", e.returncode, e.stderr) from e
+        stderr = _decode(e.stderr)
+        raise GitError(f"git {' '.join(args)} failed: {stderr.strip()}", e.returncode, stderr) from e
     if result is None:
         raise ScopeError(f"{root} is not in a git repository.")
-    return result.stdout
+    return _decode(result.stdout)
+
+
+def _decode(output: bytes) -> str:
+    # As os.fsdecode decodes a path on POSIX, so that each name maps back to its bytes on disk.
+    return output.decode(sys.getfilesystemencoding(), "surrogateescape")
 
 
 def head_commit(root: Path) -> str | None:
@@ -246,10 +250,8 @@ def require_repository(root: Path) -> None:
         )
     try:
         _run_git(root, "rev-parse", "--git-dir")
-    except ScopeError as e:
-        if not isinstance(e.__cause__, subprocess.CalledProcessError):
-            raise
-        raise ScopeError(f"git refused {root}: {e.__cause__.stderr.strip()}") from e
+    except GitError as e:
+        raise ScopeError(f"git refused {root}: {e.stderr.strip()}") from e
 
 
 def _prefix(root: Path) -> str:
@@ -261,7 +263,17 @@ def _prefix(root: Path) -> str:
 def _ls_files(root: Path, *options: str) -> list[str]:
     prefix = local_file_utils.git_prefix(root)
     output = _run_git(root, "ls-files", "-z", *options, "--", local_file_utils.git_pathspec(root))
-    return [line[len(prefix) :] for line in output.split("\0") if line and line.startswith(prefix)]
+    # git lists an unmerged path once for each of its stages.
+    lines = dict.fromkeys(output.split("\0"))
+    return [line[len(prefix) :] for line in lines if line and line.startswith(prefix)]
+
+
+def _unmerged_files(root: Path) -> list[Path]:
+    prefix = local_file_utils.git_prefix(root)
+    output = _run_git(root, "ls-files", "-z", "--unmerged", "--", local_file_utils.git_pathspec(root))
+    # Each entry is "<mode> <object> <stage>\t<path>".
+    names = dict.fromkeys(entry.partition("\t")[2] for entry in output.split("\0") if entry)
+    return [Path(name[len(prefix) :]) for name in names if name.startswith(prefix)]
 
 
 def _tracked_files(root: Path, warn: bool = True) -> tuple[list[Path], list[Path], list[Path]]:
@@ -302,8 +314,8 @@ def _tracked_files(root: Path, warn: bool = True) -> tuple[list[Path], list[Path
 
 
 def warn_held_back(root: Path, scope_result: ScopeResult) -> None:
-    """Warn of the tracked files an ignore rule keeps out of ``scope_result``'s upload, but those its block takes, its
-    filelist included, and those its black boxes leave out."""
+    """Warn of the tracked files an ignore rule keeps out of ``scope_result``'s upload, but .lean files, those its block
+    takes, its filelist included, and those its black boxes leave out."""
     block = scope_result.block
     if block is None:
         _warn_held_back(root, scope_result.held_back)
@@ -315,8 +327,8 @@ def warn_held_back(root: Path, scope_result: ScopeResult) -> None:
 
 
 def _warn_held_back(root: Path, held_back: list[Path]) -> None:
-    if held_back:
-        logger.warning(local_file_utils.held_back_warning(local_file_utils.ignore_rules(root, held_back)))
+    if named := [p for p in held_back if p.suffix != ".lean"]:
+        logger.warning(local_file_utils.held_back_warning(local_file_utils.ignore_rules(root, named)))
 
 
 def _merge_base(root: Path, base_ref: str) -> str | None:
@@ -463,6 +475,30 @@ def _push_base(root: Path, before: str) -> str | None:
     return before if present() else None
 
 
+def _previous_commit(root: Path) -> str | None:
+    """HEAD's first parent, fetched from origin into a shallow clone that lacks it; None for a first commit, or if the
+    fetch fails."""
+
+    def parent() -> str | None:
+        try:
+            return _run_git(root, "rev-parse", "HEAD~1").strip()
+        except ScopeError:
+            return None
+
+    if (found := parent()) is not None or not _is_shallow(root) or (head := head_commit(root)) is None:
+        return found
+    # By its id: a fetch without a refspec would bring down origin's other branches and their history too.
+    logger.info("Fetching the previous commit from origin, which this shallow checkout lacks")
+    try:
+        _run_git(
+            root, "fetch", "--no-tags", "--deepen=1", "origin", head, timeout=GIT_FETCH_TIMEOUT_SECONDS, writes=True
+        )
+    except ScopeError as e:
+        logger.info(f"Could not fetch the previous commit from origin: {_reason(e)}")
+        return None
+    return parent()
+
+
 def _changed_files(root: Path, base_ref: str | None, push_before: str | None = None) -> list[Path]:
     """Files the change under test adds or modifies, a rename's new path included; raises ScopeError if a base branch
     has no merge base, or the commit before a push is neither in the checkout nor fetchable.
@@ -489,13 +525,12 @@ def _changed_files(root: Path, base_ref: str | None, push_before: str | None = N
             )
         logger.info(f"Comparing against {diff_target[:12]}, the commit before this push")
     else:
-        try:
-            diff_target = _run_git(root, "rev-parse", "HEAD~1").strip()
-        except ScopeError as e:
+        diff_target = _previous_commit(root)
+        if diff_target is None:
             raise ScopeError(
                 "Cannot determine which files changed: no base branch and no parent commit. "
                 "Use --scope all or --scope paths for a shallow or initial checkout."
-            ) from e
+            )
         logger.info(f"Comparing against the previous commit ({diff_target[:12]}); set --base-ref to compare a branch")
 
     pathspec = local_file_utils.git_pathspec(root)
@@ -761,22 +796,26 @@ def tracked_source_files(root: Path) -> list[Path]:
     return [Path(line) for line in _ls_files(root) if is_source_file(Path(line))]
 
 
-def resolve_checkout(root: Path, warn: bool = True, allow_empty: bool = False) -> ScopeResult:
+def resolve_checkout(
+    root: Path, warn: bool = True, allow_empty: bool = False, allow_unmerged: bool = False
+) -> ScopeResult:
     """The upload set for a manifest run: every tracked file, with every source file in focus, even none; ``warn`` as
-    _tracked_files takes it, and ``allow_empty`` as _upload_files does.
+    _tracked_files takes it, and ``allow_empty`` and ``allow_unmerged`` as _upload_files does.
 
-    Raises ScopeError when ``root`` is not a git checkout with tracked files.
+    Raises ScopeError when ``root`` is not a git checkout with tracked files, or, unless ``allow_unmerged``, while one
+    of them is unmerged.
     """
-    upload_files, _, held_back = _upload_files(root, warn, allow_empty)
+    upload_files, _, held_back = _upload_files(root, warn, allow_empty, allow_unmerged)
     return _result(root, upload_files, [p for p in upload_files if is_source_file(p)], held_back)
 
 
 def _upload_files(
-    root: Path, warn: bool = True, allow_empty: bool = False
+    root: Path, warn: bool = True, allow_empty: bool = False, allow_unmerged: bool = False
 ) -> tuple[list[Path], list[Path], list[Path]]:
     """The upload set, the tracked files left out of it for their names and those an ignore rule holds back, as
     _tracked_files gives them; an empty upload set only with ``allow_empty``, as when ignore rules hold back every
-    tracked file and a block will bring its own."""
+    tracked file and a block will bring its own; and files git lists as unmerged only with ``allow_unmerged``, as for
+    a run already started, which uploads nothing."""
     require_repository(root)
     # As submit judges it: git's files never go up, and git would list nothing in one or fail with no work tree.
     real = Path(os.path.realpath(root))
@@ -784,6 +823,11 @@ def _upload_files(
         raise ScopeError(f"{root} is a git directory, and nothing in one is uploaded.")
     if local_file_utils.in_git_dir(real):
         raise ScopeError(f"{root} is inside a git directory, and nothing in one is uploaded.")
+    if not allow_unmerged and (unmerged := _unmerged_files(root)):
+        raise ScopeError(
+            f"Unresolved merge conflicts in {root}:{local_file_utils.listing(unmerged)}\nResolve them and mark each "
+            "file resolved with `git add` or `git rm`, then run again."
+        )
     upload_files, not_utf8, held_back = _tracked_files(root, warn)
     if not upload_files and not allow_empty:
         if warn:

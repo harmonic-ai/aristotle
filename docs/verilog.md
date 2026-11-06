@@ -33,6 +33,10 @@ simulator reads a filelist, so the one your flow writes usually works as it is:
   the design instantiates, so name each one it should treat as a black box instead, such as a
   foundry cell, with `--blackbox <module>` (see below).
 - A file or filelist it names that isn't there stops the command before anything is sent.
+- An `aristotle.f` that names no source file, itself or through the filelists it names, such as one
+  holding only `--blackbox` lines, stops the command before anything is sent, naming it: Aristotle
+  would elaborate an empty design from it. On `submit`'s command line, a `-f` or `-F` that names the
+  sources lets it through.
 - A network path, such as `\\host\share\x.v` or `//host/share/x.v`, a Windows device path, starting `\\?\`, `\\.\`
   or `\??\`, or a drive-relative path, such as `C:x.v`, stops the command, naming its line, before anything looks it
   up, on every platform, and so does an `` `include`` of one: on Windows, looking up a network path connects to the

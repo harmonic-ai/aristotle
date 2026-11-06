@@ -62,7 +62,10 @@ class CancelAction(APIAction):
                 # A UUID: try project first, then task.
                 try:
                     project = await Project.from_id(project_id)
-                except AristotleNotFoundError:
+                except AristotleNotFoundError as e:
+                    if e.status_code == 410:
+                        # Deleted, so no task of it is left to cancel; say so rather than look for a task.
+                        raise
                     try:
                         task = await AgentTask.from_id(args.project_or_task_id)
                     except AristotleNotFoundError as e:

@@ -44,7 +44,7 @@ from aristotlelib.exit_codes import (
 )
 from aristotlelib.project import AgentQuestionsSetting, Project, ProjectStatus, create_sent
 from aristotlelib.shell import shell_commands
-from tests.ci.conftest import make_declaration, refusing_git, without_git
+from tests.ci.conftest import make_declaration, merge_conflict, refusing_git, without_git
 
 
 def _line(*words: str) -> str:
@@ -505,6 +505,16 @@ async def test_an_existing_manifest_is_refused_before_anything_is_uploaded(repo:
     assert create is None
     assert (repo / "aristotle.toml").read_text() == "# mine\n"
     assert "already exists. Pass --force to replace it." in caplog.text
+
+
+async def test_an_unresolved_merge_conflict_stops_setup_before_anything_goes_up(repo: Path, caplog):
+    merge_conflict(repo, "fifo.v")
+
+    code, create = await _setup([], [])
+
+    assert code == EXIT_USAGE_ERROR
+    create.assert_not_awaited()
+    assert caplog.messages[-1].startswith(f"Unresolved merge conflicts in {repo}: fifo.v\n")
 
 
 CI_HINT = "In CI, `aristotle ci` starts from the checkout's top level, so the job reads this manifest with:"

@@ -26,7 +26,7 @@ from aristotlelib.exit_codes import (
 )
 from aristotlelib.project import Project, ProjectStatus
 from aristotlelib.verilog import filelist
-from tests.ci.conftest import commit_bare_shaped, git, latin1_name, make_declaration
+from tests.ci.conftest import commit_bare_shaped, git, latin1_name, make_declaration, merge_conflict
 from tests.conftest import NEVER_READ, UNREACHABLE_HOST, WILDCARD_FOLDERS
 
 CI_VARIABLE_PREFIXES = ("GITHUB_", "GITLAB_", "CI_", "BUILDKITE", "CIRCLE", "BUILD_", "SYSTEM_", "JENKINS_")
@@ -358,6 +358,19 @@ async def test_a_directory_that_is_not_a_repository_is_a_usage_error(action: Rev
     assert code == EXIT_USAGE_ERROR
     assert "is not a git repository" in caplog.text
     assert "isn't tracked by git" not in caplog.text
+    submit.assert_not_awaited()
+
+
+@pytest.mark.parametrize("scope_argv", [["--scope", "all"], []], ids=["all", "changed"])
+async def test_an_unresolved_merge_conflict_stops_review_before_anything_goes_up(
+    action: ReviewAction, repo: Path, caplog, scope_argv: list[str]
+):
+    merge_conflict(repo, "fifo.v")
+
+    code, submit = await _run(action, [*scope_argv, "--directory", str(repo)], [])
+
+    assert code == EXIT_USAGE_ERROR
+    assert caplog.messages[-1].startswith(f"Unresolved merge conflicts in {repo}: fifo.v\n")
     submit.assert_not_awaited()
 
 
@@ -776,7 +789,9 @@ async def test_a_review_of_everything_with_no_source_still_names_what_an_ignore_
     git(repo, "commit", "-qm", "no verilog")
     _commit(repo, "x.c", "int main(void) { return 0; }\n")
     _commit(repo, ".gitignore", "*.c\n")
-    _commit(repo, "aristotle.f", "+define+FOO\n")
+    # The block names a file, but none a review verifies.
+    _commit(repo, "model.vp", "module model;\nendmodule\n")
+    _commit(repo, "aristotle.f", "model.vp\n")
 
     with caplog.at_level(logging.INFO, logger="aristotle"):
         code, _ = await _run(action, ["--scope", "all", "--directory", str(repo), "--dry-run"], [])
@@ -784,6 +799,24 @@ async def test_a_review_of_everything_with_no_source_still_names_what_an_ignore_
     assert code == EXIT_USAGE_ERROR
     assert caplog.messages[-1].startswith("--scope all found no tracked source files")
     assert caplog.messages[-2] == local_file_utils.held_back_warning({Path("x.c"): ".gitignore:1: *.c"})
+
+
+@pytest.mark.parametrize("dry_run", [True, False], ids=["--dry-run", "run"])
+async def test_a_root_aristotle_f_of_black_boxes_alone_stops_before_anything_goes_up(
+    action: ReviewAction, repo: Path, caplog, dry_run: bool
+):
+    """It names no source file, so fifo.v would go up beside an aristotle.f naming none."""
+    _commit(repo, "aristotle.f", "--blackbox sram_1p\n")
+
+    argv = ["--scope", "all", "--directory", str(repo), "--no-junit", *(["--dry-run"] if dry_run else [])]
+    code, submit = await _run(action, argv, [])
+
+    assert code == EXIT_USAGE_ERROR
+    submit.assert_not_awaited()
+    assert caplog.messages[-1] == (
+        f"{repo / 'aristotle.f'} names no source file, so Aristotle would elaborate an empty design. Name the design's "
+        "sources in it."
+    )
 
 
 def _blackboxed(repo: Path, named: bool = True) -> None:

@@ -154,8 +154,8 @@ level for `aristotle review`. Aristotle uses it as the build configuration, and 
 
 `aristotle review` is the open-ended run: Aristotle works out what should hold of the files in scope, and checks it.
 Its properties differ from run to run, so it is advisory, and `--fail-on` defaults to `never`. `--scope changed`, the
-default, covers the source files (Verilog, C and Rust) this change touched, compared with `--base-ref` or the branch
-the CI environment names. Outside CI, without `--base-ref`, it covers only the last commit, so for uncommitted work use
+default, covers the source files this change touched, compared with `--base-ref` or the branch the CI environment
+names. Outside CI, without `--base-ref`, it covers only the last commit, so for uncommitted work use
 `--scope paths --path '<glob>'`, which uploads only tracked files: ask the user before you `git add` a new one.
 `--scope all` covers every source file.
 Use the properties it proves as candidates for the manifest. It takes `aristotle ci`'s `--timeout`, `--on-timeout`,

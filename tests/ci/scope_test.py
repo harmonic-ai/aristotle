@@ -14,7 +14,15 @@ import pytest
 
 from aristotlelib import local_file_utils, wildcard
 from aristotlelib.ci import context, naming, scope
-from tests.ci.conftest import commit_bare_shaped, git, latin1_name, recording_git, refusing_git, without_git
+from tests.ci.conftest import (
+    commit_bare_shaped,
+    git,
+    latin1_name,
+    merge_conflict,
+    recording_git,
+    refusing_git,
+    without_git,
+)
 
 #: Both ways of resolving a run's files, for the behaviour they share.
 RESOLVERS = pytest.mark.parametrize(
@@ -129,6 +137,25 @@ def test_a_tracked_lean_build_file_an_ignore_rule_matches_is_uploaded_at_any_dep
     for name in ("lake-manifest.json", "lean-toolchain", "pkg/lakefile.lean", "pkg/lakefile.toml"):
         assert Path(name) in result.upload_files
     assert "Not uploading" not in caplog.text
+
+
+@RESOLVERS
+@pytest.mark.parametrize("beside", [True, False], ids=["beside another held-back file", "alone"])
+def test_a_tracked_lean_file_an_ignore_rule_holds_back_is_not_named(git_repo: Path, caplog, resolve, beside: bool):
+    (git_repo / "proofs").mkdir()
+    (git_repo / "proofs" / "Fifo.lean").write_text("theorem t : True := trivial\n")
+    (git_repo / "notes.log").write_text("x\n")
+    git(git_repo, "add", "-A")
+    git(git_repo, "commit", "-qm", "a proof and notes")
+    (git_repo / ".gitignore").write_text("*.lean\n*.log\n" if beside else "*.lean\n")
+
+    with caplog.at_level(logging.WARNING, logger="aristotle"):
+        result = resolve(git_repo)
+        scope.warn_held_back(git_repo, result)
+
+    assert Path("proofs/Fifo.lean") not in result.upload_files
+    warnings = [local_file_utils.held_back_warning({Path("notes.log"): ".gitignore:2: *.log"})] if beside else []
+    assert caplog.messages == warnings
 
 
 def test_every_tracked_file_held_back_is_named(git_repo: Path, caplog):
@@ -441,6 +468,52 @@ def test_scope_changed_errors_on_an_initial_commit_with_no_parent(git_repo: Path
         scope.resolve(git_repo, scope.Scope.CHANGED)
 
 
+def _one_commit_on_main(repo: Path) -> None:
+    """Add a source file to ``main`` in one commit, after branching ``release`` off with a commit of its own."""
+    git(repo, "branch", "-M", "main")
+    git(repo, "checkout", "-q", "-b", "release")
+    git(repo, "commit", "-q", "--allow-empty", "-m", "release only")
+    git(repo, "checkout", "-q", "main")
+    (repo / "rtl" / "alu.v").write_text("module alu;\nendmodule\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "add alu")
+
+
+def test_scope_changed_fetches_the_previous_commit_into_a_shallow_clone(git_repo: Path, tmp_path: Path, caplog):
+    _one_commit_on_main(git_repo)
+    clone = tmp_path / "clone"
+    _runner_checkout(git_repo, clone, "main", 1)
+
+    with caplog.at_level(logging.INFO, logger="aristotle"):
+        result = scope.resolve(clone, scope.Scope.CHANGED)
+
+    assert result.focus_files == [Path("rtl/alu.v")]
+    assert "Fetching the previous commit from origin, which this shallow checkout lacks" in caplog.messages
+    # Only the commit before HEAD came down, no branch of origin's.
+    commits = subprocess.run(
+        ["git", "-C", str(clone), "rev-list", "--all", "--count"], check=True, capture_output=True, text=True
+    ).stdout
+    assert commits.strip() == "2"
+
+
+def test_scope_changed_in_a_shallow_clone_origin_does_not_serve_stops_saying_why(
+    git_repo: Path, tmp_path: Path, caplog
+):
+    _one_commit_on_main(git_repo)
+    clone = tmp_path / "clone"
+    _runner_checkout(git_repo, clone, "main", 1)
+    git(clone, "remote", "set-url", "origin", str(tmp_path / "gone.git"))
+
+    with caplog.at_level(logging.INFO, logger="aristotle"), pytest.raises(scope.ScopeError) as raised:
+        scope.resolve(clone, scope.Scope.CHANGED)
+
+    assert str(raised.value) == (
+        "Cannot determine which files changed: no base branch and no parent commit. Use --scope all or --scope paths "
+        "for a shallow or initial checkout."
+    )
+    assert any(m.startswith("Could not fetch the previous commit from origin: fatal: ") for m in caplog.messages)
+
+
 def test_scope_paths_matches_globs(git_repo: Path):
     result = scope.resolve(git_repo, scope.Scope.PATHS, paths=["rtl/*.v"])
 
@@ -738,6 +811,99 @@ def test_scope_rejects_a_repository_with_no_tracked_files(tmp_path: Path, resolv
 
     with pytest.raises(scope.ScopeError, match="No tracked files found"):
         resolve(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "resolve",
+    [
+        lambda root: scope.resolve(root, scope.Scope.ALL),
+        lambda root: scope.resolve(root, scope.Scope.CHANGED),
+        lambda root: scope.resolve(root, scope.Scope.PATHS, paths=["rtl"]),
+        scope.resolve_checkout,
+    ],
+    ids=["all", "changed", "paths", "checkout"],
+)
+@pytest.mark.parametrize("name", ["rtl/fifo.v", "README.md"])
+def test_an_unresolved_merge_conflict_stops_the_run_naming_the_file_once(git_repo: Path, resolve, name: str):
+    merge_conflict(git_repo, name)
+
+    with pytest.raises(scope.ScopeError) as e:
+        resolve(git_repo)
+
+    assert str(e.value) == (
+        f"Unresolved merge conflicts in {git_repo}: {name}\n"
+        "Resolve them and mark each file resolved with `git add` or `git rm`, then run again."
+    )
+
+
+def test_a_merge_whose_conflicts_are_marked_resolved_goes_up(git_repo: Path):
+    merge_conflict(git_repo, "rtl/fifo.v")
+    (git_repo / "rtl" / "fifo.v").write_text("module fifo;\nendmodule\n")
+    git(git_repo, "add", "rtl/fifo.v")
+
+    result = scope.resolve_checkout(git_repo)
+
+    assert result.upload_files == [Path(".env"), Path("README.md"), Path("rtl/driver.c"), Path("rtl/fifo.v")]
+
+
+def test_a_conflict_outside_the_folder_the_run_uploads_does_not_stop_it(git_repo: Path):
+    merge_conflict(git_repo, "README.md")
+
+    assert scope.resolve_checkout(git_repo / "rtl").upload_files == [Path("driver.c"), Path("fifo.v")]
+
+
+def test_a_conflict_inside_a_subfolder_the_run_uploads_is_named_from_it(git_repo: Path):
+    merge_conflict(git_repo, "rtl/fifo.v")
+
+    with pytest.raises(
+        scope.ScopeError, match=rf"^Unresolved merge conflicts in {re.escape(str(git_repo / 'rtl'))}: fifo\.v\n"
+    ):
+        scope.resolve_checkout(git_repo / "rtl")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows file names can't hold a tab")
+def test_a_conflicted_file_whose_name_holds_a_tab_is_named_whole(git_repo: Path):
+    (git_repo / "a\tb.v").write_text("module ab;\nendmodule\n")
+    git(git_repo, "add", "a\tb.v")
+    git(git_repo, "commit", "-qm", "a tab")
+    merge_conflict(git_repo, "a\tb.v")
+
+    with pytest.raises(scope.ScopeError, match=r": a\tb\.v\n"):
+        scope.resolve_checkout(git_repo)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows file names can't hold a carriage return")
+def test_a_tracked_file_whose_name_holds_a_carriage_return_goes_up_and_is_verified(
+    git_repo: Path, tmp_path: Path, caplog
+):
+    from aristotlelib.ci import runner
+
+    (git_repo / "rtl" / "b\r.v").write_text("module b;\nendmodule\n")
+    (git_repo / "Icon\r").write_text("")
+    git(git_repo, "add", "-A")
+    git(git_repo, "commit", "-qm", "names with a carriage return")
+
+    changed = scope.resolve(git_repo, scope.Scope.CHANGED)
+    with caplog.at_level(logging.WARNING, logger="aristotle"):
+        upload = runner.archive(git_repo, scope.resolve(git_repo, scope.Scope.ALL), tmp_path / "upload.tar.gz")
+
+    assert changed.focus_files == [Path("rtl/b\r.v")]
+    assert {Path("Icon\r"), Path("rtl/b\r.v")} <= set(upload.uploaded)
+    assert not [m for m in caplog.messages if m.startswith("Not uploading")]
+
+
+def test_a_checkout_for_a_run_already_started_lists_a_conflicted_file_once(git_repo: Path):
+    merge_conflict(git_repo, "rtl/fifo.v")
+
+    result = scope.resolve_checkout(git_repo, warn=False, allow_unmerged=True)
+
+    assert result.upload_files == [Path(".env"), Path("README.md"), Path("rtl/driver.c"), Path("rtl/fifo.v")]
+
+
+def test_the_tracked_files_list_a_conflicted_file_once(git_repo: Path):
+    merge_conflict(git_repo, "rtl/fifo.v")
+
+    assert scope.tracked_source_files(git_repo) == [Path("rtl/driver.c"), Path("rtl/fifo.v")]
 
 
 def test_a_checkout_uploads_every_tracked_file_with_every_source_file_in_focus(git_repo: Path):

@@ -973,9 +973,13 @@ class CIAction(VerifyAction):
 
     async def run_action(self, args: argparse.Namespace) -> int:
         try:
-            # A run already started uploads nothing, so there is nothing to warn of leaving out.
+            # A run already started uploads nothing, so there is nothing to warn of leaving out, and its record is
+            # compared with a conflicted checkout's as with any other.
             scope_result = scope.resolve_checkout(
-                self._root, warn=args.project is None, allow_empty=tracks_root_filelist(self._root)
+                self._root,
+                warn=args.project is None,
+                allow_empty=tracks_root_filelist(self._root),
+                allow_unmerged=args.project is not None,
             )
         except scope.ScopeError as e:
             if args.project is None:
@@ -1481,13 +1485,13 @@ def _language_causes(access: dict[str, bool | None]) -> tuple[list[str], list[st
         for language, on in access.items()
         if on is False
     ]
-    # Aristotle has no way to ask about Rust, so that cause is only possible, never confirmed. Verilog and C are on for
-    # every account, so a check that didn't answer names neither.
-    unknown = [
-        f"{language} is left out if this account can't verify it, which Aristotle gives no way to check"
-        for language, on in access.items()
-        if on is None and language not in runner.LANGUAGE_ACCESS_ENDPOINTS
-    ]
+    # Verilog and C are on for every account, so a check that didn't answer names neither. A language Aristotle gives no
+    # way to ask about is never named.
+    unknown = (
+        ["files in a language this account can't verify are left out, which Aristotle gives no way to check"]
+        if any(on is None and language not in runner.LANGUAGE_ACCESS_ENDPOINTS for language, on in access.items())
+        else []
+    )
     return off, unknown
 
 

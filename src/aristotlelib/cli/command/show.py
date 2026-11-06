@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from aristotlelib import progress_utils
-from aristotlelib.agent_task import ENDED_BADLY, AgentTask, TaskStatus, ending_notice
+from aristotlelib.agent_task import ENDED_BADLY, TERMINAL_STATUSES, AgentTask, TaskStatus, ending_notice
 from aristotlelib.api_request import AristotleAPIError
 from aristotlelib.cli.api_action import (
     PROJECT_REFERENCE_HELP,
@@ -381,22 +381,27 @@ class ShowAction(APIAction):
                 fetched = await _latest_task(args.project_id, project)
             except Exception as e:
                 fetched = None
+                counts = (
+                    f"the counts go by task {task.agent_task_id}, and a proof or disproof a later task left unchecked "
+                    "may count as checked"
+                    if task.status in TERMINAL_STATUSES
+                    else "the properties aren't counted"
+                )
                 lost = [
-                    *(
-                        [
-                            f"the counts go by task {task.agent_task_id}, and a proof or disproof a later task left "
-                            "unchecked may count as checked"
-                        ]
-                        if properties
-                        else []
-                    ),
+                    *([counts] if properties else []),
                     *(["no command to continue it is offered"] if offers_continue else []),
                 ]
                 logging.warning(
                     f"WARNING: The project's latest task couldn't be fetched, so {'; and '.join(lost)}: {e}"
                 )
         latest = fetched or task
-        log_property_counts(properties, await fetch_tasks(args.project_id, properties, latest))
+        if latest.status in TERMINAL_STATUSES:
+            log_property_counts(properties, await fetch_tasks(args.project_id, properties, latest))
+        # Unless the latest task is unknown, which a failed fetch has warned about.
+        elif properties and fetched is not None:
+            logging.info(
+                "Properties: no counts until the project's latest task has ended, since it may still change them."
+            )
         await self._show(task, num_events, args, project)
         if task.status in ENDED_BADLY:
             # A follow-up continues the latest task, so the command is for this one only when it is known to be that.

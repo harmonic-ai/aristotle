@@ -20,11 +20,12 @@ from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from http.cookies import CookieError, SimpleCookie
 from ipaddress import ip_address
-from typing import Any, Literal, TypeVar
+from typing import Any, Literal, TypeVar, overload
 from urllib.request import getproxies
 
 import certifi
 import httpx
+import pydantic
 import socksio
 
 from aristotlelib import credentials
@@ -83,6 +84,22 @@ _ACCOUNT_ACCESS_MESSAGE = (
     "Error: this account doesn't have access (403)\n\n"
     "Hint: it may be awaiting approval or no longer in the key's organization. Contact aristotle@harmonic.fun."
 )
+# The detail strings of the server's 403s that refuse one object, a bare HTTPException(403)'s "Forbidden" among them,
+# and the message for each.
+_OBJECT_REFUSALS = {
+    "Forbidden": (
+        "Error: this account can't see or change this project or task (403)\n\n"
+        "Hint: check its id. Only the project's owner can send it a prompt, with a key from the project's organization."
+    ),
+    "Not authorized to answer this question": (
+        "Error: this account can't answer this question (403)\n\n"
+        "Hint: only the project's owner can answer it, with a key from the project's organization."
+    ),
+    "Cannot continue a project owned by a different organization": (
+        "Error: this project isn't in this key's organization (403)\n\n"
+        "Hint: continue it with a key from the project's organization."
+    ),
+}
 
 API_KEY: str | None = None
 
@@ -367,8 +384,8 @@ class AristotleNotProcessedError(AristotleAPIError):
 @contextlib.contextmanager
 def before_sending(advice: str) -> Generator[None, None, None]:
     """Re-raise an error from this context's requests, made before one that is not safe to repeat, as
-    AristotleNotProcessedError followed by ``advice`` when no response came, or a server error or a 429 did; any other
-    error as it is."""
+    AristotleNotProcessedError followed by ``advice`` when no response came, or none it could read, or a server error or
+    a 429 did; any other error as it is."""
     try:
         yield
     except AristotleAPIError as e:
@@ -797,6 +814,7 @@ def _status_error(error: httpx.HTTPStatusError, redact: Callable[[str], str] | N
         # The API's HTTPException responses have JSON with a detail string, or Auth0's code/message detail object.
         # A proxy can imitate that format; certificate trust alone cannot establish who generated the response.
         detail = None
+        object_refusal = None
         if content_type == "application/json":
             try:
                 body = error.response.json()
@@ -804,12 +822,14 @@ def _status_error(error: httpx.HTTPStatusError, redact: Callable[[str], str] | N
                     detail = body.get("detail")
                     if isinstance(detail, dict):
                         detail = detail.get("message")
+                    elif isinstance(detail, str):
+                        object_refusal = _OBJECT_REFUSALS.get(detail)
             except ValueError:
                 pass
         if not isinstance(detail, str) or not detail.strip():
             status_line = f"{error.response.status_code} {error.response.reason_phrase}".strip()
             return _IntermediaryError(_refusal_message(status_line, error.request.url), status_code=403)
-        return AristotleAPIError(_ACCOUNT_ACCESS_MESSAGE, status_code=403)
+        return AristotleAPIError(object_refusal or _ACCOUNT_ACCESS_MESSAGE, status_code=403)
     # Extract error message from response body if available
     error_message = None
     error_code = None
@@ -870,8 +890,28 @@ def _status_error(error: httpx.HTTPStatusError, redact: Callable[[str], str] | N
 
 
 class _ForeignAnswer(httpx.HTTPStatusError):
-    """A 2xx answer typed as text, or untyped, that isn't JSON; its message says what it holds, as _foreign_body
-    does."""
+    """A 2xx answer that isn't JSON, typed as text, untyped, or of a type a request's ``read`` couldn't decode; its
+    message says what it holds, as _foreign_body or _undecoded words it."""
+
+
+class _UnreadableAnswer(httpx.HTTPStatusError):
+    """A 2xx answer whose JSON a request's ``read`` didn't validate; its message says where, as _shape_problem does."""
+
+
+_NOT_JSON = (json.JSONDecodeError, UnicodeDecodeError)
+"""What httpx.Response.json() raises for a body that isn't JSON."""
+
+
+def _as_is(response: httpx.Response) -> httpx.Response:
+    return response
+
+
+_Model = TypeVar("_Model", bound=pydantic.BaseModel)
+
+
+def json_as(model: type[_Model]) -> Callable[[httpx.Response], _Model]:
+    """A ``read`` for AristotleRequestClient's get() and post(): the answer's JSON validated as ``model``."""
+    return lambda response: model.model_validate(response.json())
 
 
 def _foreign_body(response: httpx.Response) -> str | None:
@@ -892,19 +932,52 @@ def _foreign_body(response: httpx.Response) -> str | None:
     return None
 
 
+def _undecoded(response: httpx.Response) -> str:
+    """What a 2xx answer that a request's ``read`` couldn't decode as JSON holds, such as ``application/json that isn't
+    JSON`` or ``an empty body``."""
+    if not response.content:
+        return "an empty body"
+    content_type = response.headers.get("content-type", "").partition(";")[0].strip()
+    return f"{printable(content_type) or 'an untyped body'} that isn't JSON"
+
+
+def _answered(response: httpx.Response) -> str:
+    """Where a 2xx answer came from, through which proxy, and its status, as "the answer from <origin> was 200 OK"."""
+    status_line = printable(f"{response.status_code} {response.reason_phrase}".strip())
+    proxy = _configured_proxy(response.request.url)
+    via = "" if proxy is None else f" through the proxy {printable(proxy.host)}"
+    return f"the answer from {get_web_url()}{via} was {status_line}"
+
+
 def _foreign_answer_message(response: httpx.Response, body: str) -> str:
     """What a 2xx answer that isn't Aristotle's was: its status and ``body``, which says what it holds, where it came
     from, and what may have sent it."""
-    status_line = printable(f"{response.status_code} {response.reason_phrase}".strip())
-    origin = get_web_url()
-    proxy = _configured_proxy(response.request.url)
-    via = "" if proxy is None else f" through the proxy {printable(proxy.host)}"
     senders = (
-        "a captive portal or a proxy" if origin == WEB_URL else "a captive portal, a proxy or a wrong ARISTOTLE_WEB_URL"
+        "a captive portal or a proxy"
+        if get_web_url() == WEB_URL
+        else "a captive portal, a proxy or a wrong ARISTOTLE_WEB_URL"
     )
+    return f"{_answered(response)} with {body}, not Aristotle's: {senders} may have answered instead."
+
+
+def _shape_problem(error: pydantic.ValidationError) -> str:
+    """Where a JSON answer failed validation and why, from the first of ``error``'s errors, such as ``projects: Field
+    required``, never quoting the answer."""
+    errors = error.errors()
+    first = errors[0]
+    where = ".".join(str(part) for part in first["loc"])
+    problem = f"{where}: {first['msg']}" if where else first["msg"]
+    more = f", and {len(errors) - 1} more" if len(errors) > 1 else ""
+    return printable(problem) + more
+
+
+def _unreadable_answer_message(response: httpx.Response, problem: str) -> str:
+    """What a 2xx answer whose JSON this version can't read was: its status and ``problem``, as _shape_problem says it,
+    where it came from, and what may have sent it."""
+    senders = "a proxy" if get_web_url() == WEB_URL else "a proxy or a wrong ARISTOTLE_WEB_URL"
     return (
-        f"the answer from {origin}{via} was {status_line} with {body}, not Aristotle's: {senders} may have answered "
-        "instead."
+        f"{_answered(response)} with JSON this version of aristotlelib can't read ({problem}): {senders} may have "
+        "answered instead, or a newer aristotlelib may be needed."
     )
 
 
@@ -929,12 +1002,17 @@ class _Failure:
         self.certificate_error: ssl.SSLCertVerificationError | None = None
         # Whether the TLS handshake that failed was with an https:// proxy, for its own certificate, not the server.
         self.proxy_tls = proxy_tls
-        if isinstance(cause, _ForeignAnswer):
-            self.status_error = AristotleAPIError(_foreign_answer_message(cause.response, str(cause)))
+        if isinstance(cause, (_ForeignAnswer, _UnreadableAnswer)):
             # Aristotle's answer was lost, as the request may have reached it.
             self.unsent = False
             self.transient = self.maybe_processed = True
-            self.summary = f"{cause.response.status_code} on {request}: {cause}, not Aristotle's answer"
+            status = cause.response.status_code
+            if isinstance(cause, _ForeignAnswer):
+                self.status_error = AristotleAPIError(_foreign_answer_message(cause.response, str(cause)))
+                self.summary = f"{status} on {request}: {cause}, not Aristotle's answer"
+            else:
+                self.status_error = AristotleAPIError(_unreadable_answer_message(cause.response, str(cause)))
+                self.summary = f"{status} on {request}: JSON this version can't read ({cause})"
         elif isinstance(cause, httpx.HTTPStatusError):
             status = cause.response.status_code
             self.status_error = _status_error(cause, redact)
@@ -1033,9 +1111,51 @@ class AristotleRequestClient:
         """Async context manager exit."""
         await self.close()
 
-    async def get(self, endpoint: str, params: dict[str, Any] | None = None) -> httpx.Response:
-        """Make a GET request."""
-        return await self._make_request("GET", endpoint, params=params)
+    @overload
+    async def get(self, endpoint: str, params: dict[str, Any] | None = None) -> httpx.Response: ...
+
+    @overload
+    async def get(
+        self, endpoint: str, params: dict[str, Any] | None = None, *, read: Callable[[httpx.Response], _T]
+    ) -> _T: ...
+
+    async def get(
+        self, endpoint: str, params: dict[str, Any] | None = None, *, read: Callable[[httpx.Response], Any] = _as_is
+    ) -> Any:
+        """Make a GET request; ``read`` turns its answer into what it returns, as _make_request says."""
+        return await self._make_request("GET", endpoint, params=params, read=read)
+
+    @overload
+    async def post(
+        self,
+        endpoint: str,
+        params: dict[str, Any] | None = None,
+        data: dict[str, Any] | None = None,
+        files: list[tuple[str, tuple[Any, ...]]] | None = None,
+        json: dict[str, Any] | None = None,
+        idempotent: bool = False,
+        idempotency_key: str | None = None,
+        timeout: httpx.Timeout | None = None,
+        authenticated: bool = True,
+        redact: Callable[[str], str] | None = None,
+    ) -> httpx.Response: ...
+
+    @overload
+    async def post(
+        self,
+        endpoint: str,
+        params: dict[str, Any] | None = None,
+        data: dict[str, Any] | None = None,
+        files: list[tuple[str, tuple[Any, ...]]] | None = None,
+        json: dict[str, Any] | None = None,
+        idempotent: bool = False,
+        idempotency_key: str | None = None,
+        timeout: httpx.Timeout | None = None,
+        authenticated: bool = True,
+        redact: Callable[[str], str] | None = None,
+        *,
+        read: Callable[[httpx.Response], _T],
+    ) -> _T: ...
 
     async def post(
         self,
@@ -1049,11 +1169,14 @@ class AristotleRequestClient:
         timeout: httpx.Timeout | None = None,
         authenticated: bool = True,
         redact: Callable[[str], str] | None = None,
-    ) -> httpx.Response:
+        *,
+        read: Callable[[httpx.Response], Any] = _as_is,
+    ) -> Any:
         """Make a POST request; ``idempotent`` says that sending it twice has the effect of sending it once,
         ``idempotency_key``, sent as IDEMPOTENCY_KEY_HEADER on every attempt, lets a server that takes it say so,
         ``timeout`` replaces the client's timeouts, as upload_timeout() does for an upload, ``authenticated=False``
-        sends it without an API key, and ``redact`` rewrites what the request logs and raises, as _make_request says."""
+        sends it without an API key, and ``redact`` rewrites what the request logs and raises, and ``read`` turns its
+        answer into what it returns, as _make_request says."""
         return await self._make_request(
             "POST",
             endpoint,
@@ -1066,15 +1189,16 @@ class AristotleRequestClient:
             timeout=timeout,
             authenticated=authenticated,
             redact=redact,
+            read=read,
         )
 
     async def put(self, endpoint: str, data: dict[str, Any] | None = None) -> httpx.Response:
         """Make a PUT request."""
-        return await self._make_request("PUT", endpoint, data=data)
+        return await self._make_request("PUT", endpoint, data=data, read=_as_is)
 
     async def delete(self, endpoint: str) -> httpx.Response:
         """Make a DELETE request."""
-        return await self._make_request("DELETE", endpoint)
+        return await self._make_request("DELETE", endpoint, read=_as_is)
 
     async def _make_request(
         self,
@@ -1089,21 +1213,26 @@ class AristotleRequestClient:
         timeout: httpx.Timeout | None = None,
         authenticated: bool = True,
         redact: Callable[[str], str] | None = None,
-    ) -> httpx.Response:
+        *,
+        read: Callable[[httpx.Response], _T],
+    ) -> _T:
         """Make an HTTP request to the Aristotle API, with the API key unless not ``authenticated``, retrying transient
-        failures with jittered backoff. ``redact``, for a request whose body holds a secret a server may quote back,
-        rewrites the text of each retry it logs, of a refusal's verbose report and of the error it raises, whose cause
-        is then _redacted_cause's.
+        failures with jittered backoff, and return ``read`` of its 2xx answer; an exception ``read`` raises propagates
+        unretried, but for the decode and validation errors below. ``redact``, for a request whose body holds a secret a
+        server may quote back, rewrites the text of each retry it logs, of a refusal's verbose report and of the error
+        it raises, whose cause is then _redacted_cause's.
 
         Any request is retried after a failure to connect, a proxy's refusal that a later try may pass, a refusal by the
         per-second rate limit, billing's 503 for credits it couldn't read or, with ``idempotency_key``, a 409 while its
         first copy is in progress, which leave it unprocessed, and an idempotent one also after a 5xx, a timeout, a
-        dropped connection or a 2xx answer that _foreign_body says isn't Aristotle's; a certificate this machine doesn't
-        trust is not retried. A request that is not idempotent raises AristotleOutcomeUnknownError after a failure that
-        may have followed its processing, and AristotleNotProcessedError when no attempt was processed, as when billing
-        refused the run it would start, for credits or while the organization sets up. A retry waits at least as long as
-        the response's Retry-After asks, every attempt waits for its request slot, and an attempt whose connection isn't
-        open within CONNECTION_DEADLINE_SECONDS fails as a ConnectTimeout.
+        dropped connection, a 2xx answer that _foreign_body says isn't Aristotle's, or one whose body ``read`` couldn't
+        decode as JSON or validate, raising json.JSONDecodeError, UnicodeDecodeError or pydantic's ValidationError; a
+        certificate this machine doesn't trust is not retried. A request that is not idempotent raises
+        AristotleOutcomeUnknownError after a failure that may have followed its processing, and
+        AristotleNotProcessedError when no attempt was processed, as when billing refused the run it would start, for
+        credits or while the organization sets up. A retry waits at least as long as the response's Retry-After asks,
+        every attempt waits for its request slot, and an attempt whose connection isn't open within
+        CONNECTION_DEADLINE_SECONDS fails as a ConnectTimeout.
         """
         url = f"{get_base_url()}/{endpoint.lstrip('/')}"
         # As httpcore names it to the server's TLS handshake.
@@ -1149,7 +1278,6 @@ class AristotleRequestClient:
                 response.raise_for_status()
                 if (foreign := _foreign_body(response)) is not None:
                     raise _ForeignAnswer(foreign, request=response.request, response=response)
-                return response
             except httpx.HTTPError as e:
                 proxy_tls = watch.tls_host is not None and watch.tls_host != host
                 failure = _Failure(e, request, keyed=idempotency_key is not None, proxy_tls=proxy_tls, redact=redact)
@@ -1158,6 +1286,16 @@ class AristotleRequestClient:
                     self._client = new_http_client()
             except socksio.ProtocolError as e:
                 failure = _Failure(_socks_reply_error(e), request, keyed=idempotency_key is not None)
+            else:
+                try:
+                    return read(response)
+                except pydantic.ValidationError as e:
+                    cause: httpx.HTTPStatusError = _UnreadableAnswer(
+                        _shape_problem(e), request=response.request, response=response
+                    )
+                except _NOT_JSON:
+                    cause = _ForeignAnswer(_undecoded(response), request=response.request, response=response)
+                failure = _Failure(cause, request, keyed=idempotency_key is not None)
             self.rate_limit_refusals += failure.rate_limited
             if failure.key_busy:
                 busy = failure

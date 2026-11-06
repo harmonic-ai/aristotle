@@ -40,13 +40,13 @@ def validate_prompt(prompt: str) -> None:
         raise ValueError("Prompt cannot be empty")
 
 
-def files_refused_while_running(project_id: str, files: str) -> str:
+def files_refused_while_running(project_id: str, files: str, *, without: str | None = None) -> str:
     """The refusal of ``files``, as the caller names them, with a prompt to project ``project_id`` while it runs a task,
-    saying what to do instead."""
+    saying what to do instead: send the prompt without the options ``without`` names, ``files`` by default, or wait."""
     return (
-        f"Files can't be added to project {project_id} while it runs a task. Send the prompt without {files} to reach "
-        f"that task: its agent reads it right away. Or wait for the task to finish (`aristotle show {project_id} "
-        f"--wait`), then send the prompt with {files}. "
+        f"Files can't be added to project {project_id} while it runs a task. Send the prompt without "
+        f"{without or files} to reach that task: its agent reads it right away. Or wait for the task to finish "
+        f"(`aristotle show {project_id} --wait`), then send the prompt with {files}. "
         # Holds until a task started after a cancel carries over the cancelled task's prompts.
         "Cancelling the task first would lose the prompts it was given, except the project's first."
     )
@@ -600,8 +600,8 @@ def _build_archive(
     linked: list[str] = []
     included_files: set[tuple[int, int] | None] = set()
     names: list[str] = []
-    # In UTF-8, as Aristotle reads it, whatever the locale's encoding; with dereference, no file goes in as a hard link.
-    with tarfile.open(tar_file_path, "w:gz", encoding="utf-8", dereference=True) as tar:
+    # In UTF-8, as Aristotle reads it, whatever the locale's encoding.
+    with tarfile.open(tar_file_path, "w:gz", encoding="utf-8") as tar:
         for rel_path in candidates:
             assert project_dir is not None
             if generated is not None and rel_path.as_posix() == filelist_name:
@@ -744,7 +744,7 @@ _OTHER_SOURCES = (".c", ".rs")
 """Suffixes of a C or Rust file."""
 
 LEAN_FILES_WARNING = (
-    "WARNING: The folder holds .lean files. Aristotle verifies Verilog and C code, and Rust where the account has it, "
+    "WARNING: The folder holds .lean files. Aristotle verifies Verilog and C code, "
     "and writes the Lean itself: it doesn't verify Lean you send, and a project with only Lean files ends without "
     "verifying anything."
 )
@@ -1035,12 +1035,13 @@ class Project(AristotleObject):
                 await asyncio.sleep(0)
                 create_sent.set(True)
                 try:
-                    response = await client.post(
+                    return await client.post(
                         f"/{cls.endpoint_prefix}",
                         data={"body": body},
                         files=files,
                         idempotency_key=str(uuid.uuid4()),
                         timeout=api_request.upload_timeout(size),
+                        read=api_request.json_as(cls),
                     )
                 except api_request.AristotleOutcomeUnknownError as e:
                     # TODO: send it again under its key once the server says it takes keys.
@@ -1053,7 +1054,6 @@ class Project(AristotleObject):
                     # Only billing's refusals are not processed with a 402 or a 409.
                     advice = RUN_NOT_STARTED if e.status_code in (402, 409) else PROJECT_NOT_CREATED
                     raise api_request.AristotleNotProcessedError(f"{e} {advice}", e.status_code, e.error_code) from e
-                return cls.model_validate(response.json())
 
     @classmethod
     async def create_from_directory(
@@ -1073,13 +1073,14 @@ class Project(AristotleObject):
         git ignores, those the directory's top-level .gitignore excludes) but never ``.lake`` or
         ``local_file_utils.LEAN_BUILD_FILES``, files that local_file_utils.is_secret_path calls credentials, by name or
         by folder, result archives an earlier run saved, and files whose names aren't UTF-8; the ``aristotle`` logger
-        names which tracked files, which credential files, which result archives and which names that aren't UTF-8 it
-        left out, without ``block``, the Verilog sources an ignore rule leaves out when none goes up but a .c or .rs
-        file does, and, when a .lean file other than Lean's build files goes up, that Aristotle doesn't verify Lean.
+        names which tracked files but .lean ones, which credential files, which result archives and which names that
+        aren't UTF-8 it left out, without ``block``, the Verilog sources an ignore rule leaves out when none goes up
+        but a .c or .rs file does, and, when a .lean file other than Lean's build files goes up, that Aristotle doesn't
+        verify Lean.
 
         Args:
             prompt: Tells Aristotle what to do.
-            project_dir: Path to the directory with the code to verify, e.g. a Verilog, C or Rust project.
+            project_dir: Path to the directory with the code to verify, e.g. a Verilog or C project.
             agent_questions_setting: Whether the agent can ask questions. By default it can, and waits up to 15
                 minutes for each answer; DISABLED turns questions off.
             name: The project's name, as for create().
@@ -1169,13 +1170,12 @@ class Project(AristotleObject):
         cls, client: api_request.AristotleRequestClient, params: dict[str, Any]
     ) -> tuple[list["Project"], str | None]:
         """One page of the caller's projects, and the key of the next, over an open client."""
-        response = await client.get(f"/{cls.endpoint_prefix}", params=params)
-        response_data = response.json()
-        projects: list["Project"] = [cls.model_validate(project) for project in response_data["projects"]]
-        pagination_key = response_data.get("pagination_key")
-        if pagination_key is not None and not isinstance(pagination_key, str):
-            raise TypeError("pagination_key must be a string or None")
-        return projects, pagination_key
+
+        def read(response: httpx.Response) -> tuple[list["Project"], str | None]:
+            page = _ProjectPage.model_validate(response.json())
+            return [cls.model_validate(project) for project in page.projects], page.pagination_key
+
+        return await client.get(f"/{cls.endpoint_prefix}", params=params, read=read)
 
     @classmethod
     async def resolve_id(cls, reference: str) -> str:
@@ -1274,15 +1274,53 @@ class Project(AristotleObject):
         project_id = validate_project_id(project_id)
         name = validate_project_name(name)
         async with api_request.AristotleRequestClient() as client:
-            response = await client.post(
-                f"/{cls.endpoint_prefix}/{project_id}/rename", json={"name": name}, idempotent=True
+            return await client.post(
+                f"/{cls.endpoint_prefix}/{project_id}/rename",
+                json={"name": name},
+                idempotent=True,
+                read=api_request.json_as(cls),
             )
-            return cls.model_validate(response.json())
 
     async def rename(self, name: str) -> None:
         """Rename this project and update it from the server's reply; see rename_by_id."""
-        renamed = await self.rename_by_id(self.project_id, name)
-        self._update_from_response(renamed.model_dump())
+        self._adopt(await self.rename_by_id(self.project_id, name))
+
+    @classmethod
+    async def delete_by_id(cls, project_id: str) -> None:
+        """Delete one of your projects for good, or, as an admin of its organization, a member's. Its runs and results
+        go with it, and its shared link stops working. It can't be undone. Your organization's billing page still lists
+        the credits its runs used.
+
+        Args:
+            project_id: The project's UUID.
+
+        Raises:
+            ValueError: If the id is not a UUID.
+            AristotleAPIError: With status 404 if you can't delete a project with this id, or 409 while one of its runs
+                is still going.
+        """
+        project_id = validate_project_id(project_id)
+        async with api_request.AristotleRequestClient() as client:
+            try:
+                await client.delete(f"/{cls.endpoint_prefix}/{project_id}")
+            except api_request.AristotleAPIError as e:
+                failure = e
+            else:
+                return
+        if failure.status_code != 404 or isinstance(failure, api_request._IntermediaryError):
+            raise failure
+        # A delete sent again after a lost reply is refused with a 404 once the first one went through, and the project
+        # then reads 410.
+        try:
+            await cls.from_id(project_id)
+        except api_request.AristotleNotFoundError as e:
+            if e.status_code == 410:
+                return
+        raise failure
+
+    async def delete(self) -> None:
+        """Delete this project for good; see delete_by_id."""
+        await self.delete_by_id(self.project_id)
 
     async def ask(
         self,
@@ -1387,12 +1425,13 @@ class Project(AristotleObject):
             async with api_request.AristotleRequestClient() as client:
                 try:
                     # httpx uses multipart when both data and files are provided
-                    response = await client.post(
+                    task, response = await client.post(
                         f"/{self.endpoint_prefix}/{self.project_id}/ask",
                         data=data,
                         files=files_data if files_data else [("_", (None, ""))],
                         idempotency_key=str(uuid.uuid4()),
                         timeout=api_request.upload_timeout(size),
+                        read=lambda response: (AgentTask.model_validate(response.json()), response),
                     )
                 except api_request.AristotleOutcomeUnknownError as e:
                     # TODO: send it again under its key once the server says it takes keys.
@@ -1405,7 +1444,6 @@ class Project(AristotleObject):
                     raise api_request.AristotleNotProcessedError(
                         f"{e} {PROMPT_NOT_SENT}", e.status_code, e.error_code
                     ) from e
-                task = AgentTask.model_validate(response.json())
             if folder is not None:
                 task._files_applied = _files_applied(response)
                 if task._files_applied is None:
@@ -1514,10 +1552,16 @@ class Project(AristotleObject):
 
         params: dict[str, Any] = {"pagination_key": pagination_key, "limit": limit, "ascending": not newest_first}
         async with api_request.AristotleRequestClient() as client:
-            response = await client.get(f"/{self.endpoint_prefix}/{self.project_id}/tasks", params=params)
-            response_data = response.json()
-            tasks: list[AgentTask] = [AgentTask.model_validate(task) for task in response_data["agent_tasks"]]
-            pagination_key = response_data.get("pagination_key")
-            if pagination_key is not None and not isinstance(pagination_key, str):
-                raise TypeError("pagination_key must be a string or None")
-            return tasks, pagination_key
+            path = f"/{self.endpoint_prefix}/{self.project_id}/tasks"
+            page = await client.get(path, params=params, read=api_request.json_as(_TaskPage))
+        return page.agent_tasks, page.pagination_key
+
+
+class _ProjectPage(pydantic.BaseModel):
+    projects: list[dict[str, Any]]
+    pagination_key: str | None = None
+
+
+class _TaskPage(pydantic.BaseModel):
+    agent_tasks: list[AgentTask]
+    pagination_key: str | None = None

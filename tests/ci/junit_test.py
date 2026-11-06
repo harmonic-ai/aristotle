@@ -24,11 +24,18 @@ from aristotlelib.ci.results import (
     UNCHECKED_PROOFS_NOTE,
     RunResults,
 )
-from aristotlelib.declaration import DeclarationEvidence, DeclarationFailureReason, DeclarationStatus, DeclarationType
+from aristotlelib.declaration import (
+    Declaration,
+    DeclarationEvidence,
+    DeclarationFailureReason,
+    DeclarationStatus,
+    DeclarationType,
+)
 from tests.ci.conftest import expecting_refuted, make_declaration
 from tests.conftest import hard_link
 
 NO_OVERFLOW = RequestedProperty("no_overflow", Kind.NATURAL_LANGUAGE, "The FIFO never overflows.")
+NO_UNDERFLOW = RequestedProperty("no_underflow", Kind.NATURAL_LANGUAGE, "The FIFO never underflows.")
 
 
 def _suite(results: RunResults) -> ET.Element:
@@ -633,9 +640,9 @@ def test_a_manifest_property_the_run_did_not_register_is_a_skipped_case_with_no_
     results = RunResults.from_declarations([], duration_seconds=1.0, requested=[NO_OVERFLOW])
 
     suite = _suite(results)
-    testcase = suite.find("testcase")
+    testcase = suite.find("testcase[@name='no_overflow']")
 
-    assert (suite.get("tests"), suite.get("failures"), suite.get("skipped")) == ("1", "0", "1")
+    assert (suite.get("failures"), suite.get("skipped")) == ("0", "1")
     assert testcase is not None
     assert testcase.get("name") == "no_overflow"
     assert testcase.get("classname") == "aristotle"
@@ -834,6 +841,53 @@ def test_a_cut_short_runs_error_carries_an_excerpt_of_its_summary():
     assert error is not None
     assert (error.text or "").startswith("Aristotle's summary of the run:\nThe model drops the assertion.\n")
     assert "the job log has the whole summary" in (error.text or "")
+
+
+@pytest.mark.parametrize(
+    "declarations",
+    [
+        [],
+        [
+            make_declaration(
+                "Spec.NoOverflow", DeclarationStatus.FAILED, failure_reason=DeclarationFailureReason.SYSTEM_ERROR
+            ).model_copy(update={"declaration_id": "no_overflow"}),
+            make_declaration("Spec.NoUnderflow", DeclarationStatus.UNKNOWN).model_copy(
+                update={"declaration_id": "no_underflow"}
+            ),
+        ],
+    ],
+    ids=["none registered", "unresolved and unknown"],
+)
+def test_a_manifest_run_that_finished_without_verifying_a_property_is_an_error_in_the_suite(
+    declarations: list[Declaration],
+):
+    results = dataclasses.replace(
+        RunResults.from_declarations(declarations, duration_seconds=1.0, requested=[NO_OVERFLOW, NO_UNDERFLOW]),
+        run_summary="The ports have other names.",
+    )
+
+    root = junit.build_root(results)
+    suite = _suite(results)
+
+    assert (root.get("tests"), root.get("failures"), root.get("errors")) == ("3", "0", "1")
+    assert (suite.get("tests"), suite.get("skipped"), suite.get("errors")) == ("3", "2", "1")
+    error = suite.find("testcase[@name='Aristotle run']/error")
+    assert error is not None
+    assert (error.get("type"), error.get("message"), error.text) == (
+        "nothing verified",
+        "No property in the manifest was verified.",
+        "The job log names the likely causes.\n\nAristotle's summary of the run:\nThe ports have other names.",
+    )
+
+
+def test_a_manifest_run_that_verified_a_property_is_no_error():
+    proved = make_declaration("Spec.NoOverflow").model_copy(update={"declaration_id": "no_overflow"})
+    results = RunResults.from_declarations([proved], duration_seconds=1.0, requested=[NO_OVERFLOW, NO_UNDERFLOW])
+
+    suite = _suite(results)
+
+    assert (suite.get("tests"), suite.get("skipped"), suite.get("errors")) == ("2", "1", "0")
+    assert suite.find("testcase[@name='Aristotle run']") is None
 
 
 def test_a_manifest_property_of_a_run_that_never_started_is_skipped_with_that_reason():

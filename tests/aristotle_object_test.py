@@ -23,6 +23,6 @@ class _Record(AristotleObject):
 def test_an_update_sets_the_stored_fields_and_the_computed_ones_follow():
     record = _Record(record_id="r", label="old")
 
-    record._update_from_response({"record_id": "r", "label": "new", "shout": "IGNORED"})
+    record._adopt(_Record(record_id="r", label="new"))
 
     assert (record.label, record.shout) == ("new", "NEW")

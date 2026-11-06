@@ -13,8 +13,8 @@ from aristotlelib._vendor import tomli
 REPO = Path(__file__).resolve().parent.parent
 
 
-def _python(code: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
+def _python(code: str, *options: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run([sys.executable, *options, "-c", code], capture_output=True, text=True, timeout=60)
 
 
 def test_importing_the_library_leaves_the_programs_logging_configuration_to_it():
@@ -33,6 +33,12 @@ def test_the_library_prints_nothing_until_the_program_configures_logging():
     run = _python("import logging, aristotlelib\nlogging.getLogger('aristotle').error('from the library')")
 
     assert (run.returncode, run.stdout, run.stderr) == (0, "", "")
+
+
+def test_importing_the_library_warns_of_nothing():
+    run = _python("import aristotlelib", "-W", "error")
+
+    assert (run.returncode, run.stderr) == (0, "")
 
 
 def test_the_package_is_marked_as_typed():

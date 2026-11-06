@@ -70,7 +70,7 @@ def test_a_group_name_that_is_not_utf8_does_not_stop_a_utf8_name_going_up(git_re
     runner.build_tarball(git_repo, [Path("rtl/naïve.v")], destination, None)
 
     with tarfile.open(destination, encoding="utf-8") as tar:
-        assert tar.getnames() == ["rtl/naïve.v"]
+        assert [(m.name, m.uname, m.gname) for m in tar.getmembers()] == [("rtl/naïve.v", "", "")]
 
 
 def test_secrets_are_excluded_even_when_tracked_in_git(git_repo: Path, tmp_path: Path):

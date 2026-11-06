@@ -143,8 +143,8 @@ def build_tarball(
         # As a block file, so that a committed link to a file an ignore rule holds back still goes up.
         members.setdefault(filelist_name, verilog_bundle.Member(filelist_name, block.committed, ""))
     held_back: list[str] = []
-    # In UTF-8, as Aristotle reads it, whatever the locale's encoding; with dereference, no file goes in as a hard link.
-    with tarfile.open(destination, "w:gz", encoding="utf-8", dereference=True) as tar:
+    # In UTF-8, as Aristotle reads it, whatever the locale's encoding.
+    with tarfile.open(destination, "w:gz", encoding="utf-8") as tar:
         for rel_path in files:
             if generated is not None and rel_path.as_posix() == filelist_name:
                 continue

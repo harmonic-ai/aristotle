@@ -21,6 +21,7 @@ from aristotlelib.cli.command import ci as ci_command
 from aristotlelib.cli.command.cancel import CancelAction
 from aristotlelib.cli.command.ci import CIAction
 from aristotlelib.cli.command.continue_ import ContinueAction
+from aristotlelib.cli.command.delete import DeleteAction
 from aristotlelib.cli.command.download import DownloadAction
 from aristotlelib.cli.command.list import ListAction
 from aristotlelib.cli.command.login import LoginAction
@@ -62,6 +63,7 @@ def test_action_classes_returns_all_actions_in_priority_order():
         QuestionsAction,  # 75
         CancelAction,  # 80
         RenameAction,  # 85
+        DeleteAction,  # 86
         LogoutAction,  # 90
     ]
 
@@ -240,6 +242,51 @@ def test_a_page_in_place_of_aristotles_answers_ends_every_command_with_its_error
     assert (
         "the answer from https://aristotle.harmonic.fun was 200 OK with text/html, not Aristotle's: a captive portal "
         "or a proxy may have answered instead." in (err or caplog.messages[-1])
+    )
+    assert "Traceback" not in err
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("argv", "code"),
+    [
+        (["list"], 3),
+        (["show", PROJECT_ID], 3),
+        (["show", PROJECT_ID, "--wait", "--json"], 3),
+        (["tasks", PROJECT_ID], 3),
+        (["download", PROJECT_ID], 3),
+        (["continue", PROJECT_ID, "Prove it"], 3),
+        (["cancel", PROJECT_ID], 3),
+        (["questions", PROJECT_ID], 3),
+        (["properties", PROJECT_ID], 3),
+        (["property", PROJECT_ID, "Spec.Anything"], 3),
+        (["rename", PROJECT_ID, "New name"], 3),
+        (["submit", "Prove it"], 7),
+    ],
+    ids=lambda value: " ".join(word for word in value if word != PROJECT_ID) if isinstance(value, list) else None,
+)
+@pytest.mark.usefixtures("frozen_api_clock")
+def test_json_this_version_cant_read_in_place_of_aristotles_answers_ends_every_command_with_its_error(
+    argv, code, api_server, monkeypatch, tmp_path, capsys, caplog
+):
+    monkeypatch.setattr(api_request, "getproxies", dict)
+    monkeypatch.delenv("ARISTOTLE_WEB_URL", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    api_server(*(lambda request: httpx.Response(200, json={}) for _ in range(api_request.RETRY_ATTEMPTS)))
+    monkeypatch.setattr("sys.argv", ["aristotle", *argv])
+
+    with patch("sys.stdin", io.StringIO("")):
+        try:
+            exit_code = main()
+        except SystemExit as raised:
+            exit_code = raised.code
+
+    err = capsys.readouterr().err
+    assert exit_code == code
+    assert (
+        "the answer from https://aristotle.harmonic.fun was 200 OK with JSON this version of aristotlelib can't read ("
+        in (err or caplog.messages[-1])
     )
     assert "Traceback" not in err
     assert list(tmp_path.iterdir()) == []

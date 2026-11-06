@@ -8,7 +8,12 @@ from pathlib import Path
 
 from aristotlelib import local_file_utils
 from aristotlelib.agent_task import follow_hint
-from aristotlelib.api_request import AristotleAPIError, AristotleOutcomeUnknownError, AristotleProjectLimitError
+from aristotlelib.api_request import (
+    AristotleAPIError,
+    AristotleOutcomeUnknownError,
+    AristotleProjectLimitError,
+    AristotleRequestClient,
+)
 from aristotlelib.ci.runner import describe_upload
 from aristotlelib.cli.api_action import (
     APIAction,
@@ -31,6 +36,7 @@ from aristotlelib.cli.api_action import (
 )
 from aristotlelib.cli.command.rename import project_name_argument
 from aristotlelib.cli.command.show import log_property_counts
+from aristotlelib.cli.login_flow import billed_to
 from aristotlelib.exit_codes import EXIT_INFRASTRUCTURE_ERROR, EXIT_SUCCESS, EXIT_USAGE_ERROR
 from aristotlelib.local_file_utils import LeanProjectError
 from aristotlelib.project import (
@@ -71,15 +77,23 @@ class _BlockOption(argparse.Action):
 
 
 def read_block(
-    project_dir: Path | None, arguments: list[str], *, list_outside: bool = True, report: bool = True
+    project_dir: Path | None,
+    arguments: list[str],
+    *,
+    list_outside: bool = True,
+    report: bool = True,
+    blackboxes_only: bool = False,
 ) -> verilog_bundle.Bundle | None:
     """The Verilog block that ``project_dir``'s ``aristotle.f`` and then the command line's ``arguments`` describe,
     logged with ``report``, with each file from outside the folder when ``list_outside``, and its black boxes without
-    ``project_dir``, whose files build_archive() reads before naming them; None with neither.
+    ``project_dir``, whose files build_archive() reads before naming them; None with neither. With
+    ``blackboxes_only`` and no ``arguments``, for a caller that takes only the black boxes, the block may name no
+    source file.
 
     Raises:
         FilelistError: a filelist can't be read, or is a credential.
-        verilog_bundle.BundleError: the block can't be uploaded as described, or ``arguments`` leave it with no file.
+        verilog_bundle.BundleError: the block names no source file, unless ``blackboxes_only`` is given without
+            ``arguments``, or it can't be uploaded as described.
         LeanProjectError: check_withheld() refuses the folder the block is read from.
     """
     committed = None if project_dir is None else verilog_bundle.folder_filelist(project_dir)
@@ -116,6 +130,7 @@ def read_block(
         committed=committed,
         whole_folder=project_dir is not None,
         arguments=bool(arguments),
+        blackboxes_only=blackboxes_only,
     )
     if not report:
         return block
@@ -150,6 +165,15 @@ def _interrupted_create_hint(name: str | None) -> str:
 def _unwaited(project: Project) -> SubmitResult:
     """The --json result of a wait that couldn't start: the new project, with no task, counts or properties."""
     return SubmitResult(project=project, task=None, web_url=project.web_url(), **NO_SUMMARY._asdict())
+
+
+def _report_interrupt_after_create(project: Project, wait_hint: str | None, as_json: bool) -> None:
+    """Say that an interrupt before the wait leaves the new project's run going, and how to follow it; print the
+    project as _unwaited() under --json."""
+    interrupted = "Interrupted" if wait_hint is None else "Interrupted before the wait started"
+    logging.info(f"{interrupted}: the project's run goes on.\n" + follow_hint(project.project_id, carry_on=wait_hint))
+    if as_json:
+        print_json(_unwaited(project))
 
 
 def block_prompt(prompt: str, block: verilog_bundle.Bundle | None) -> str:
@@ -189,8 +213,8 @@ class SubmitAction(APIAction):
             "--project-dir",
             type=project_dir_argument,
             help=(
-                "The folder holding the code to verify, as it is, and what the proof needs: Verilog and C on every "
-                "account, Rust on accounts where it's enabled. Aristotle writes the Lean itself, so don't send Lean or "
+                "The folder holding the code to verify, as it is, and what the proof needs: Verilog and C. "
+                "Aristotle writes the Lean itself, so don't send Lean or "
                 "pure mathematics, which it doesn't verify. Without --project-dir, -f or -F, only the prompt goes up. "
                 "Files git ignores (unless --include-ignored), files named like credentials or kept in a folder that "
                 "holds them, result archives an earlier run saved and files whose names aren't UTF-8 are left out, "
@@ -328,10 +352,15 @@ class SubmitAction(APIAction):
         args.prompt = read_prompt(self.parser, args)
         try:
             validate_prompt(args.prompt)
-            if (args.wait or args.non_interactive) and args.destination is not None:
-                validate_destination(args.destination)
         except ValueError as e:
             self.parser.error(str(e))
+        if args.wait or args.non_interactive:
+            if args.dry_run:
+                self.parser.error("--dry-run sends nothing, so there is nothing to wait for.")
+            try:
+                validate_destination(args.destination or ".")
+            except ValueError as e:
+                self.parser.error(str(e) if args.destination else f"{e}. Name another place with --destination.")
         if args.project_dir:
             if not os.path.isdir(args.project_dir):
                 self.parser.error(f"--project-dir must be a valid directory: {args.project_dir}")
@@ -356,8 +385,6 @@ class SubmitAction(APIAction):
         return super().run(args)
 
     async def run_action(self, args: argparse.Namespace) -> int | None:
-        if args.dry_run and (args.wait or args.non_interactive):
-            self.parser.error("--dry-run sends nothing, so there is nothing to wait for.")
         if args.non_interactive:
             args.wait = args.json = True
         agent_questions_setting = (
@@ -428,6 +455,7 @@ class SubmitAction(APIAction):
                 )
             else:
                 logging.info(f"Project name: {project.description}")
+        wait_hint: str | None = None
         if args.wait:
             wait_hint = shell_hint(
                 "Wait for it with",
@@ -435,18 +463,23 @@ class SubmitAction(APIAction):
                     project.project_id, None, args.destination, non_interactive=args.non_interactive, json=args.json
                 ),
             )
+        try:
+            async with AristotleRequestClient() as client:
+                payer = await billed_to(client)
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            _report_interrupt_after_create(project, wait_hint, args.json)
+            raise
+        if payer is not None:
+            stop = "" if payer.endswith((".", "!", "?")) else "."
+            logging.info(f"This run is billed to {payer}{stop}")
+        if args.wait:
             listing_error: AristotleAPIError | None = None
             try:
                 tasks, _ = await project.get_tasks(limit=1)
             except AristotleAPIError as e:
                 tasks, listing_error = [], e
             except (KeyboardInterrupt, asyncio.CancelledError):
-                logging.info(
-                    "Interrupted before the wait started: the project's run goes on.\n"
-                    + follow_hint(project.project_id, carry_on=wait_hint)
-                )
-                if args.json:
-                    print_json(_unwaited(project))
+                _report_interrupt_after_create(project, wait_hint, args.json)
                 raise
             if not tasks:
                 if listing_error is None:

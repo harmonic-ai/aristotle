@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import warnings
 from pathlib import Path, PurePath
 from typing import Any, BinaryIO
@@ -70,6 +71,17 @@ LEAN_PROJECT_IGNORED_FILE_PATTERNS = [
     # all nested .git repos
     "**/.git",
 ] + [f"**/.lake/packages/{pkg}" for pkg in MATHLIB_INCLUDED_STD_PACKAGES]
+
+
+_per_thread = threading.local()
+
+
+def _lean_project_ignored() -> pathspec.PathSpec:
+    # Per thread, as pathspec's hyperscan backend can't match in two at once; on first use, as compiling warns.
+    if not hasattr(_per_thread, "spec"):
+        _per_thread.spec = pathspec.PathSpec.from_lines("gitwildmatch", LEAN_PROJECT_IGNORED_FILE_PATTERNS)
+    return _per_thread.spec
+
 
 SECRET_FILE_PATTERNS = (
     ".env",
@@ -633,8 +645,8 @@ def _ignored_itself(project_dir: Path) -> str | None:
 
 def _git_ignored(project_dir: Path, candidates: list[Path], kept: frozenset[Path]) -> set[Path] | None:
     """The ``candidates`` git ignores, a tracked one only for a rule in one of the repository's .gitignore files, or
-    in a folder git ignores those its top-level .gitignore excludes, naming the tracked ones not in ``kept``; None if
-    ``project_dir`` is outside a work tree.
+    in a folder git ignores those its top-level .gitignore excludes, naming the tracked ones not in ``kept`` but .lean
+    files; None if ``project_dir`` is outside a work tree.
 
     Raises:
         LeanProjectError: git could not say which files it ignores.
@@ -655,7 +667,7 @@ def _git_ignored(project_dir: Path, candidates: list[Path], kept: frozenset[Path
     if (prefix := _ignored_itself(project_dir)) is not None:
         logger.debug(f"git ignores {project_dir} itself; applying only its top-level .gitignore")
         ignored = _top_level_ignored(project_dir, candidates)
-        if held_back := _tracked(project_dir, ignored - kept):
+        if held_back := _tracked(project_dir, {p for p in ignored - kept if p.suffix != ".lean"}):
             logger.warning(held_back_warning(dict.fromkeys(held_back, f"{prefix}.gitignore"), include_ignored=True))
         return ignored
     if not candidates:
@@ -672,7 +684,7 @@ def _git_ignored(project_dir: Path, candidates: list[Path], kept: frozenset[Path
         if rules is not None:
             ignored -= {p for p in held_back if p not in rules}
             held_back = [p for p in held_back if p in rules]
-        if named := [p for p in held_back if p not in kept]:
+        if named := [p for p in held_back if p not in kept and p.suffix != ".lean"]:
             logger.warning(held_back_warning({p: (rules or {}).get(p, "") for p in named}, include_ignored=True))
     return ignored
 
@@ -768,7 +780,7 @@ def gitignored_files(project_dir: Path, candidates: list[Path], kept: frozenset[
     In a git work tree git decides, from every ignore rule that applies, though only a rule in one of the repository's
     .gitignore files holds back a tracked file; elsewhere, or when git ignores ``project_dir`` itself, only
     ``project_dir``'s top-level .gitignore applies. In a work tree the ``aristotle`` logger names each tracked file held
-    back, with INCLUDE_IGNORED_HINT, except those in ``kept``, which go up regardless.
+    back but a .lean file, with INCLUDE_IGNORED_HINT, except those in ``kept``, which go up regardless.
 
     Raises:
         LeanProjectError: git could not say which files it ignores.
@@ -824,8 +836,6 @@ def should_skip_input_file(
     Returns:
         True if the file should be skipped, False otherwise.
     """
-    spec = pathspec.PathSpec.from_lines("gitwildmatch", LEAN_PROJECT_IGNORED_FILE_PATTERNS)
-
     if base_path is not None:
         rel_path = file_path.relative_to(base_path)
     else:
@@ -834,7 +844,7 @@ def should_skip_input_file(
     rel_path_str = str(rel_path)
 
     # Check built-in ignore patterns first
-    if spec.match_file(rel_path_str):
+    if _lean_project_ignored().match_file(rel_path_str):
         return True
 
     # Check gitignore patterns if provided
@@ -851,10 +861,22 @@ def file_identity(file_stat: os.stat_result) -> tuple[int, int] | None:
     return file_stat.st_dev, file_stat.st_ino
 
 
+#: The modification time of each file an upload copies, in place of its own; zip refuses one before 1980.
+ARCHIVED_MTIME = 946684800  # 2000-01-01T00:00:00Z
+
+
+def _file_member(arcname: str, file_stat: os.stat_result) -> tarfile.TarInfo:
+    """The header of the file member ``arcname``, with ``/`` for ``os.sep``, ``file_stat``'s size and permissions,
+    ARCHIVED_MTIME, owner ids 0 and no owner names."""
+    info = tarfile.TarInfo(arcname.replace(os.sep, "/"))
+    info.size, info.mode, info.mtime = file_stat.st_size, stat.S_IMODE(file_stat.st_mode), ARCHIVED_MTIME
+    return info
+
+
 def add_file(tar: tarfile.TarFile, path: Path | str, arcname: str, checked: os.stat_result) -> None:
     """Archive the regular file at ``path`` as the file member ``arcname``, read from a handle opened without following
     a link at ``path``, or, where the platform can't open that way, from one whose device and inode are those of
-    ``checked``, its lstat; ``tar`` is opened with dereference=True, or a second name for a file goes in as a hard link.
+    ``checked``, its lstat.
 
     Raises:
         FileChangedError: ``path`` is a link or no regular file now, or, without O_NOFOLLOW, another file.
@@ -872,7 +894,7 @@ def add_file(tar: tarfile.TarFile, path: Path | str, arcname: str, checked: os.s
     if f is None:
         raise changed
     with f:
-        tar.addfile(tar.gettarinfo(arcname=arcname, fileobj=f), f)
+        tar.addfile(_file_member(arcname, os.fstat(f.fileno())), f)
 
 
 def add_symlinked_file(
@@ -900,7 +922,7 @@ def add_symlinked_file(
     if f is None:
         raise SkippedSymlinkError("target not uploaded")
     with f:
-        tar.addfile(tar.gettarinfo(arcname=arcname, fileobj=f), f)
+        tar.addfile(_file_member(arcname, os.fstat(f.fileno())), f)
     return identity
 
 

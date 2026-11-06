@@ -465,7 +465,48 @@ async def test_show_task_counts_by_the_latest_task_whose_end_the_properties_stan
     older.show.assert_awaited_once()
 
 
-async def test_a_project_without_properties_gets_no_counts_line(properties, caplog):
+@pytest.mark.parametrize(
+    ("argv", "latest_status"),
+    [
+        (["--task", "task-old"], TaskStatus.QUEUED),
+        (["--task", "task-old"], TaskStatus.IN_PROGRESS),
+        (["--task", "task-old"], TaskStatus.UNKNOWN),
+        ([], TaskStatus.UNKNOWN),
+    ],
+    ids=["a later task queued", "a later task running", "a later task's status unknown", "its own status unknown"],
+)
+async def test_show_counts_the_properties_only_once_the_latest_task_has_ended(argv, latest_status, properties, caplog):
+    """As --json, whose counts are null until then."""
+    caplog.set_level(logging.INFO)
+    asked = _property(DeclarationStatus.PROVED).model_copy(update={"source": DeclarationSource.USER})
+    properties.return_value = [asked, _failed(DeclarationFailureReason.PROOF_CHECK_FAILED)]
+    action = ShowAction(argparse.ArgumentParser().add_subparsers())
+    action.add_action_arguments()
+    older = _completed_task(task_id="task-old")
+    latest = _completed_task(task_id="task-new")
+    latest.status = latest_status
+    # After the verdicts, so judging them would list the project's tasks.
+    latest.created_at = datetime.now() + timedelta(minutes=25)
+    shown = older if argv else latest
+    shown.show = AsyncMock(side_effect=lambda **kwargs: logging.info("(the task)"))
+    project = _project_with(latest, earlier=[older])
+
+    with (
+        patch("aristotlelib.cli.command.show.AgentTask.from_id", return_value=older),
+        patch("aristotlelib.cli.command.show.Project.from_id", return_value=project),
+    ):
+        assert await action.run_action(action.parser.parse_args(["project-123", *argv])) is None
+
+    # The counts of those asked for and the broken-proofs note wait too, and no tasks are listed to judge them by.
+    assert caplog.messages == [
+        "Properties: no counts until the project's latest task has ended, since it may still change them.",
+        "(the task)",
+    ]
+    project.get_tasks.assert_awaited_once_with(limit=1)
+
+
+@pytest.mark.parametrize("status", [TaskStatus.COMPLETE, TaskStatus.UNKNOWN])
+async def test_a_project_without_properties_gets_no_counts_line(status, properties, caplog):
     caplog.set_level(logging.INFO)
     properties.return_value = []
     parser = argparse.ArgumentParser()
@@ -474,6 +515,7 @@ async def test_a_project_without_properties_gets_no_counts_line(properties, capl
     mock_project = Mock(spec=Project, description=None)
     mock_project.project_id = "project-123"
     mock_task = _completed_task()
+    mock_task.status = status
     mock_project.get_tasks = AsyncMock(return_value=([mock_task], None))
 
     with patch("aristotlelib.cli.command.show.Project.from_id", return_value=mock_project):
@@ -1111,14 +1153,28 @@ async def test_json_for_an_older_task_counts_by_the_latest_one(latest, listed, c
     assert snapshot["web_url"] == "https://aristotle.harmonic.fun/projects/project-123"
 
 
-async def test_text_for_an_older_task_warns_when_the_latest_task_cannot_be_fetched(properties, caplog):
+@pytest.mark.parametrize(
+    ("status", "says", "counts"),
+    [
+        (
+            TaskStatus.COMPLETE,
+            "so the counts go by task task-456",
+            ["Properties: 1 proved · 0 refuted · 0 in progress"],
+        ),
+        (TaskStatus.UNKNOWN, "so the properties aren't counted: bad gateway", []),
+    ],
+    ids=["it has ended", "its status unknown"],
+)
+async def test_text_for_an_older_task_warns_when_the_latest_task_cannot_be_fetched(
+    status, says, counts, properties, caplog
+):
     caplog.set_level(logging.INFO)
     properties.return_value = [_property(DeclarationStatus.PROVED)]
     action = ShowAction(argparse.ArgumentParser().add_subparsers())
     action.add_action_arguments()
 
     with (
-        patch("aristotlelib.cli.command.show.AgentTask.from_id", return_value=_real_task(TaskStatus.COMPLETE)),
+        patch("aristotlelib.cli.command.show.AgentTask.from_id", return_value=_real_task(status)),
         patch(
             "aristotlelib.cli.command.show.Project.from_id",
             side_effect=AristotleAPIError("bad gateway", status_code=502),
@@ -1127,8 +1183,8 @@ async def test_text_for_an_older_task_warns_when_the_latest_task_cannot_be_fetch
     ):
         assert await action.run_action(action.parser.parse_args(["project-123", "--task", "task-456"])) is None
 
-    assert any("latest task couldn't be fetched, so the counts go by task task-456" in m for m in caplog.messages)
-    assert "Properties: 1 proved · 0 refuted · 0 in progress" in caplog.messages
+    assert any(f"latest task couldn't be fetched, {says}" in m for m in caplog.messages)
+    assert [m for m in caplog.messages if m.startswith("Properties:")] == counts
 
 
 async def test_json_with_a_task_of_another_project_prints_nothing_and_exits_4(capsys):

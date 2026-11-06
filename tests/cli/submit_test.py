@@ -21,6 +21,7 @@ import pytest
 from aristotlelib import api_request, local_file_utils
 from aristotlelib.agent_task import AgentTask, TaskStatus
 from aristotlelib.api_request import AristotleAPIError
+from aristotlelib.cli import login_flow
 from aristotlelib.cli.api_action import resume_hint
 from aristotlelib.cli.command.submit import PROMPT_ONLY_WARNING, SubmitAction
 from aristotlelib.cli.controller import main
@@ -593,6 +594,41 @@ async def test_a_submit_wait_interrupted_before_its_task_is_listed_still_prints_
     _check_unwaited(capsys.readouterr().out, flags)
 
 
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, asyncio.CancelledError])
+@pytest.mark.parametrize("flags", [[], ["--json"], *WAITS], ids=lambda flags: " ".join(flags) or "no flags")
+async def test_a_submit_interrupted_while_asking_who_pays_says_the_run_goes_on(
+    flags, interrupt, billed_to, capsys, caplog
+):
+    caplog.set_level(logging.INFO)
+    action = SubmitAction(argparse.ArgumentParser().add_subparsers())
+    action.add_action_arguments()
+    billed_to.side_effect = interrupt
+
+    with (
+        patch("aristotlelib.cli.command.submit.Project.create", return_value=_project("Test prompt")),
+        pytest.raises(interrupt),
+    ):
+        await action.run_action(action.parser.parse_args(["Test prompt", *flags]))
+
+    if flags in ([], ["--json"]):
+        assert caplog.messages[-1] == (
+            "Interrupted: the project's run goes on.\n"
+            f"Follow it with: aristotle show {PROJECT_ID}\n"
+            f"Cancel it with: aristotle cancel {PROJECT_ID}"
+        )
+    else:
+        assert caplog.messages[-1] == (
+            "Interrupted before the wait started: the project's run goes on.\n"
+            f"{shell_hint('Wait for it with', ['aristotle', 'show', PROJECT_ID, *flags])}\n"
+            f"Cancel it with: aristotle cancel {PROJECT_ID}"
+        )
+    out = capsys.readouterr().out
+    if flags == []:
+        assert out == ""
+    else:
+        _check_unwaited(out, flags)
+
+
 async def test_submit_action_with_wait_and_destination():
     """Test submitting a project with --wait and --destination flags."""
     parser = argparse.ArgumentParser()
@@ -779,6 +815,87 @@ async def test_submit_with_name_renames_the_new_project(caplog):
         "Project name: solana proj",
         f"If Aristotle asks anything, answer with:\n  aristotle questions {PROJECT_ID}",
     ]
+
+
+async def test_submit_says_who_the_run_is_billed_to_after_the_project_link(billed_to, caplog):
+    action = SubmitAction(argparse.ArgumentParser().add_subparsers())
+    action.add_action_arguments()
+    billed_to.return_value = "Acme Robotics"
+
+    with (
+        patch("aristotlelib.cli.command.submit.Project.create", return_value=_project("Test prompt")),
+        patch(RENAME_BY_ID, return_value=_project("solana proj")),
+        caplog.at_level(logging.INFO),
+    ):
+        await action.run_action(action.parser.parse_args(["Test prompt", "--name", "solana proj"]))
+
+    assert caplog.messages[-5:] == [
+        f"Project created: {PROJECT_ID}",
+        f"Open in Aristotle Web: https://aristotle.harmonic.fun/projects/{PROJECT_ID}",
+        "Project name: solana proj",
+        "This run is billed to Acme Robotics.",
+        f"If Aristotle asks anything, answer with:\n  aristotle questions {PROJECT_ID}",
+    ]
+
+
+async def test_submit_ends_the_billing_line_once_after_a_name_that_ends_a_sentence(billed_to, caplog):
+    action = SubmitAction(argparse.ArgumentParser().add_subparsers())
+    action.add_action_arguments()
+    billed_to.return_value = "Acme Inc."
+
+    with (
+        patch("aristotlelib.cli.command.submit.Project.create", return_value=_project("Test prompt")),
+        caplog.at_level(logging.INFO),
+    ):
+        await action.run_action(action.parser.parse_args(["Test prompt"]))
+
+    assert "This run is billed to Acme Inc." in caplog.messages
+
+
+async def test_submit_asks_with_its_key_who_the_run_is_billed_to(billed_to, api_server, caplog):
+    action = SubmitAction(argparse.ArgumentParser().add_subparsers())
+    action.add_action_arguments()
+    billed_to.side_effect = login_flow.billed_to
+    requests = api_server(
+        httpx.Response(200, json={"organization_id": "org-sam", "name": "Sam Example", "organization_type": 1})
+    )
+
+    with (
+        patch("aristotlelib.cli.command.submit.Project.create", return_value=_project("Test prompt")),
+        caplog.at_level(logging.INFO),
+    ):
+        await action.run_action(action.parser.parse_args(["Test prompt"]))
+
+    assert "This run is billed to your personal organization." in caplog.messages
+    assert [(request.url.path, request.headers["X-API-Key"]) for request in requests] == [
+        ("/api/v3/organization", "test-key")
+    ]
+
+
+async def test_submit_json_leaves_the_billing_line_out_of_stdout(billed_to, capsys, caplog):
+    action = SubmitAction(argparse.ArgumentParser().add_subparsers())
+    action.add_action_arguments()
+    billed_to.return_value = "Acme Robotics"
+
+    with (
+        patch("aristotlelib.cli.command.submit.Project.create", return_value=_project("Test prompt")),
+        patch.object(Project, "get_tasks", AsyncMock(return_value=([_real_task(TaskStatus.QUEUED)], None))),
+        caplog.at_level(logging.INFO),
+    ):
+        assert await action.run_action(action.parser.parse_args(["Test prompt", "--json"])) is None
+
+    out = capsys.readouterr().out
+    assert list(json.loads(out)) == [
+        "project",
+        "task",
+        "web_url",
+        "result_path",
+        "property_counts",
+        "requested_counts",
+        "properties",
+    ]
+    assert "billed" not in out
+    assert "This run is billed to Acme Robotics." in caplog.messages
 
 
 async def test_submit_sends_a_name_that_is_not_utf8_escaped():
@@ -1167,6 +1284,53 @@ async def test_submit_to_a_destination_through_a_file_exits_2_without_creating_a
     captured = capsys.readouterr()
     assert captured.out == ""
     assert f"Cannot save the archive to {destination}: notes.txt is not a directory" in captured.err
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="POSIX permission bits, which root bypasses")
+@pytest.mark.parametrize(
+    ("destination", "hint"),
+    [([], ". Name another place with --destination."), (["--destination", "."], "")],
+    ids=["no destination", "destination"],
+)
+@pytest.mark.parametrize("flags", WAITS, ids=" ".join)
+def test_a_wait_from_a_folder_it_cannot_write_exits_2_before_any_request(
+    flags, destination, hint, api_server, tmp_path, monkeypatch, capsys
+):
+    requests = api_server()
+    monkeypatch.chdir(tmp_path)
+    tmp_path.chmod(0o555)
+
+    try:
+        with (
+            patch("sys.argv", ["aristotle", "submit", "Prove it", *flags, *destination]),
+            pytest.raises(SystemExit) as exited,
+        ):
+            main()
+    finally:
+        tmp_path.chmod(0o755)
+
+    assert exited.value.code == 2
+    assert requests == []
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.endswith(f"error: Cannot save the archive to .: . is not writable{hint}\n")
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="POSIX permission bits, which root bypasses")
+@pytest.mark.parametrize("argv", [[], ["--json"], ["--wait", "--destination", "../out/"]], ids=" ".join)
+def test_a_submit_that_saves_nothing_there_runs_from_a_folder_it_cannot_write(argv, tmp_path, monkeypatch):
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    monkeypatch.chdir(locked)
+    locked.chmod(0o555)
+    parser = argparse.ArgumentParser()
+    action = SubmitAction(parser.add_subparsers())
+    action.add_action_arguments()
+
+    try:
+        assert action.preflight(action.parser.parse_args(["Test prompt", *argv])) is None
+    finally:
+        locked.chmod(0o755)
 
 
 DESTINATION_IGNORED = (
@@ -1613,6 +1777,29 @@ def test_a_submit_answered_by_a_page_that_isnt_aristotles_exits_7_as_its_answer_
         "captive portal or a proxy may have answered instead. Aristotle may have acted on it, so it was not sent "
         "again. If it did, the project was created, though it may take a few minutes to show up: check `aristotle "
         "list` before submitting again."
+    )
+    assert caplog.messages[-1] == error
+    out = capsys.readouterr().out
+    assert (json.loads(out) if json_flag else out) == ({"outcome": "unknown", "error": error} if json_flag else "")
+
+
+@pytest.mark.parametrize("json_flag", [["--json"], []], ids=["--json", "no --json"])
+def test_a_submit_answered_by_json_this_version_cant_read_exits_7_as_its_answer_was_lost(
+    api_server, caplog, capsys, monkeypatch, json_flag: list[str]
+):
+    monkeypatch.setattr(api_request, "getproxies", dict)
+    requests = api_server(httpx.Response(200, json={"project_id": "p-1"}))
+
+    with patch("sys.argv", ["aristotle", "submit", "Prove it", *json_flag]):
+        assert main() == 7
+
+    assert len(requests) == 1
+    error = (
+        "POST /project: the answer from https://aristotle.harmonic.fun was 200 OK with JSON this version of "
+        "aristotlelib can't read (created_at: Field required, and 5 more): a proxy may have answered instead, or a "
+        "newer aristotlelib may be needed. Aristotle may have acted on it, so it was not sent again. If it did, the "
+        "project was created, though it may take a few minutes to show up: check `aristotle list` before submitting "
+        "again."
     )
     assert caplog.messages[-1] == error
     out = capsys.readouterr().out
@@ -2714,6 +2901,28 @@ def test_a_filelist_that_names_no_source_is_refused_without_the_prompt_route(
     assert caplog.messages[-1] == NO_SOURCE_IN_FILELIST
 
 
+@pytest.mark.parametrize("dry_run", [True, False], ids=["--dry-run", "run"])
+def test_a_folders_aristotle_f_of_black_boxes_alone_stops_before_any_request(
+    tmp_path, monkeypatch, caplog, dry_run: bool
+):
+    """It names no source file, and the folder's sources would go up beside an aristotle.f naming none of them."""
+    block = tmp_path / "block"
+    _write(block / "rtl" / "top.v", "module top; sram_1p u(); endmodule\n")
+    _write(block / "vendor" / "sram_1p.v", "module sram_1p; endmodule\n")
+    _write(block / "aristotle.f", "--blackbox sram_1p\n")
+    monkeypatch.chdir(tmp_path)
+
+    argv = ["--project-dir", "block", *(["--dry-run"] if dry_run else [])]
+    code, _, mock_create = _run_submit(argv, monkeypatch, key=not dry_run)
+
+    assert code == 2
+    mock_create.assert_not_called()
+    assert caplog.messages[-1] == (
+        f"{Path('block', 'aristotle.f')} names no source file, so Aristotle would elaborate an empty design. Name the "
+        "design's sources in it."
+    )
+
+
 def test_a_filelist_kept_outside_a_folder_with_none_lets_a_black_box_leave_the_folders_model_out(tmp_path, monkeypatch):
     """Paths in -f are from the current directory, and nothing is written into the folder."""
     folder = tmp_path / "design"
@@ -3011,6 +3220,24 @@ def test_a_dry_run_that_cant_mean_anything_is_a_usage_error(argv, message, tmp_p
 
     assert exited.value.code == 2
     assert message in capsys.readouterr().err
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="POSIX permission bits, which root bypasses")
+@pytest.mark.parametrize("flags", [["--wait"], ["--non-interactive"]], ids=" ".join)
+def test_a_dry_run_with_a_wait_from_a_folder_it_cannot_write_is_refused_as_a_dry_run(
+    flags, tmp_path, monkeypatch, capsys
+):
+    monkeypatch.chdir(tmp_path)
+    tmp_path.chmod(0o555)
+
+    try:
+        with pytest.raises(SystemExit) as exited:
+            _run_submit(["--project-dir", ".", "--dry-run", *flags], monkeypatch, key=False)
+    finally:
+        tmp_path.chmod(0o755)
+
+    assert exited.value.code == 2
+    assert capsys.readouterr().err.endswith("error: --dry-run sends nothing, so there is nothing to wait for.\n")
 
 
 def test_submit_reads_a_filelist_spelled_in_any_case(tmp_path, monkeypatch):

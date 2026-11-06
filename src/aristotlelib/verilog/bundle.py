@@ -572,18 +572,21 @@ def build(
     whole_folder: bool = True,
     arguments: bool = False,
     check: Callable[[Path, str], None] | None = None,
+    blackboxes_only: bool = False,
 ) -> Bundle:
     """The upload for ``block`` from the folder ``root``, all of which goes up when ``whole_folder``; ``committed``
     is the ``aristotle.f`` it was read from, and ``arguments`` whether command-line options added to it. ``check`` is
     called with each file the block reaches, as named, and why, before anything of it is read, and raises BundleError
     to refuse it. A file the filelists name that declares a ``--blackbox`` module and no other design unit is left out.
+    With ``blackboxes_only``, for a caller that takes only the black boxes, the block may name no source file.
 
     Raises:
-        BundleError: the block names more than one top, a ``--blackbox`` that isn't a module's name or is the top, a
-            ``-y`` folder the server can't be given, ``-v`` files without a top, a value that isn't UTF-8, or a path a
-            generated ``aristotle.f`` can't name; a ``--blackbox`` module shares a file with another design unit, or is
-            in an included file, or leaves out every file named; or a file it reaches can't be read, has a name the
-            upload can't hold, includes a path filelist.never_read() refuses, or ``check`` refuses it.
+        BundleError: the block names more than one top, a ``--blackbox`` that isn't a module's name or is the top, no
+            source file without ``blackboxes_only``, a ``-y`` folder the server can't be given, ``-v`` files without a
+            top, a value that isn't UTF-8, or a path a generated ``aristotle.f`` can't name; a ``--blackbox`` module
+            shares a file with another design unit, or is in an included file, or leaves out every file named; or a
+            file it reaches can't be read, has a name the upload can't hold, includes a path filelist.never_read()
+            refuses, or ``check`` refuses it.
     """
     root = Path(os.path.normpath(os.path.abspath(root)))
     boxed = _boxed(block)
@@ -610,6 +613,11 @@ def build(
                     check(Path(file.path), file.reason)
                 reached[file.path] = file
                 queue.append(file)
+    if not queue and not blackboxes_only:
+        empty = "names no source file, so Aristotle would elaborate an empty design."
+        if committed is None:
+            raise BundleError(f"The Verilog block {empty}")
+        raise BundleError(f"{filelist.shown(committed)} {empty} Name the design's sources in it.")
     left_out = _leave_out(queue, boxed) if boxed else {}
     if left_out:
         for path in left_out:
@@ -1377,7 +1385,8 @@ def write_member(tar: tarfile.TarFile, bundle: Bundle | None, member: Member, ar
         # Built by hand, as it holds the rewritten bytes, not the file's.
         file_stat = os.lstat(real)
         info = tarfile.TarInfo(member.archive)
-        info.size, info.mode, info.mtime = len(content), stat.S_IMODE(file_stat.st_mode), int(file_stat.st_mtime)
+        info.size, info.mode = len(content), stat.S_IMODE(file_stat.st_mode)
+        info.mtime = local_file_utils.ARCHIVED_MTIME
         tar.addfile(info, io.BytesIO(content))
     if (identity := local_file_utils.file_identity(file_stat)) is not None:
         archived.add(identity)

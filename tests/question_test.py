@@ -1,12 +1,14 @@
 """Tests for aristotlelib.question module."""
 
 from datetime import datetime
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock
 
+import httpx
 import pytest
 
 from aristotlelib.api_request import AristotleAPIError
 from aristotlelib.question import Question, QuestionClosed
+from tests.conftest import OBJECT_REFUSALS, patched_client
 
 
 def _payload(**overrides):
@@ -83,7 +85,7 @@ async def test_list_for_task_hits_the_task_endpoint_and_sorts_oldest_first():
     ]
     mock_client = _client(get=AsyncMock(return_value=mock_response))
 
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=mock_client):
+    with patched_client(mock_client):
         questions = await Question.list_for_task("task-456")
 
     mock_client.get.assert_called_once_with("/task/task-456/questions")
@@ -95,7 +97,7 @@ async def test_list_for_task_hits_the_task_endpoint_and_sorts_oldest_first():
 async def test_list_for_task_surfaces_a_missing_endpoint():
     mock_client = _client(get=AsyncMock(side_effect=AristotleAPIError("not found", status_code=404)))
 
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=mock_client):
+    with patched_client(mock_client):
         with pytest.raises(AristotleAPIError) as excinfo:
             await Question.list_for_task("task-456")
 
@@ -110,7 +112,7 @@ async def test_answer_posts_the_answer_and_takes_the_servers_state():
     )
     mock_client = _client(post=AsyncMock(return_value=mock_response))
 
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=mock_client):
+    with patched_client(mock_client):
         await question.answer("Active low")
 
     mock_client.post.assert_called_once_with("/question/q-1/answer", json={"answer": "Active low"})
@@ -123,7 +125,7 @@ async def test_answer_reports_a_closed_question():
     question = Question.model_validate(_payload())
     mock_client = _client(post=AsyncMock(side_effect=AristotleAPIError("conflict", status_code=409)))
 
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=mock_client):
+    with patched_client(mock_client):
         with pytest.raises(QuestionClosed, match="already closed") as excinfo:
             await question.answer("Active low")
 
@@ -137,18 +139,30 @@ async def test_answer_passes_other_errors_through():
     question = Question.model_validate(_payload())
     mock_client = _client(post=AsyncMock(side_effect=AristotleAPIError("forbidden", status_code=403)))
 
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=mock_client):
+    with patched_client(mock_client):
         with pytest.raises(AristotleAPIError) as excinfo:
             await question.answer("Active low")
 
     assert excinfo.value.status_code == 403
 
 
+async def test_an_answer_the_server_takes_only_from_the_owner_says_so(api_server):
+    question = Question.model_validate(_payload())
+    detail = "Not authorized to answer this question"
+    api_server(httpx.Response(403, json={"detail": detail}))
+
+    with pytest.raises(AristotleAPIError) as excinfo:
+        await question.answer("Active low")
+
+    assert (str(excinfo.value), excinfo.value.status_code) == (OBJECT_REFUSALS[detail], 403)
+    assert question.pending
+
+
 @pytest.mark.parametrize(("run_live", "state"), [(True, "PENDING"), (None, "PENDING"), (False, "UNANSWERED")])
 async def test_an_open_question_of_a_run_that_ended_is_unanswered(run_live, state):
     client = _client(get=AsyncMock(return_value=Mock(json=Mock(return_value=[_payload(), _payload(response="Yes")]))))
 
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=client):
+    with patched_client(client):
         questions = await Question.list_for_task("task-456", run_live=run_live)
 
     assert [q.model_dump(mode="json")["state"] for q in questions] == [state, "ANSWERED"]

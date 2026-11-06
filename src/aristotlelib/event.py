@@ -5,6 +5,7 @@ import pydantic
 from aristotlelib import api_request
 from aristotlelib.aristotle_object import AristotleObject, SafeIntEnum
 from aristotlelib.date_utils import UTCDatetime
+from aristotlelib.question import Question, _question_notice
 
 logger = logging.getLogger("aristotle")
 
@@ -70,6 +71,8 @@ class Event(AristotleObject):
     suggestions: list[str] | None = None
     status: EventStatus
     duration_seconds: float | None = None
+    # The line str() prints for a question event, from its task's questions listing; None to print the event itself.
+    _notice: str | None = pydantic.PrivateAttr(default=None)
 
     @pydantic.computed_field  # type: ignore[prop-decorator]
     @property
@@ -80,7 +83,8 @@ class Event(AristotleObject):
     @pydantic.computed_field  # type: ignore[prop-decorator]
     @property
     def status_name(self) -> str:
-        """``status``'s name: ``COMPLETE``, ``SENT`` while a question awaits an answer, or ``UNKNOWN``."""
+        """``status``'s name: ``COMPLETE``, ``SENT`` for a message Aristotle hasn't received yet or an older server's
+        question awaiting an answer, or ``UNKNOWN``."""
         return self.status.name
 
     endpoint_prefix = "event"
@@ -95,6 +99,8 @@ class Event(AristotleObject):
                 return f"You asked: {self.content}\nAnswer: {self.explanation}"
             return f"You asked: {self.content}"
         elif self.event_type == EventType.AGENT_QUESTION:
+            if self._notice is not None:
+                return self._notice
             response = f"Aristotle asked: {self.content}"
             if self.explanation:
                 return response + f"\nYou answered: {self.explanation}"
@@ -113,10 +119,15 @@ class Event(AristotleObject):
             return _ACTIVITIES.get(self.event_type, self.event_type.name)
 
     async def answer(self, answer: str) -> None:
-        """Answer an agent question.
+        """Answer an agent question: the question the task's questions listing has for this event, or, from an older
+        server, the event itself while it is SENT.
 
         Args:
             answer: The answer to the question.
+
+        Raises:
+            ValueError: The event isn't an agent question, its question was answered, closed without an answer or timed
+                out, its run has ended, or the project is someone else's.
         """
         await self.refresh()
         if self.event_type != EventType.AGENT_QUESTION:
@@ -124,11 +135,40 @@ class Event(AristotleObject):
         if self.explanation:
             raise ValueError("This question has already been answered")
         if self.status != EventStatus.SENT:
-            raise ValueError("This question timed out. The agent did what it thought was best.")
+            await self._answer_listed(answer)
+            return
 
         async with api_request.AristotleRequestClient() as client:
-            response = await client.post(
+            answered = await client.post(
                 f"/{self.endpoint_prefix}/{self.event_id}/answer",
                 json={"answer": answer},
+                read=api_request.json_as(type(self)),
             )
-            self._update_from_response(response.json())
+        self._adopt(answered)
+
+    async def _answer_listed(self, answer: str) -> None:
+        """Answer the question the task's questions listing has for this event; str() then prints it with the answer."""
+        # Imported here: agent_task imports this module.
+        from aristotlelib.agent_task import AgentTask
+
+        task = await AgentTask.from_id(self.agent_task_id)
+        try:
+            questions = await Question.list_for_task(self.agent_task_id, run_live=task.live)
+        except api_request.AristotleAPIError as e:
+            if e.status_code not in (404, 405):
+                raise
+            questions = []
+        question = next((question for question in questions if question.event_id == self.event_id), None)
+        if question is None:
+            raise ValueError("This question timed out. The agent did what it thought was best.")
+        self._notice = _question_notice(question, task.read_only)
+        if question.answered:
+            raise ValueError("This question has already been answered")
+        if question.ignored:
+            raise ValueError("This question was closed without an answer")
+        if not task.live:
+            raise ValueError("The run has ended, so no answer can reach Aristotle now")
+        if task.read_only:
+            raise ValueError("Only the project's owner can answer this question")
+        await question.answer(answer)
+        self._notice = _question_notice(question, task.read_only)

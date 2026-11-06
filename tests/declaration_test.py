@@ -18,6 +18,7 @@ from aristotlelib.declaration import (
     decode_html_entities,
 )
 from aristotlelib.results import PropertyCounts
+from tests.conftest import patched_client
 
 PROJECT_ID = "b2396058-7c1e-4d7a-9f3b-2a6c8e1d4f50"
 
@@ -54,7 +55,7 @@ def _mock_client(*pages: dict) -> Mock:
 async def test_list_for_project_parses_a_response():
     client = _mock_client({"declarations": [SAMPLE_DECLARATION], "pagination_key": None})
 
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=client):
+    with patched_client(client):
         declarations, pagination_key = await Declaration.list_for_project(PROJECT_ID)
 
     assert pagination_key is None
@@ -139,7 +140,7 @@ async def test_api_refutations_normalize_without_changing_the_response(fields, e
     original = raw.copy()
     client = _mock_client({"declarations": [raw], "pagination_key": None})
 
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=client):
+    with patched_client(client):
         declarations, _ = await Declaration.list_for_project(PROJECT_ID)
 
     declaration = declarations[0]
@@ -156,7 +157,7 @@ async def test_api_refutations_read_an_unknown_evidence_kind_as_unknown_instead_
     raw = {**SAMPLE_DECLARATION, "status": status, "evidence": evidence}
     client = _mock_client({"declarations": [raw], "pagination_key": None})
 
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=client):
+    with patched_client(client):
         [declaration], _ = await Declaration.list_for_project(PROJECT_ID)
 
     assert declaration.status is DeclarationStatus.REFUTED
@@ -175,7 +176,7 @@ async def test_mixed_api_pages_preserve_every_refutation_in_counts():
     )
 
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=client),
+        patched_client(client),
         patch("aristotlelib.declaration.asyncio.sleep", AsyncMock()),
     ):
         declarations = await Declaration.list_all_for_project(PROJECT_ID)
@@ -192,7 +193,7 @@ async def test_mixed_api_pages_preserve_every_refutation_in_counts():
 async def test_list_for_project_requests_the_right_endpoint():
     client = _mock_client({"declarations": [], "pagination_key": None})
 
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=client):
+    with patched_client(client):
         await Declaration.list_for_project(PROJECT_ID, declaration_type=DeclarationType.PROPERTY, limit=50)
 
     endpoint, kwargs = client.get.call_args[0][0], client.get.call_args[1]
@@ -209,7 +210,7 @@ async def test_list_for_project_requests_the_right_endpoint():
 async def test_list_for_project_rejects_an_id_that_is_not_a_uuid_without_a_request(project_id, listing):
     client = _mock_client()
 
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=client):
+    with patched_client(client):
         with pytest.raises(AristotleAPIError) as raised:
             await listing(project_id)
 
@@ -239,7 +240,7 @@ async def test_list_all_for_project_follows_pagination():
     client = _mock_client(page_one, page_two)
 
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=client),
+        patched_client(client),
         patch("aristotlelib.declaration.asyncio.sleep", AsyncMock()),
     ):
         declarations = await Declaration.list_all_for_project(PROJECT_ID)
@@ -255,7 +256,7 @@ async def test_list_all_for_project_reads_every_page_over_one_connection():
     client = _mock_client(page, page, {**page, "pagination_key": None})
 
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=client) as connect,
+        patched_client(client) as connect,
         patch("aristotlelib.declaration.asyncio.sleep", AsyncMock()),
     ):
         declarations = await Declaration.list_all_for_project(PROJECT_ID)
@@ -282,7 +283,7 @@ async def test_list_all_for_project_spaces_its_pages_out(request_seconds):
 
     client.get = get
     with (
-        patch("aristotlelib.api_request.AristotleRequestClient", return_value=client),
+        patched_client(client),
         patch("aristotlelib.declaration.time", Mock(monotonic=lambda: now[0])),
         patch("aristotlelib.declaration.asyncio.sleep", sleep),
     ):
@@ -302,7 +303,7 @@ async def test_an_unrecognized_status_degrades_to_unknown():
     # A status this client predates parses as UNKNOWN rather than failing validation.
     client = _mock_client({"declarations": [{**SAMPLE_DECLARATION, "status": 99}], "pagination_key": None})
 
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=client):
+    with patched_client(client):
         declarations, _ = await Declaration.list_for_project(PROJECT_ID)
 
     assert declarations[0].status == DeclarationStatus.UNKNOWN
@@ -312,7 +313,7 @@ async def test_optional_fields_may_be_absent():
     minimal = {k: v for k, v in SAMPLE_DECLARATION.items() if k not in {"lean_code", "description"}}
     client = _mock_client({"declarations": [minimal], "pagination_key": None})
 
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=client):
+    with patched_client(client):
         declarations, _ = await Declaration.list_for_project(PROJECT_ID)
 
     assert declarations[0].lean_code is None

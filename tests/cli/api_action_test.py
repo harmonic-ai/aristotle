@@ -53,7 +53,7 @@ from aristotlelib.project import Project, lookup_at_terminal
 from aristotlelib.results import NO_SUMMARY
 from aristotlelib.shell import shell_commands, shell_hint
 from tests.ci.conftest import make_declaration
-from tests.conftest import FAKE_KEY, PADDED_KEYS, REFUSED_KEYS, give_key, shown_key_runs
+from tests.conftest import FAKE_KEY, PADDED_KEYS, REFUSED_KEYS, give_key, patched_client, shown_key_runs
 
 
 @pytest.fixture(autouse=True)
@@ -89,7 +89,7 @@ def _run(action_cls, argv: list[str], client: AsyncMock):
     parser = argparse.ArgumentParser()
     action = action_cls(parser.add_subparsers())
     action.add_arguments()
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=client):
+    with patched_client(client):
         return action.run(action.parser.parse_args(argv, _top_level()))
 
 
@@ -596,7 +596,7 @@ def test_every_command_exits_4_for_a_missing_project(argv, monkeypatch, caplog):
     client.post = AsyncMock(side_effect=AristotleAPIError("Not found", status_code=404))
     monkeypatch.setattr("sys.argv", ["aristotle", *argv])
 
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=client):
+    with patched_client(client):
         try:
             code = controller.main()
         except SystemExit as exited:
@@ -753,7 +753,7 @@ BY_NAME = [
 
 def _main(argv: list[str], client: AsyncMock, monkeypatch) -> int:
     monkeypatch.setattr("sys.argv", ["aristotle", *argv])
-    with patch("aristotlelib.api_request.AristotleRequestClient", return_value=client):
+    with patched_client(client):
         try:
             return controller.main()
         except SystemExit as exited:
