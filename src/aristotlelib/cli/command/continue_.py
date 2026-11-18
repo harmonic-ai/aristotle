@@ -10,6 +10,7 @@ from aristotlelib.agent_task import AgentTask
 from aristotlelib.api_request import AristotleProjectLimitError, before_sending, quietly
 from aristotlelib.ci.runner import describe_upload
 from aristotlelib.cli.api_action import (
+    NON_INTERACTIVE_HELP,
     PROJECT_REFERENCE_HELP,
     APIAction,
     add_prompt_arguments,
@@ -17,6 +18,7 @@ from aristotlelib.cli.api_action import (
     fetch_properties_and_tasks,
     judge_properties,
     log_download_hint,
+    log_next_steps,
     log_unjudged,
     print_json,
     print_questions_pending,
@@ -59,7 +61,7 @@ REPLACES = (
     "Each file that goes up replaces the project's file at the same path, even one Aristotle has edited since, or is "
     "added; the project's other files stay."
 )
-"""What a folder sent with a prompt does to the project's files, as --help and --dry-run say it."""
+"""What a folder sent with a prompt does to the project's files, as --dry-run says it."""
 
 
 class ContinueAction(APIAction):
@@ -82,89 +84,53 @@ class ContinueAction(APIAction):
         self.parser.add_argument(
             "project_id",
             type=str,
-            help=f"The project to continue: {PROJECT_REFERENCE_HELP}",
+            help=f"The project: {PROJECT_REFERENCE_HELP}",
         )
         add_prompt_arguments(self.parser, "Prompt for Aristotle")
         self.parser.add_argument(
             "--files",
             type=Path,
             nargs="*",
-            help=(
-                "Local files to upload when the project is idle, relative to the current directory or absolute. "
-                "Their paths inside --project-dir are preserved."
-            ),
+            help="Local files to upload when the project is idle.",
         )
         self.parser.add_argument(
             "--project-dir",
-            help=(
-                "Root for uploaded paths; default: the current directory. Only --files are uploaded, unless "
-                "--send-folder sends the whole directory, so it needs --files or --send-folder. Files outside this "
-                "directory, also through links, and paths containing .. are refused."
-            ),
+            help="The root of --files' paths, or the folder to send.",
         )
         self.parser.add_argument(
             "--send-folder",
             action="store_true",
-            help=(
-                "Upload the whole folder --project-dir names with the prompt, when the project is idle, its files "
-                "picked as submit --project-dir picks them, so the files the black boxes of its aristotle.f leave out "
-                "stay out. Nothing else of that aristotle.f applies: it and the files it names go up only as the "
-                "folder's other files do, so an ignore rule keeps them out without --include-ignored, and it goes up "
-                f"as written, in place of the project's, even one submit generated. {REPLACES} It needs --project-dir "
-                "and takes no --files. It needs a server that takes a folder with a follow-up: an older one starts the "
-                "task without it, and continue then names the task, with the command that cancels it, and exits 3."
-            ),
+            help="Upload the whole --project-dir folder with the prompt.",
         )
         self.parser.add_argument(
             "--include-ignored",
             action="store_true",
-            help=(
-                "With --send-folder, also upload the files in --project-dir that git ignores, such as sources a build "
-                "generates, as submit --include-ignored does: files named like credentials or kept in a folder that "
-                "holds them, .git folders, result archives an earlier run saved and files whose names aren't UTF-8 "
-                "still stay out."
-            ),
+            help="With --send-folder, also upload files git ignores.",
         )
         self.parser.add_argument(
             "--dry-run",
             action="store_true",
-            help=(
-                "With --send-folder, send nothing, and need no key: list the files of --project-dir that would go up, "
-                "marking those --include-ignored adds, and those an ignore rule leaves out, and the prompt, and say "
-                "how large the upload would be. With --json, print that as one JSON object."
-            ),
+            help="List what --send-folder would upload; send nothing.",
         )
         self.parser.add_argument(
             "--wait",
             action="store_true",
-            help="Wait for task completion and display events as they stream in",
+            help="Wait for the task to finish, showing its progress.",
         )
         self.parser.add_argument(
             "--json",
             action="store_true",
-            help=(
-                "Print the task and the project's properties as one JSON object. With --wait, print them when the "
-                "wait ends (still running if it broke off), with no progress display and no prompts."
-            ),
+            help="Print the task and the project's properties as JSON.",
         )
         self.parser.add_argument(
             "--non-interactive",
             action="store_true",
-            help=(
-                "For scripts and agents: --wait and --json, but never prompt, and stop as soon as Aristotle asks "
-                "something, printing the questions as JSON and exiting with code 10. Answer with `aristotle "
-                "questions <project-id> --answer <question-id>=<answer>`, then carry on with `aristotle show "
-                "<project-id> --non-interactive`."
-            ),
+            help=NON_INTERACTIVE_HELP,
         )
         self.parser.add_argument(
             "--no-questions",
             action="store_true",
-            help=(
-                "Don't let Aristotle ask questions in the task this prompt starts, for a batch run nobody will answer: "
-                "work that needs a decision only you can make is then left unverified and named in the summary. By "
-                "default it may ask, and waits up to 15 minutes for each answer. A running task keeps its setting."
-            ),
+            help="Don't let Aristotle ask questions in a new task.",
         )
 
     def preflight(self, args: argparse.Namespace) -> int | None:
@@ -313,13 +279,17 @@ class ContinueAction(APIAction):
             if questions:
                 return print_questions_pending(task, questions)
             unjudged = None
+            properties = None
             if judged is not None:
                 summary, unjudged = judged
                 print_json(_result(project, task, summary))
             else:
-                log_property_counts(*await fetch_properties_and_tasks(args.project_id, task))
+                properties, judged_by = await fetch_properties_and_tasks(args.project_id, task)
+                log_property_counts(properties, judged_by)
             if not task.live:
                 await log_download_hint(args.project_id)
+                if not args.json:
+                    log_next_steps(task, bool(properties))
             if unjudged is not None:
                 # The prompt was sent: 3, not the exit code of a refusal to retry, which would send it again.
                 log_unjudged(task.project_id, unjudged)

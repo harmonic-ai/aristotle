@@ -244,6 +244,7 @@ async def test_json_prints_the_records_and_keeps_the_pagination_key_on_stderr(ca
         "latest_run_status": None,
         "has_input": True,
         "has_files": False,
+        "archived_at": None,
         "status_name": "RUNNING",
     }
     # For a person reading stderr, the key is printed there too.
@@ -265,6 +266,35 @@ async def test_json_with_no_projects_is_an_empty_page(capsys, caplog):
     assert caplog.messages == []
 
 
+@pytest.mark.parametrize(("argv", "archived"), [(["--archived"], True), ([], False)], ids=["archived", "default"])
+async def test_archived_lists_archived_projects_alone(argv: list[str], archived: bool):
+    parser = argparse.ArgumentParser()
+    action = ListAction(parser.add_subparsers())
+    action.add_action_arguments()
+
+    with patch("aristotlelib.cli.command.list.Project.list_projects", return_value=([], None)) as mock_list:
+        await action.run_action(action.parser.parse_args(argv))
+
+    assert mock_list.call_args[1]["archived"] is archived
+
+
+@pytest.mark.parametrize(
+    ("argv", "message"), [(["--archived"], "No archived projects found."), ([], "No projects found.")]
+)
+async def test_an_empty_list_says_which_projects_it_found_none_of(argv: list[str], message: str, caplog):
+    parser = argparse.ArgumentParser()
+    action = ListAction(parser.add_subparsers())
+    action.add_action_arguments()
+
+    with (
+        patch("aristotlelib.cli.command.list.Project.list_projects", return_value=([], None)),
+        caplog.at_level(logging.INFO),
+    ):
+        await action.run_action(action.parser.parse_args(argv))
+
+    assert caplog.messages == [message]
+
+
 async def test_the_table_says_how_each_projects_latest_run_stands_or_ended(capsys):
     parser = argparse.ArgumentParser()
     action = ListAction(parser.add_subparsers())
@@ -273,6 +303,9 @@ async def test_the_table_says_how_each_projects_latest_run_stands_or_ended(capsy
         _project("proj-1", ProjectStatus.IDLE).model_copy(update={"latest_run_status": TaskStatus.FAILED}),
         _project("proj-2", ProjectStatus.RUNNING).model_copy(update={"latest_run_status": TaskStatus.IN_PROGRESS}),
         _project("proj-3", ProjectStatus.IDLE),
+        _project("proj-4", ProjectStatus.IDLE).model_copy(
+            update={"latest_run_status": TaskStatus.COMPLETE_WITH_ERRORS}
+        ),
     ]
 
     with patch("aristotlelib.cli.command.list.Project.list_projects", return_value=(projects, None)):
@@ -280,8 +313,14 @@ async def test_the_table_says_how_each_projects_latest_run_stands_or_ended(capsy
 
     lines = capsys.readouterr().out.splitlines()
     assert lines[0].split() == ["ID", "CREATED", "NAME", "STATUS", "LAST", "RUN"]
+    status_column, last_run_column = lines[0].index("STATUS"), lines[0].index("LAST RUN")
     # An idle project doesn't say whether its run passed; LAST RUN does.
-    assert [line.split()[-2:] for line in lines[2:]] == [["IDLE", "FAILED"], ["RUNNING", "IN_PROGRESS"], ["IDLE", "-"]]
+    assert [(line[status_column:last_run_column].rstrip(), line[last_run_column:].rstrip()) for line in lines[2:]] == [
+        ("IDLE", "FAILED"),
+        ("RUNNING", "IN_PROGRESS"),
+        ("IDLE", "-"),
+        ("IDLE", "REVIEW SUGGESTED"),
+    ]
     assert max(map(len, lines)) <= 120
 
 

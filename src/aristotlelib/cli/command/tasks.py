@@ -1,7 +1,7 @@
 import argparse
 import logging
 
-from aristotlelib.agent_task import AgentTask
+from aristotlelib.agent_task import AgentTask, task_status_label
 from aristotlelib.api_request import AristotleAPIError
 from aristotlelib.cli.api_action import (
     PROJECT_REFERENCE_HELP,
@@ -32,13 +32,13 @@ class TasksAction(APIAction):
         self.parser.add_argument(
             "project_id",
             type=str,
-            help=f"The project to list tasks for: {PROJECT_REFERENCE_HELP}",
+            help=f"The project: {PROJECT_REFERENCE_HELP}",
         )
         self.parser.add_argument(
             "--limit",
             type=int,
             default=10,
-            help="Maximum number of tasks to return (1-100). Default: 10",
+            help="How many tasks to list, 1 to 100 (default: 10).",
         )
         self.parser.add_argument(
             "--pagination-key",
@@ -48,7 +48,7 @@ class TasksAction(APIAction):
         self.parser.add_argument(
             "--json",
             action="store_true",
-            help='Print {"project_id", "tasks", "pagination_key"} as JSON instead of a table.',
+            help="Print the tasks as JSON instead of a table.",
         )
 
     def preflight(self, args: argparse.Namespace) -> int | None:
@@ -88,6 +88,6 @@ class TasksAction(APIAction):
             name = task.description or "-"
             if len(name) > 30:
                 name = name[:27] + "..."
-            status = task.status.name
+            status = task_status_label(task.status)
 
             print_line(f"{task_id:<36} {created:<20} {name:<30} {status:<15}")

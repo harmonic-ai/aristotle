@@ -6,9 +6,6 @@ requires-python = ">=3.10"
 exclude-newer = "0001-01-01T00:00:00Z" # This has no effect and is included for backwards compatibility when using relative exclude-newer values.
 exclude-newer-span = "P15D"
 
-[options.exclude-newer-package]
-certifi = "2026-10-21T00:00:00Z"
-
 [[package]]
 name = "annotated-types"
 version = "0.7.0"
@@ -34,7 +31,7 @@ wheels = [
 
 [[package]]
 name = "aristotlelib"
-version = "3.3.0"
+version = "3.4.0"
 source = { editable = "." }
 dependencies = [
     { name = "certifi" },

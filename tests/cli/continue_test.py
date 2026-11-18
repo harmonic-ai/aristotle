@@ -892,10 +892,12 @@ async def test_continue_wait_ends_with_the_property_counts_and_how_to_get_the_fi
 
     assert code == 0
     assert from_id.await_count == 2
-    assert caplog.messages[-3:] == [
+    assert caplog.messages[-5:] == [
         "Properties: 1 proved · 0 refuted · 0 in progress · 1 unresolved",
         "The proof of 1 property no longer checks, so it isn't verified; re-run to re-prove it.",
         DOWNLOAD_HINT,
+        "Open in Aristotle Web: https://aristotle.harmonic.fun/projects/project-123",
+        "See each property with:\n  aristotle properties project-123",
     ]
     assert capsys.readouterr().out == ""
 
@@ -923,7 +925,12 @@ async def test_continue_wait_names_no_download_while_the_task_runs_or_when_there
 
     await _continue_and_wait([], status, has_files=has_files)
 
-    assert caplog.messages[-1] == "Properties: 1 proved · 0 refuted · 0 in progress"
+    assert "Properties: 1 proved · 0 refuted · 0 in progress" in caplog.messages
+    assert not [message for message in caplog.messages if message.startswith("Get the project's files")]
+    # A wait that broke off says how to carry on instead.
+    assert ("Open in Aristotle Web: https://aristotle.harmonic.fun/projects/project-123" in caplog.messages) is (
+        status == TaskStatus.COMPLETE
+    )
 
 
 async def test_continue_wait_json_says_how_to_get_the_files_on_stderr_only(properties, caplog, capsys):

@@ -136,6 +136,11 @@ def _later_event_id(current: str | None, candidate: str) -> str:
         return candidate
 
 
+def _sendable(value: str) -> bool:
+    """Whether ``value`` goes in a request header as it is: printable ASCII without whitespace at either end."""
+    return value.isascii() and value.isprintable() and value == value.strip()
+
+
 class _MalformedKeyError(ValueError):
     """A key get_api_key() found and can't send; the message names where it came from, and never shows it."""
 
@@ -165,6 +170,125 @@ def api_key_problem(api_key: str) -> str | None:
     if not api_key.isprintable():
         return "contains a control character"
     return None
+
+
+# An Aristotle API key, or the start of one.
+_KEY_SHAPE = re.compile(r"\barstl_[A-Za-z0-9_-]+")
+
+
+_ENTITIES = {"&": "amp", "<": "lt", ">": "gt", '"': "quot", "'": "apos"}
+"""The named entities an HTML or XML page writes these characters as."""
+
+
+def _backslashed(char: str) -> str:
+    """A pattern for ``char`` as a bytes repr or a JSON string writes it: a ``\\u`` code, a backslash escape, or as it
+    is, which a backslash never is."""
+    escapes = [rf"\\u{ord(char):04x}"]
+    if char in "\\'\"/":
+        escapes.append(re.escape(f"\\{char}"))
+    written = "" if char == "\\" else f"|{re.escape(char)}"
+    return f"(?:(?i:{'|'.join(escapes)}){written})"
+
+
+def _entity(char: str) -> str:
+    """A pattern for ``char`` as written, or as an HTML or XML page writes it: a character reference or its entity."""
+    code = ord(char)
+    escapes = [f"&#x0*{code:x};", f"&#0*{code};"]
+    if char in _ENTITIES:
+        escapes.append(f"&{_ENTITIES[char]};")
+    return f"(?:(?i:{'|'.join(escapes)})|{re.escape(char)})"
+
+
+def _quoted_twice(char: str) -> str:
+    """A pattern for ``char`` as a repr writes a bytes repr or a JSON string of it, as httpcore's trace of a failure
+    quotes h11's message: a backslash as four, a quote or slash after up to three, anything else as it is."""
+    if char == "\\":
+        return r"\\{4}"
+    if char in "'\"/":
+        return rf"\\{{0,3}}{re.escape(char)}"
+    return re.escape(char)
+
+
+def _cut(text: str, spans: list[tuple[int, int]]) -> str:
+    """``text`` with each stretch ``spans`` cover, however they overlap, shown as [redacted]."""
+    pieces: list[str] = []
+    kept = 0
+    for start, stop in sorted(spans):
+        if start >= kept:
+            pieces += [text[kept:start], "[redacted]"]
+        kept = max(kept, stop)
+    return "".join([*pieces, text[kept:]])
+
+
+def _key_spans(text: str, key: str | None) -> list[tuple[int, int]]:
+    """Where ``text`` holds ``key``, if any, as written or escaped."""
+    spans: list[tuple[int, int]] = []
+    if key:
+        # A pattern per way of escaping, in which a character reads two ways only where a bare & begins an entity.
+        for escaped in (_backslashed, _entity, _quoted_twice):
+            pattern = "".join(escaped(char) for char in key)
+            spans.extend(match.span() for match in re.finditer(pattern, text))
+    return spans
+
+
+def _without_sent(text: str, key: str | None, redact: Callable[[str], str] | None = None) -> str:
+    """``text``, from a server, through ``redact`` first, then with ``key``, the API key a request sent, if any, as
+    written or escaped, and anything shaped like one, shown as [redacted]."""
+    if redact is not None:
+        text = redact(text)
+    return _KEY_SHAPE.sub("[redacted]", _cut(text, _key_spans(text, key)))
+
+
+def _without_key(text: str, request: httpx.Request | None, redact: Callable[[str], str] | None = None) -> str:
+    """_without_sent's ``text`` for the API key ``request`` sent, if any."""
+    return _without_sent(text, None if request is None else request.headers.get("X-API-Key"), redact)
+
+
+_sent: contextvars.ContextVar[tuple[str | None, Callable[[str], str] | None] | None] = contextvars.ContextVar(
+    "sent", default=None
+)
+
+
+@contextlib.contextmanager
+def _sending(key: str | None, redact: Callable[[str], str] | None) -> Generator[None, None, None]:
+    """Have httpx and httpcore log the request this context sends, and its answer, through _without_sent with ``key``
+    and ``redact``."""
+    token = _sent.set((key, redact))
+    try:
+        yield
+    finally:
+        _sent.reset(token)
+
+
+def _hidden(value: object, key: str | None, redact: Callable[[str], str] | None) -> object:
+    """``value``, or what _without_sent makes of its text where that hides something."""
+    text = str(value)
+    shown = _without_sent(text, key, redact)
+    return value if shown == text else shown
+
+
+def _hide_sent(record: logging.LogRecord) -> bool:
+    """httpx's and httpcore's log filter: within _sending, a record's message where it has no arguments, else each of
+    its string arguments, goes through _hidden, so the record keeps its shape and still formats."""
+    if (sent := _sent.get()) is not None:
+        if not record.args:
+            record.msg = _hidden(record.msg, *sent)
+        elif isinstance(record.args, tuple):
+            record.args = tuple(_hidden(arg, *sent) if isinstance(arg, str) else arg for arg in record.args)
+    return True
+
+
+_TRANSPORT_LOGGERS = (
+    "httpx",
+    "httpcore.connection",
+    "httpcore.http11",
+    "httpcore.http2",
+    "httpcore.proxy",
+    "httpcore.socks",
+)
+"""Where httpx logs each request with its answer's status line, and httpcore traces each connection and exchange."""
+for _transport_logger in _TRANSPORT_LOGGERS:
+    logging.getLogger(_transport_logger).addFilter(_hide_sent)
 
 
 def _malformed_key_message(source: str, problem: str) -> str:
@@ -412,10 +536,24 @@ _UNSENT_ERRORS = (
 )
 
 
-def _scrubbed(error: httpx.HTTPError) -> httpx.HTTPError:
-    """``error``, or for a LocalProtocolError, whose text quotes the header value h11 refused, a copy of its class with
-    no text and no request."""
-    return type(error)("") if isinstance(error, httpx.LocalProtocolError) else error
+def _scrubbed(error: httpx.HTTPError, redact: Callable[[str], str] | None = None) -> httpx.HTTPError:
+    """``error``, or a copy of its class: for a LocalProtocolError, whose text quotes the header value h11 refused, with
+    no text and no request; for a status error, whose text quotes the reason phrase, or another transport error, whose
+    text can quote a response line h11 couldn't parse, with its request and response and with its text through
+    _without_key and ``redact``, where that changes it."""
+    if isinstance(error, httpx.LocalProtocolError):
+        return type(error)("")
+    if isinstance(error, httpx.HTTPStatusError):
+        text = _without_key(str(error), error.request, redact)
+        return error if text == str(error) else type(error)(text, request=error.request, response=error.response)
+    if not isinstance(error, httpx.TransportError):
+        return error
+    try:
+        request = error.request
+    except RuntimeError:
+        request = None
+    text = _without_key(str(error), request, redact)
+    return error if text == str(error) else type(error)(text, request=request)
 
 
 # A SOCKS proxy's refusals that a later try may pass, as httpcore words them after "Proxy Server could not connect: ".
@@ -428,6 +566,11 @@ _SOCKS_TRANSIENT_REPLIES = (
 )
 # How _socks_reply_error words a reply socksio couldn't read; a later try may pass.
 _SOCKS_MALFORMED = "The SOCKS proxy sent a reply it couldn't read, or closed the connection"
+
+
+def _proxy_forbidden(error: httpx.HTTPError) -> bool:
+    """Whether a proxy refused the tunnel with a 403, such as ``403 Forbidden``."""
+    return isinstance(error, httpx.ProxyError) and re.fullmatch(r"403(?: [^\r\n]+)?", str(error)) is not None
 
 
 def _proxy_unavailable(error: httpx.HTTPError) -> bool:
@@ -567,11 +710,24 @@ async def _streamed_get(
     """``client.stream("GET", url)``, whose connection must open within CONNECTION_DEADLINE_SECONDS."""
     watch = _ConnectionWatch()
     request = client.build_request("GET", url, headers=headers, extensions={"trace": watch})
-    response = await watch.run(client.send(request, stream=True))
+    with _sending(headers.get("X-API-Key"), None):
+        response = await watch.run(client.send(request, stream=True))
     try:
         yield response
     finally:
         await response.aclose()
+
+
+async def _lines(response: httpx.Response) -> AsyncIterator[str]:
+    """``response.aiter_lines()``, each line read within _sending for the key its request sent."""
+    lines = response.aiter_lines()
+    while True:
+        with _sending(response.request.headers.get("X-API-Key"), None):
+            try:
+                line = await anext(lines)
+            except StopAsyncIteration:
+                return
+        yield line
 
 
 _next_request_at = 0.0
@@ -645,6 +801,14 @@ def _wait_text(seconds: float) -> str:
     if whole < 120:
         return f"{whole} second{'' if whole == 1 else 's'}"
     return f"{math.ceil(whole / 60)} minutes"
+
+
+def _body_text(response: httpx.Response) -> str:
+    """``response.text``, or its bytes read as UTF-8 where the charset it names can't decode them."""
+    try:
+        return response.text
+    except Exception:  # Such as UTF-16's UnicodeError without a byte order mark, or the base64 codec's AssertionError.
+        return response.content.decode("utf-8", "replace")
 
 
 def _json_detail(response: httpx.Response) -> str | None:
@@ -753,7 +917,7 @@ def _log_refusal_response(error: httpx.HTTPStatusError, redact: Callable[[str], 
     if not http_logger.isEnabledFor(logging.DEBUG):
         return
     response = error.response
-    secrets = [error.request.headers.get("X-API-Key", "")]
+    secrets: list[str] = []
     for headers in (error.request.headers, response.headers):
         for name in ("Authorization", "Proxy-Authorization"):
             for authorization in headers.get_list(name):
@@ -783,11 +947,11 @@ def _log_refusal_response(error: httpx.HTTPStatusError, redact: Callable[[str], 
     def safe(text: str, limit: int) -> str:
         if redact is not None:
             text = redact(text)
-        for secret in sorted(set(secrets), key=len, reverse=True):
+        spans = _key_spans(text, error.request.headers.get("X-API-Key"))
+        for secret in set(secrets):
             if secret:
-                text = text.replace(secret, "[redacted]")
-        text = re.sub(r"\barstl_[A-Za-z0-9_-]+", "[redacted]", text)
-        text = printable(" ".join(text.split()))
+                spans.extend(match.span() for match in re.finditer(re.escape(secret), text))
+        text = printable(" ".join(_KEY_SHAPE.sub("[redacted]", _cut(text, spans)).split()))
         return text[:limit] + ("…" if len(text) > limit else "")
 
     http_logger.debug("Response headers (%s %s):", response.status_code, safe(response.reason_phrase, 80))
@@ -795,22 +959,31 @@ def _log_refusal_response(error: httpx.HTTPStatusError, redact: Callable[[str], 
         if re.search(r"authorization|cookie|api[-_]?key|token|secret", name, re.IGNORECASE):
             value = "[redacted]"
         http_logger.debug("%s: %s", safe(name, 80), safe(value, 256))
-    excerpt = response.text
+    excerpt = _body_text(response)
     if "html" in response.headers.get("content-type", "").lower() or excerpt.lstrip().startswith("<"):
         page = _ResponseText()
-        page.feed(excerpt)
+        # HTMLParser before CPython's 2025 fixes raises AssertionError at a malformed declaration, quoting the page.
+        with contextlib.suppress(AssertionError):
+            page.feed(excerpt)
         excerpt = " ".join(page.title or page.text)
     if excerpt:
         http_logger.debug("Response excerpt: %s", safe(excerpt, 160))
 
 
 def _status_error(error: httpx.HTTPStatusError, redact: Callable[[str], str] | None = None) -> AristotleAPIError:
+    return _redacted(_server_status_error(error, redact), lambda text: _without_key(text, error.request, redact))
+
+
+def _server_status_error(error: httpx.HTTPStatusError, redact: Callable[[str], str] | None = None) -> AristotleAPIError:
     """The AristotleAPIError for an error response, with the server's detail and error code; a 429 says which limit was
     hit, a 402 where to buy credits, a detail object's message stands alone, and a 403's verbose report passes through
     ``redact``."""
-    if error.response.status_code == 403:
+    status = error.response.status_code
+    content_type = error.response.headers.get("content-type", "").partition(";")[0].strip().lower()
+    if status == 403 or (
+        status in (404, 409) and (content_type == "text/html" or _body_text(error.response).lstrip().startswith("<"))
+    ):
         _log_refusal_response(error, redact)
-        content_type = error.response.headers.get("content-type", "").partition(";")[0].strip().lower()
         # The API's HTTPException responses have JSON with a detail string, or Auth0's code/message detail object.
         # A proxy can imitate that format; certificate trust alone cannot establish who generated the response.
         detail = None
@@ -824,12 +997,14 @@ def _status_error(error: httpx.HTTPStatusError, redact: Callable[[str], str] | N
                         detail = detail.get("message")
                     elif isinstance(detail, str):
                         object_refusal = _OBJECT_REFUSALS.get(detail)
-            except ValueError:
+            except Exception:  # Such as the RecursionError of JSON nested past the parser's limit.
                 pass
         if not isinstance(detail, str) or not detail.strip():
             status_line = f"{error.response.status_code} {error.response.reason_phrase}".strip()
-            return _IntermediaryError(_refusal_message(status_line, error.request.url), status_code=403)
-        return AristotleAPIError(object_refusal or _ACCOUNT_ACCESS_MESSAGE, status_code=403)
+            status_line = _without_key(status_line, error.request, redact)
+            return _IntermediaryError(_refusal_message(status_line, error.request.url), status_code=status)
+        if status == 403:
+            return AristotleAPIError(object_refusal or _ACCOUNT_ACCESS_MESSAGE, status_code=403)
     # Extract error message from response body if available
     error_message = None
     error_code = None
@@ -928,7 +1103,7 @@ def _foreign_body(response: httpx.Response) -> str | None:
     except ValueError:
         if not response.content:
             return "an empty body"
-        return printable(content_type) if content_type else "an untyped body"
+        return printable(_without_key(content_type, response.request)) if content_type else "an untyped body"
     return None
 
 
@@ -938,12 +1113,12 @@ def _undecoded(response: httpx.Response) -> str:
     if not response.content:
         return "an empty body"
     content_type = response.headers.get("content-type", "").partition(";")[0].strip()
-    return f"{printable(content_type) or 'an untyped body'} that isn't JSON"
+    return f"{printable(_without_key(content_type, response.request)) or 'an untyped body'} that isn't JSON"
 
 
 def _answered(response: httpx.Response) -> str:
     """Where a 2xx answer came from, through which proxy, and its status, as "the answer from <origin> was 200 OK"."""
-    status_line = printable(f"{response.status_code} {response.reason_phrase}".strip())
+    status_line = printable(_without_key(f"{response.status_code} {response.reason_phrase}".strip(), response.request))
     proxy = _configured_proxy(response.request.url)
     via = "" if proxy is None else f" through the proxy {printable(proxy.host)}"
     return f"the answer from {get_web_url()}{via} was {status_line}"
@@ -951,13 +1126,14 @@ def _answered(response: httpx.Response) -> str:
 
 def _foreign_answer_message(response: httpx.Response, body: str) -> str:
     """What a 2xx answer that isn't Aristotle's was: its status and ``body``, which says what it holds, where it came
-    from, and what may have sent it."""
+    from, and what may have sent it; the API key the request sent is hidden."""
     senders = (
         "a captive portal or a proxy"
         if get_web_url() == WEB_URL
         else "a captive portal, a proxy or a wrong ARISTOTLE_WEB_URL"
     )
-    return f"{_answered(response)} with {body}, not Aristotle's: {senders} may have answered instead."
+    message = f"{_answered(response)} with {body}, not Aristotle's: {senders} may have answered instead."
+    return _without_key(message, response.request)
 
 
 def _shape_problem(error: pydantic.ValidationError) -> str:
@@ -973,12 +1149,13 @@ def _shape_problem(error: pydantic.ValidationError) -> str:
 
 def _unreadable_answer_message(response: httpx.Response, problem: str) -> str:
     """What a 2xx answer whose JSON this version can't read was: its status and ``problem``, as _shape_problem says it,
-    where it came from, and what may have sent it."""
+    where it came from, and what may have sent it; the API key the request sent is hidden."""
     senders = "a proxy" if get_web_url() == WEB_URL else "a proxy or a wrong ARISTOTLE_WEB_URL"
-    return (
+    message = (
         f"{_answered(response)} with JSON this version of aristotlelib can't read ({problem}): {senders} may have "
         "answered instead, or a newer aristotlelib may be needed."
     )
+    return _without_key(message, response.request)
 
 
 class _Failure:
@@ -992,7 +1169,8 @@ class _Failure:
         proxy_tls: bool = False,
         redact: Callable[[str], str] | None = None,
     ):
-        self.cause = cause = _scrubbed(cause)
+        # Reported as scrubbed, but classified as raised: a redaction never changes whether it is retried.
+        self.cause = _scrubbed(cause, redact)
         self.request = request
         self.retry_after: float | None = None
         self.key_busy = False
@@ -1000,6 +1178,7 @@ class _Failure:
         # Whether billing refused the run the request would start, before Aristotle acted on it; no retry gets past it.
         self.refused = False
         self.certificate_error: ssl.SSLCertVerificationError | None = None
+        self.proxy_forbidden = _proxy_forbidden(cause)
         # Whether the TLS handshake that failed was with an https:// proxy, for its own certificate, not the server.
         self.proxy_tls = proxy_tls
         if isinstance(cause, (_ForeignAnswer, _UnreadableAnswer)):
@@ -1009,10 +1188,11 @@ class _Failure:
             status = cause.response.status_code
             if isinstance(cause, _ForeignAnswer):
                 self.status_error = AristotleAPIError(_foreign_answer_message(cause.response, str(cause)))
-                self.summary = f"{status} on {request}: {cause}, not Aristotle's answer"
+                summary = f"{status} on {request}: {cause}, not Aristotle's answer"
             else:
                 self.status_error = AristotleAPIError(_unreadable_answer_message(cause.response, str(cause)))
-                self.summary = f"{status} on {request}: JSON this version can't read ({cause})"
+                summary = f"{status} on {request}: JSON this version can't read ({cause})"
+            self.summary = _without_key(summary, cause.request, redact)
         elif isinstance(cause, httpx.HTTPStatusError):
             status = cause.response.status_code
             self.status_error = _status_error(cause, redact)
@@ -1029,7 +1209,9 @@ class _Failure:
             self.unsent = self.key_busy or self.rate_limited or billing_unavailable
             self.transient = self.unsent or status >= 500
             self.maybe_processed = status >= 500 and not billing_unavailable
-            self.summary = f"{status} on {request}" + (f": {detail}" if detail else "")
+            self.summary = f"{status} on {request}"
+            if detail:
+                self.summary += f": {_without_key(detail, cause.request, redact)}"
         else:
             self.unsent = isinstance(cause, _UNSENT_ERRORS)
             self.certificate_error = _certificate_error(cause)
@@ -1037,7 +1219,7 @@ class _Failure:
                 isinstance(cause, _TRANSIENT_ERRORS) or _proxy_unavailable(cause)
             ) and self.certificate_error is None
             self.maybe_processed = not self.unsent
-            self.summary = f"{type(cause).__name__} on {request}" + (f": {cause}" if str(cause) else "")
+            self.summary = f"{type(cause).__name__} on {request}" + (f": {self.cause}" if str(self.cause) else "")
 
     def error(self, attempts: int, seconds: float, idempotent: bool) -> AristotleAPIError:
         """The error to raise: the failure, the request, and the attempts made if more than one."""
@@ -1057,7 +1239,7 @@ class _Failure:
             message = f"{self.request}{after}: {self.status_error}"
             status_code, error_code = self.status_error.status_code, self.status_error.error_code
         else:
-            if isinstance(self.cause, httpx.ProxyError) and re.fullmatch(r"403(?: [^\r\n]+)?", str(self.cause)):
+            if self.proxy_forbidden:
                 message = _refusal_message(str(self.cause), self.cause.request.url, known_proxy=True)
                 # A refused CONNECT sent none of a mutating request; keep that outcome classification.
                 return _IntermediaryError(message) if idempotent else AristotleNotProcessedError(message)
@@ -1264,38 +1446,38 @@ class AristotleRequestClient:
         while True:
             watch = _ConnectionWatch()
             try:
-                response = await watch.run(
-                    self._client.request(
-                        method=method,
-                        url=url,
-                        params=params,
-                        headers=headers,
-                        extensions={"trace": watch},
-                        timeout=httpx.USE_CLIENT_DEFAULT if timeout is None else timeout,
-                        **body,
+                with _sending(headers.get("X-API-Key"), redact):
+                    response = await watch.run(
+                        self._client.request(
+                            method=method,
+                            url=url,
+                            params=params,
+                            headers=headers,
+                            extensions={"trace": watch},
+                            timeout=httpx.USE_CLIENT_DEFAULT if timeout is None else timeout,
+                            **body,
+                        )
                     )
-                )
                 response.raise_for_status()
                 if (foreign := _foreign_body(response)) is not None:
                     raise _ForeignAnswer(foreign, request=response.request, response=response)
             except httpx.HTTPError as e:
-                proxy_tls = watch.tls_host is not None and watch.tls_host != host
-                failure = _Failure(e, request, keyed=idempotency_key is not None, proxy_tls=proxy_tls, redact=redact)
-                if watch.expired:
-                    self._retired.append(self._client)
-                    self._client = new_http_client()
+                # Described after the clause, so nothing raised while describing it chains it, nor the key it quotes.
+                raised: httpx.HTTPError = e
             except socksio.ProtocolError as e:
-                failure = _Failure(_socks_reply_error(e), request, keyed=idempotency_key is not None)
+                raised = _socks_reply_error(e)
             else:
                 try:
                     return read(response)
                 except pydantic.ValidationError as e:
-                    cause: httpx.HTTPStatusError = _UnreadableAnswer(
-                        _shape_problem(e), request=response.request, response=response
-                    )
+                    raised = _UnreadableAnswer(_shape_problem(e), request=response.request, response=response)
                 except _NOT_JSON:
-                    cause = _ForeignAnswer(_undecoded(response), request=response.request, response=response)
-                failure = _Failure(cause, request, keyed=idempotency_key is not None)
+                    raised = _ForeignAnswer(_undecoded(response), request=response.request, response=response)
+            proxy_tls = watch.tls_host is not None and watch.tls_host != host
+            failure = _Failure(raised, request, keyed=idempotency_key is not None, proxy_tls=proxy_tls, redact=redact)
+            if watch.expired:
+                self._retired.append(self._client)
+                self._client = new_http_client()
             self.rate_limit_refusals += failure.rate_limited
             if failure.key_busy:
                 busy = failure
@@ -1327,15 +1509,16 @@ class AristotleRequestClient:
         live: Callable[[], bool] | None = None,
         on_outage: Callable[[Exception | None], None] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
-        """Stream Server-Sent Events; a dropped or silent connection reopens with Last-Event-ID, the newest id seen, and
-        one whose answer isn't typed text/event-stream counts as dropped.
+        """Stream Server-Sent Events; a dropped or silent connection reopens with Last-Event-ID, the newest id seen that
+        _sendable() passes, and one whose answer isn't typed text/event-stream counts as dropped.
 
         A clean end also reconnects while ``reconnect_if()`` is true. Gives up after ``max_retries`` connections in a
         row that received no line, or at once after a refusal whose Retry-After asks for more than
-        STREAM_RECONNECT_MAX_SECONDS: a transport error or retryable status is raised, a clean end returns.
-        ``live()`` says, without a request, whether the run the stream follows was live when last seen. While it is,
-        connections in a row that received no line are retried instead for STREAM_OUTAGE_SECONDS from the first of
-        them that failed, however many that takes; once it isn't, giving up returns rather than raises.
+        STREAM_RECONNECT_MAX_SECONDS: a transport error or retryable status is raised, a clean end returns. A
+        LocalProtocolError, h11 refusing the request, is raised at once, without its text. ``live()`` says, without a
+        request, whether the run the stream follows was live when last seen. While it is, connections in a row that
+        received no line are retried instead for STREAM_OUTAGE_SECONDS from the first of them that failed, however many
+        that takes; once it isn't, giving up returns rather than raises.
         ``on_outage(error)`` is called as the stream begins to ride out such an outage, and ``on_outage(None)`` when a
         line arrives after it. A data line already yielded is not yielded again. Each connection waits for its request
         slot, and a reconnect after a refusal waits at least as long as its Retry-After asks.
@@ -1373,21 +1556,30 @@ class AristotleRequestClient:
                 )
                 async with new_http_client(timeout=timeout) as client:
                     async with _streamed_get(client, url, headers) as response:
+                        if not response.is_success:
+                            # Read the body for the server's detail before an error quoting the status line exists.
+                            with _sending(headers.get("X-API-Key"), None):
+                                await response.aread()
                         try:
                             response.raise_for_status()
                         except httpx.HTTPStatusError as e:
-                            # Read the body for the server's detail.
-                            await response.aread()
+                            # Described after the clause, as a request's failure is.
+                            refused: httpx.HTTPStatusError | None = e
+                        else:
+                            refused = None
+                        if refused is not None:
                             retry_after = _retry_after(response)
-                            raise _status_error(e) from e
+                            raise _status_error(refused) from _scrubbed(refused)
                         media_type = response.headers.get("content-type", "").partition(";")[0].strip()
                         if media_type.lower() != "text/event-stream":
                             # Any other answer fails the connection, as the SSE spec has it.
                             raise httpx.RemoteProtocolError(
-                                _foreign_answer_message(response, printable(media_type) or "no content type"),
+                                _foreign_answer_message(
+                                    response, printable(_without_key(media_type, response.request)) or "no content type"
+                                ),
                                 request=response.request,
                             )
-                        async for line in response.aiter_lines():
+                        async for line in _lines(response):
                             if not received:
                                 outage_since = None
                                 if reported and on_outage is not None:
@@ -1399,7 +1591,8 @@ class AristotleRequestClient:
                                     last_event_id = _later_event_id(last_event_id, event_id)
                                     event_id = None
                             elif line.startswith("id:"):
-                                event_id = line[3:].removeprefix(" ")
+                                if _sendable(candidate := line[3:].removeprefix(" ")):
+                                    event_id = candidate
                             elif line.startswith(data_prefix):
                                 data = line.removeprefix(data_prefix)
                                 if data in yielded:
@@ -1407,21 +1600,23 @@ class AristotleRequestClient:
                                 try:
                                     event = json.loads(data)
                                 except json.JSONDecodeError:
-                                    logger.warning(f"Failed to parse SSE data: {line}")
+                                    logger.warning(_without_key(f"Failed to parse SSE data: {line}", response.request))
                                     continue
                                 yielded.add(data)
                                 yield event
             except httpx.TransportError as e:
-                if isinstance(e, httpx.ProxyError) and re.fullmatch(r"403(?: [^\r\n]+)?", str(e)):
-                    error = _IntermediaryError(_refusal_message(str(e), e.request.url, known_proxy=True))
-                else:
-                    error = _scrubbed(e)
+                error = _scrubbed(e)
+                if _proxy_forbidden(e):
+                    error = _IntermediaryError(_refusal_message(str(error), e.request.url, known_proxy=True))
             except socksio.ProtocolError as e:
                 error = _socks_reply_error(e)
             except AristotleAPIError as e:
                 if e.status_code is None or (e.status_code != 429 and e.status_code < 500):
                     raise
                 error = e
+            if isinstance(error, httpx.LocalProtocolError):
+                # The same request would be refused again.
+                raise error
             if error is None and (reconnect_if is None or not await reconnect_if()):
                 return
 

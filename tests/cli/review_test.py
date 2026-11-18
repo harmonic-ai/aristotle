@@ -1393,7 +1393,7 @@ def test_on_timeouts_help_says_it_cancels_by_default(monkeypatch: pytest.MonkeyP
 
     help_text = " ".join(_action().parser.format_help().split())
 
-    assert "or the job is cancelled (default: cancel)." in help_text
+    assert "--on-timeout {cancel,leave} Cancel or leave a run cut short (default: cancel)." in help_text
 
 
 async def test_a_stopped_run_with_no_properties_prints_its_questions_instead_of_the_warning(

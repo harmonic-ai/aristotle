@@ -4,7 +4,7 @@ The detail behind the [README](../README.md), in the order you meet it:
 
 1. [Logging in](#logging-in)
 2. [What goes up](#what-goes-up)
-3. [Referring to a project](#referring-to-a-project)
+3. [Referring to a project](#referring-to-a-project), and [archiving one](#archiving-a-project)
 4. [Following and waiting](#following-and-waiting)
 5. [Results and artifacts](#results-and-artifacts)
 6. [Questions](#questions)
@@ -12,6 +12,8 @@ The detail behind the [README](../README.md), in the order you meet it:
 8. [Property statuses](#property-statuses)
 9. [Proxies and private networks](#proxies-and-private-networks)
 10. For programs: [JSON output](#json-output), [exit codes](#exit-codes) and [retries](#retries-and-lost-requests)
+
+To check credits before a run: [Checking your balance](#checking-your-balance).
 
 ## Logging in
 
@@ -38,12 +40,38 @@ The README's [Log in](../README.md#log-in) shows the login in the browser. Also:
 | `printf '%s\n' "$KEY" \| aristotle login` | Checks and stores a key from stdin, for scripts. |
 | `aristotle login --api-key <key>` | Checks and stores that key, which shows in the process list and your shell history. |
 | `export ARISTOTLE_API_KEY=<your-key>` | Overrides the stored key, so a logged-in machine still behaves like a build agent. |
-| `aristotle --api-key <your-key> submit "My prompt"` | A key for one command. |
+| `aristotle --api-key <your-key> submit "My prompt"` | A key for one command, in place of `ARISTOTLE_API_KEY` and the stored key. |
+
+## Checking your balance
+
+```bash
+aristotle balance
+aristotle balance --json
+```
+
+The command reads the organization associated with your API key. Log in first, or provide an existing key with
+`ARISTOTLE_API_KEY` or `--api-key`. It does not offer a login, start a run, or start a purchase. Help works offline.
+
+Organization admins see the available balance, free and purchased credits, active-grant amounts, and observation
+and expiry times. Active-grant amounts are the credits originally issued, not an extra available balance.
+Amounts use the billing page's configured Credit unit and precision. The command prints the conversion and
+truncates amounts. Positive amounts below the display precision read `<1`, `<0.1`, or `<0.01`.
+
+Members see an admin restriction and credit status. If an exact balance is unavailable because billing is off or
+the account is not initialized, the command also checks credit status. An unknown balance stays unknown, never
+zero. Status can be available, low, out of credits, disabled, or unavailable. `disabled` means consumption is not
+billed; purchases can still be enabled. Credit status does not guarantee that a run can start.
+
+A balance read or credit status other than unavailable exits 0. Failed reads and unavailable status exit nonzero;
+see [Exit codes](#exit-codes). Errors go to stderr. Failed text output leaves stdout empty. `--json` prints a
+structured result, except that missing or rejected credentials leave stdout empty and exit 5. JSON keeps exact
+small-credit amounts and the returned display configuration. Missing or invalid configuration fails the read.
 
 ## What goes up
 
-Without `--project-dir`, `-f` or `-F`, only the prompt goes up, and `submit` warns. Unless the prompt includes the code
-itself or asks Aristotle to design new hardware, such a run verifies nothing.
+Without `--project-dir`, `-f` or `-F`, only the prompt goes up, and `submit` warns. A `--wait` without `--json` says so
+again in one line when it ends. Unless the prompt includes the code itself or asks Aristotle to design new hardware,
+such a run verifies nothing.
 
 `--project-dir` uploads the folder as one compressed archive of at most 100 MB; over that, `submit` says how large it
 is and exits 2 before uploading. Each file in it keeps its permissions, but not its modification time or the name and
@@ -94,11 +122,11 @@ out stay out. Nothing else of that `aristotle.f` applies: it and the files it na
 files do, so an ignore rule keeps them out without `--include-ignored`, and it goes up as written, in place of the
 project's, even one `submit` generated; `continue` says so when it does. Each file that goes up replaces the project's
 file at the same path, even one Aristotle has edited since, or is added; the project's other files stay, and nothing is
-deleted. `--dry-run` lists the files that would go up and sends nothing. Once the prompt is sent, `continue` says how
-many of them Aristotle applied. This needs a server that takes a folder with a follow-up: an older one starts the task
-without the folder, and `continue` then names the task, with the command that cancels it, and exits 3. `--send-folder`
-takes no `--files`. Without it, `--project-dir` is only the root of `--files`' paths, as above, so `continue` exits 2
-before any request when neither is given.
+deleted. `--dry-run` lists the files that would go up and sends nothing, so it needs no key; with `--json`, it prints
+them as one JSON object. Once the prompt is sent, `continue` says how many of them Aristotle applied. This needs a
+server that takes a folder with a follow-up: an older one starts the task without the folder, and `continue` then names
+the task, with the command that cancels it, and exits 3. `--send-folder` takes no `--files`. Without it, `--project-dir`
+is only the root of `--files`' paths, as above, so `continue` exits 2 before any request when neither is given.
 
 **Long prompts.** `--prompt-file`, on `submit` and `continue`, reads the prompt from a file, for one too long for the
 command line: Linux takes at most 128 KiB in one argument, and fails a longer one before the command starts.
@@ -113,17 +141,34 @@ id, as in `aristotle show "FIFO overflow"` or `aristotle download 2fa30605 --des
 a name shaped like one, is used as an id, with no extra request. Anything else is looked up among your 2,000 most
 recent projects, as an id prefix (case and dashes don't matter) or an exact name, then as the name in another case. If
 several match, the command lists them with their ids and exits 2, doing nothing; if none does, it exits 4. Task ids
-(`--task`, or a task given to `cancel`) are always given in full.
+(`--task`, or a task given to `cancel`) are always given in full. The lookup leaves out
+[archived projects](#archiving-a-project), but for `unarchive`, which looks among them alone.
+
+`submit` names a project after its `--project-dir` folder, else after the top module of a block given with `-f` or
+`-F` (`block` when the filelists name none), else after its prompt; `--name` gives it another.
+
+## Archiving a project
+
+`aristotle archive <project-id>` takes a project out of `aristotle list` and out of name and id prefix lookups, and
+`aristotle list --archived` lists your archived projects. `aristotle unarchive <project-id>` brings one back, as
+sending it a prompt with `continue` does. Other commands take an archived project only by its full id, and its shared
+link keeps working. A project whose run is still going can't be archived: `archive` says so and exits 4, and once the
+run ends, or you stop it with `aristotle cancel`, it can be.
 
 ## Following and waiting
 
 At a terminal, `show` follows a running task until it ends. Piped, as in `show <id> | tail`, it prints the task as it
 stands and says how to wait for it, as `--json` does.
 
-A wait (`submit --wait`, `continue --wait`, or `show` of a running task) ends with how the task ended and, if the
-project has properties, a count such as `Properties: 25 proved · 5 refuted · 0 in progress`. If it breaks off or is
-interrupted, or the task fails, is cancelled or runs out of budget, it prints on stderr the command that carries on the
-same way:
+While a wait (`submit --wait`, `continue --wait`, or `show` of a running task) follows the task, it shows the task's
+status, its project and its newest events. At a terminal it redraws them in place, below what the command printed
+before, and leaves its last frame on screen. Piped, in a CI log or under `TERM=dumb`, it prints them once, then each
+new event and each change of status or property counts as it comes, and the status again after five minutes with
+nothing new. The wait ends with how the task ended and, if the project has properties, a count such as
+`Properties: 25 proved · 5 refuted · 0 in progress`.
+Once it has seen the task end, it then prints the project's link in the web app and, if the task completed and the
+project has properties, the `aristotle properties` command that lists them. If it breaks off or is interrupted, or the
+task fails, is cancelled or runs out of budget, it prints on stderr the command that carries on the same way:
 
 | The wait | Ended | The command it prints |
 |---|---|---|
@@ -191,11 +236,12 @@ Aristotle may ask something part-way through a run, whether or not you wait. It 
 or cancelling a question doesn't stop the run. When it needs an answer, it waits up to 15 minutes, then carries on
 without one, leaving what depends on it unverified.
 
-- Until they're answered, in the CLI or the web app, the progress display ends with
+- Until they're answered, in the CLI or the web app, a progress display that redraws in place at a terminal ends with
   `2 questions pending — answer with: aristotle questions <project-id>`. A new question brings back the whole
   pending set.
 - The CLI prompts only at an interactive terminal. Piped, redirected or in the background, it prints the questions
-  above that line. Without `--wait`, `submit` and `continue` print the `aristotle questions` command.
+  on stderr, followed by that line unless the display redraws in place. Without `--wait`, `submit` and `continue`
+  print the `aristotle questions` command.
 
 | Command | What it does |
 |---|---|
@@ -253,6 +299,8 @@ script needs no `aristotle download`. Any other code is in [the table](#exit-cod
 `aristotle show <project-id> --json` tells what happened, and `show --non-interactive` picks a broken-off wait up again.
 If `submit` fails after printing `Project created:`, the project exists: resume it rather than submit again.
 
+`delete` asks before it deletes, so without a terminal, and with `--json`, it needs `--yes`.
+
 ## Property statuses
 
 The README's [Read the results](../README.md#read-the-results) says what each word `aristotle properties` shows
@@ -281,12 +329,14 @@ contract, inferring missing evidence without creating a message. A kind of evide
   `--status` goes by the reported status, so `--status PROVED` lists unchecked proofs too, though `show` and `--json`
   count them as unchecked. In `--json`, each `properties` and `property` record says so in `unchecked`, and keeps its
   `status` as reported.
+- `--sort updated`, the default, and `--sort created` list the newest first; `--sort name` lists by name.
 - `--created-by you` lists only the properties you asked for, and `--created-by aristotle` those Aristotle proposed.
   `--kind definition` lists the definitions Aristotle wrote as supporting context instead of properties: they're never
   proved or refuted, so it takes no `--status`.
-- `aristotle property` looks among properties and definitions both. A name that matches several lists them, with
-  their kinds and ids, and exits 2: give the full name or the id, or, when a property and a definition share the name,
-  `--kind property` or `--kind definition`.
+- `aristotle property` takes a name or a declaration id, and looks among properties and definitions both. A name
+  `aristotle properties` shortened with `...` can be given as shown, and case and any leading namespace can be left out
+  when that's unambiguous. A name that matches several lists them, with their kinds and ids, and exits 2: give the full
+  name or the id, or, when a property and a definition share the name, `--kind property` or `--kind definition`.
 
 ## Proxies and private networks
 
@@ -314,7 +364,7 @@ refuses a change, such as a `continue` to someone else's project.
 page's title. Trusting the corporate CA lets HTTPS connect, but doesn't override the proxy's access policy. A proxy
 can return JSON too, so the format is a clue to the source, not proof.
 
-Each request's `User-Agent` header names the client, as in `aristotlelib/3.3.0 (cli; python/3.12; linux)`: the SDK's
+Each request's `User-Agent` header names the client, as in `aristotlelib/3.4.0 (cli; python/3.12; linux)`: the SDK's
 version; `cli` for a command, `ci` for `aristotle ci` and `aristotle review`, `action` when the GitHub Action runs
 them, or `library` for a Python program; then the Python version and operating system. Nothing else: no arguments,
 paths, host or user names, or anything about your projects.
@@ -337,6 +387,7 @@ warnings and errors go to stderr.
 | Command | Prints |
 |---------|--------|
 | `list` | `{"projects", "pagination_key"}` |
+| `balance` | `{"status", "unit", "small_credits_per_credit", "decimal_places", "balance", "credit_status", "error"}` |
 | `tasks` | `{"project_id", "tasks", "pagination_key"}` |
 | `show` | `{"project_id", "project", "task", "web_url", "events", "result_path", "property_counts", "requested_counts", "properties"}` |
 | `submit` | `{"project", "task", "web_url", "result_path", "property_counts", "requested_counts", "properties"}` |
@@ -344,6 +395,7 @@ warnings and errors go to stderr.
 | `cancel` | a task |
 | `rename` | a project |
 | `delete` | `{"project_id", "deleted"}` |
+| `archive`, `unarchive` | a project |
 | `download` | `{"project_id", "result_path"}` |
 | `download --artifact` | `{"project_id", "files", "missing"}` |
 | `login` | `{"verification_uri", "user_code", "expires_in"}` while it waits for approval in the browser, then `{"credentials_path", "key_name"}` |
@@ -353,6 +405,15 @@ warnings and errors go to stderr.
 | `questions` | `{"project_id", "task", "questions"}` |
 | `properties` | `{"project_id", "declarations", "pagination_key"}` |
 | `property` | a declaration |
+
+`balance --json` uses `status`: `available`, `restricted`, or `unavailable`. Its `balance` is null unless an admin
+balance was read. Otherwise it contains integer `credits`, `paid_credits`, `free_credits`, and `granted_credits`,
+with `observed_at`, nullable `next_expiry_at`, and the API's resolved `credit_display_config`. The `unit` is
+`small_credits`; divide each amount by `small_credits_per_credit` to obtain Credits. `decimal_places` is the display
+precision. These conversion fields match `credit_display_config` when a balance is read and are null otherwise.
+`credit_status` contains the classification when read, otherwise null. A successful status read after an
+unavailable exact balance can exit 0 with `status` set to `unavailable`. `error` explains restriction or a failed
+read, otherwise it is null. Missing or rejected credentials leave stdout empty, including with `--json`.
 
 | Command | Notes |
 |---|---|
@@ -388,9 +449,9 @@ know is `0`, named `UNKNOWN`. An unknown task status is `UNKNOWN`.
 
 | Record | Fields |
 |---|---|
-| Project | `project_id`, `name` (`Project.description` in Python, as the API calls it), `status` (1 running, 2 idle) and `status_name`, `latest_run_status` (how its latest run stands or ended, named as a task's `status` is; `null` before its first run), `created_at`, `last_updated`, `has_input`, `has_files`. |
+| Project | `project_id`, `name` (`Project.description` in Python, as the API calls it), `status` (1 running, 2 idle) and `status_name`, `latest_run_status` (how its latest run stands or ended, named as a task's `status` is; `null` before its first run), `created_at`, `last_updated`, `has_input`, `has_files`, `archived_at` (when it was archived; `null` unless it's archived). |
 | Task | `agent_task_id`, `project_id`, `status` (`QUEUED`, `IN_PROGRESS`, `COMPLETE`, `COMPLETE_WITH_ERRORS`, `OUT_OF_BUDGET`, `FAILED`, `CANCELED` or `UNKNOWN`), `budget_failure_reason` (why billing stopped an `OUT_OF_BUDGET` run: 1 your organization ran out of credits, 2 Aristotle couldn't read its credits, 3 free credits allow one active project per organization; `null` when billing didn't stop it, and for someone else's shared project) and `budget_failure_reason_name`, `percent_complete` (deprecated: `null` from current servers; each property's `outcome` in `properties` says how the run stands), `description`, `output_summary`, `file_name`, `created_at`, `started_at` (when the run's job started, shortly before the run reports `IN_PROGRESS`; `null` while it is queued, for a run cancelled before it started, and from a server that doesn't send it, though a run that failed before it started may carry one), `last_updated_at`, `read_only` (someone else's shared project). |
-| Event | `event_id`, `agent_task_id`, `event_type` (a number; see `aristotlelib.EventType`) and `event_type_name`, `content`, `explanation`, `file_path`, `suggestions`, `status` (1 complete, 2 sent: a message Aristotle hasn't received yet, or, from an older server, a question awaiting an answer) and `status_name`, `created_at`, `duration_seconds`. A question Aristotle asks has an `AGENT_QUESTION` (`17`) event, complete from the start, whose `content` only says that it asked one: `aristotle questions --json` has the question and its `state`. `EventType.AGENT_FOLLOW_UP` (`18`) carries a post-run message in `content`, such as a bug-fix offer or an invitation to continue after reaching the time limit. It's informational, and doesn't open the question-answer flow: act on it with a new prompt, through `Project.ask()` or `aristotle continue`. |
+| Event | `event_id`, `agent_task_id`, `event_type` (a number; see `aristotlelib.EventType`) and `event_type_name`, `content`, `explanation`, `file_path`, `suggestions`, `status` (1 complete, 2 sent: a message Aristotle hasn't received yet, or, from an older server, a question awaiting an answer) and `status_name`, `created_at`, `duration_seconds`, `declaration_id`, `declaration_status`. A question Aristotle asks has an `AGENT_QUESTION` (`17`) event, complete from the start, whose `content` only says that it asked one: `aristotle questions --json` has the question and its `state`. `EventType.AGENT_FOLLOW_UP` (`18`) carries a post-run message in `content`, such as a bug-fix offer or an invitation to continue after reaching the time limit. It's informational, and doesn't open the question-answer flow: act on it with a new prompt, through `Project.ask()` or `aristotle continue`. `PROPERTY_ADDED` (`19`), `PROPERTY_MODIFIED` (`20`), `PROPERTY_STATUS_CHANGED` (`21`), `PROPERTY_REMOVED` (`22`), `DEFINITION_ADDED` (`23`), `DEFINITION_MODIFIED` (`24`) and `DEFINITION_REMOVED` (`25`) record a change Aristotle made to a property or definition. Their `content` names it and says what changed, such as `` `Spec.noOverflow`: In progress → Proved ``, and `declaration_id` is the one `properties` and `Declaration` list; it's `null` on every other event. A `PROPERTY_STATUS_CHANGED` event's `declaration_status` is the status it moved to, as a declaration's `status` numbers it; it's `null` on every other event. |
 | Question | `question_id`, `event_id`, `project_id`, `agent_task_id` (the task), `content`, `suggestions`, `response`, `state` (`PENDING` while it awaits an answer, `ANSWERED`, `IGNORED` when it closed without one, or, in `questions`, `UNANSWERED` when its run ended first, as the table shows it), `created_at`, `updated_at`, `blocking_since`, `ever_awaited`, `answered_at`, `ignored_at`. |
 | Declaration | `declaration_id`, `project_id`, `declaration_type` (1 property, 2 definition) and `declaration_type_name`, `name`, `status` (0 unknown, 1 in progress, 2 refuted, 3 proved, 4 removed, 6 failed) and `status_name`, `failure_reason` (1 out of budget, 2 system error, 3 the proof no longer checks, 4 the run finished without a verdict on it, 5 the run was cancelled) and `failure_reason_name`, `evidence` (0 unknown, 1 `COUNTEREXAMPLE`, 2 `NEGATION_PROVED`, 3 `BOTH`; required for `REFUTED`, otherwise nullable), `evidence_message` (the agent's explanation, preserved as received; it may contain inline Markdown), `source` (1 Aristotle, 2 you) and `source_name`, `filename`, `source_file`, `source_line`, `source_anchor`, `lean_code`, `description`, `artifact_paths` (the paths in the project of the files Aristotle linked to it, such as a counterexample's trace, as `download --artifact` takes them; empty when there are none), `created_at`, `last_updated`. |
 
@@ -405,10 +466,10 @@ Every command exits with one of these codes, so a script can tell a failed run f
 | Code | Meaning |
 |------|---------|
 | 0 | Success. |
-| 1 | The task a wait followed (`submit --wait`, `continue --wait`, `show --wait`, a `--non-interactive` run, or a plain `show` at a terminal) finished without completing the request (`COMPLETE_WITH_ERRORS` or `OUT_OF_BUDGET`). Or the verdicts failed the build: `aristotle ci`'s on its manifest's properties, or `aristotle review`'s when `--fail-on` is `failure` or `no-verdict` ([What your team sees](aristotle-in-ci.md#what-your-team-sees)), a run Aristotle stopped for decisions only you can make included. Or `aristotle ci setup` found no proposed properties to write. |
+| 1 | The task a wait followed (`submit --wait`, `continue --wait`, `show --wait`, a `--non-interactive` run, or a plain `show` at a terminal) finished without completing the request: `OUT_OF_BUDGET`, or `COMPLETE_WITH_ERRORS`, which `--json` gives by name and text output shows as `REVIEW SUGGESTED`, as the web app does. Or the verdicts failed the build: `aristotle ci`'s on its manifest's properties, or `aristotle review`'s when `--fail-on` is `failure` or `no-verdict` ([What your team sees](aristotle-in-ci.md#what-your-team-sees)), a run Aristotle stopped for decisions only you can make included. Or `aristotle ci setup` found no proposed properties to write. |
 | 2 | Usage error: a missing or invalid argument, input Aristotle can't take, a project name or id prefix that matches more than one project, or an `aristotle ci --project` run that isn't of this checkout. |
 | 3 | The command couldn't complete: a server or network error outlasted the retries; a task you waited on failed or was cancelled; a wait ended with the task still running; an `aristotle ci` or `aristotle review` run's time budget cut it, whatever `--fail-on` is; an `aristotle ci` run, or an `aristotle review` run when `--fail-on` is `failure` or `no-verdict`, ran out of budget, or billing stopped it, before Aristotle checked its results; a `continue --send-folder` prompt started a task without the folder, on a server that doesn't take one with a follow-up, which `continue` names with the command that cancels it; `aristotle login` checked a key but couldn't store it, or `aristotle logout` couldn't remove the stored one; a key a browser login handed out can't be sent; or an unexpected error. |
-| 4 | The project, task, property or question doesn't exist or your key can't see it, no project has that name or id prefix, or Aristotle refused the action: cancelling a finished task (one already cancelled counts as cancelled), or `questions --answer` for a closed question, an ended run or someone else's project, or `delete` of a project whose run is still going. Also `download` of a project with no files yet, or of an `--artifact` it has no file at. |
+| 4 | The project, task, property or question doesn't exist or your key can't see it, no project has that name or id prefix, or Aristotle refused the action: cancelling a finished task (one already cancelled counts as cancelled), or `questions --answer` for a closed question, an ended run or someone else's project, or `delete` or `archive` of a project whose run is still going. Also `download` of a project with no files yet, or of an `--artifact` it has no file at. |
 | 5 | No API key was found, Aristotle rejected it, it can't be sent (whitespace around a key is ignored, and what's left is empty or holds a space, a control character or a non-ASCII character), or `aristotle login` was denied in the browser or its code expired. |
 | 6 | Aristotle is rate limiting your account: too many runs in progress or waiting to start, or too many requests at once, even after the retries. The message says which, with Aristotle's limits when it gives them. Retry later; for runs, wait for one of yours to finish, or cancel one. Or an organization doesn't have the credits to start a run: the message names the page to buy them on and, when Aristotle says which, the organization that needs them. Once they're bought, run it again. Also an `aristotle ci` or `aristotle review` run still queued when its time budget ran out. |
 | 7 | The request may have gone through: its response was lost after Aristotle may have acted on it, so it wasn't sent again, or an earlier copy was still in progress when the retries ran out. Check before sending it again ([Retries and lost requests](#retries-and-lost-requests)). |
@@ -429,7 +490,7 @@ terminal.
 | Too many requests at once (any 429 but the one for too many runs in progress), a server error, a proxy's 5xx or SOCKS failure, a dropped connection, a timeout, which includes a connection that isn't open within 25 seconds, as through a proxy that stops answering its handshake or tunnel request, or an answer that isn't Aristotle's, such as a captive portal's or a proxy's page: text, or no content type, that isn't JSON, any other content that isn't JSON where Aristotle answers with JSON, or JSON in a shape this version can't read | Retries, waiting at least as long as `Retry-After` asks, and starts no retry more than 90 seconds after the first attempt, so a request gives up within about two minutes. |
 | The reply to an upload | Waits 30 seconds plus the upload's size at 16 KB/s, up to 10 minutes, since its last bytes can still be on their way to Aristotle once written. |
 | A server certificate this machine doesn't trust | Doesn't retry. |
-| An outage while a wait (`--wait`, `--non-interactive`, `show`) follows a live run | Rides it out for up to 10 minutes, reconnecting every 30 seconds at most, then stops, saying why, while the run goes on. It says once that the connection failed and once that it's back, and the progress display shows the outage. |
+| An outage while a wait (`--wait`, `--non-interactive`, `show`) follows a live run | Rides it out for up to 10 minutes, reconnecting every 30 seconds at most, then stops, saying why, while the run goes on. It says once that the connection failed and once that it's back. |
 
 Each process starts at most five requests a second, which keeps a script polling through the SDK under Aristotle's
 per-second limit. That limit counts every request from your account, so commands run side by side can still exceed

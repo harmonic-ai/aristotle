@@ -55,7 +55,7 @@ class QuestionsAction(APIAction):
         self.parser.add_argument(
             "project_id",
             type=str,
-            help=f"The project whose questions to show: {PROJECT_REFERENCE_HELP}",
+            help=f"The project: {PROJECT_REFERENCE_HELP}",
         )
         self.parser.add_argument(
             "--task",
@@ -66,17 +66,14 @@ class QuestionsAction(APIAction):
         self.parser.add_argument(
             "--json",
             action="store_true",
-            help='Print {"project_id", "task", "questions"} as JSON instead of a table, and never prompt',
+            help="Print the questions as JSON, and never prompt.",
         )
         self.parser.add_argument(
             "--answer",
             action="append",
             type=answer_argument,
             metavar="QUESTION_ID=ANSWER",
-            help=(
-                "Answer a pending question without prompting; repeat it to answer several. The ids are in the "
-                "--json output. Nothing is sent unless every id names a question that is still open."
-            ),
+            help="Answer a pending question; repeatable.",
         )
 
     def preflight(self, args: argparse.Namespace) -> int | None:

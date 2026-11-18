@@ -350,7 +350,7 @@ async def test_a_setup_run_that_ends_incomplete_says_it_proposed_the_properties(
     ],
     ids=["nothing", "a definition", "a withdrawn property"],
 )
-async def test_a_setup_run_that_ends_incomplete_with_no_property_says_it_did_not_complete(
+async def test_a_setup_run_that_ends_incomplete_with_no_property_says_it_finished_and_writes_nothing(
     repo: Path, declarations, caplog
 ):
     with caplog.at_level(logging.INFO, logger="aristotle"):
@@ -436,7 +436,7 @@ async def test_ctrl_c_during_the_wait_gives_the_cancel_hint_once(
     with (
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(side_effect=KeyboardInterrupt)),
         patch.object(AgentTask, "refresh", refresh),
-        patch("aristotlelib.progress_utils.print_progress_lines"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw"),
         caplog.at_level(logging.INFO, logger="aristotle"),
         pytest.raises(KeyboardInterrupt),
     ):
@@ -540,9 +540,37 @@ async def test_a_manifest_written_in_a_subfolder_says_what_ci_needs_to_read_it(r
     assert f"{CI_HINT}\n  aristotle ci --directory hw" in caplog.text
 
 
-async def test_from_below_a_subprojects_manifest_setup_refuses_to_hide_it(repo: Path, monkeypatch, caplog):
+def _link(path: Path, target: Path, folder: bool = False) -> None:
+    """A symbolic link at ``path`` to ``target``, or the test skipped where the system won't make one."""
+    try:
+        path.symlink_to(target, target_is_directory=folder)
+    except (OSError, NotImplementedError):
+        pytest.skip("needs the right to make symbolic links")
+
+
+SUBPROJECT_MANIFESTS = [
+    pytest.param("a file", id="a file"),
+    pytest.param("a broken link", id="a broken link, which `aristotle ci` run here finds and stops at"),
+    pytest.param("a link to a folder", id="a link to a folder, which `aristotle ci` run here finds and stops at"),
+]
+"""What ``hw/aristotle.toml`` can be, for _subprojects_manifest()."""
+
+
+def _subprojects_manifest(repo: Path, kind: str) -> None:
+    """``hw/aristotle.toml`` in ``repo``, as ``kind`` of SUBPROJECT_MANIFESTS says."""
+    if kind == "a file":
+        (repo / "hw" / "aristotle.toml").write_text("# hw\n")
+    elif kind == "a broken link":
+        _link(repo / "hw" / "aristotle.toml", Path("..", "common", "aristotle.toml"))
+    else:
+        (repo / "hw" / "cfg").mkdir()
+        _link(repo / "hw" / "aristotle.toml", Path("cfg"), folder=True)
+
+
+@pytest.mark.parametrize("kind", SUBPROJECT_MANIFESTS)
+async def test_from_below_a_subprojects_manifest_setup_refuses_to_hide_it(repo: Path, monkeypatch, caplog, kind: str):
     _subfolders(repo, "hw/rtl")
-    (repo / "hw" / "aristotle.toml").write_text("# hw\n")
+    _subprojects_manifest(repo, kind)
     monkeypatch.chdir(repo / "hw" / "rtl")
 
     code, create = await _setup([], [])
@@ -550,15 +578,17 @@ async def test_from_below_a_subprojects_manifest_setup_refuses_to_hide_it(repo: 
     assert code == EXIT_USAGE_ERROR
     assert create is None
     assert not (repo / "hw" / "rtl" / "aristotle.toml").exists()
+    reads = "reads" if kind == "a file" else "finds"
     assert (
-        f"{repo / 'hw' / 'aristotle.toml'} already exists, and `aristotle ci` run here reads it. Pass --force to "
+        f"{repo / 'hw' / 'aristotle.toml'} already exists, and `aristotle ci` run here {reads} it. Pass --force to "
         "replace it, or --directory . to set up this folder on its own."
     ) in caplog.text
 
 
-async def test_force_from_below_a_subprojects_manifest_replaces_that_one(repo: Path, monkeypatch, caplog):
+@pytest.mark.parametrize("kind", SUBPROJECT_MANIFESTS)
+async def test_force_from_below_a_subprojects_manifest_replaces_that_one(repo: Path, monkeypatch, caplog, kind: str):
     _subfolders(repo, "hw/rtl")
-    (repo / "hw" / "aristotle.toml").write_text("# hw\n")
+    _subprojects_manifest(repo, kind)
     monkeypatch.chdir(repo / "hw" / "rtl")
 
     with caplog.at_level(logging.INFO, logger="aristotle"):
@@ -566,13 +596,29 @@ async def test_force_from_below_a_subprojects_manifest_replaces_that_one(repo: P
 
     assert code == EXIT_SUCCESS
     assert [p.id for p in manifest.load(repo / "hw" / "aristotle.toml").properties] == ["p"]
+    assert not (repo / "hw" / "aristotle.toml").is_symlink()
+    assert not (repo / "common").exists() and not (repo / "hw" / "cfg" / "aristotle.toml").exists()
     assert not (repo / "hw" / "rtl" / "aristotle.toml").exists()
     assert f"{CI_HINT}\n  aristotle ci --directory hw" in caplog.text
+    reads = "reads" if kind == "a file" else "finds"
     assert (
-        f"Setting up {repo / 'hw'}, whose aristotle.toml `aristotle ci` run here reads, and replacing it. Pass "
+        f"Setting up {repo / 'hw'}, whose aristotle.toml `aristotle ci` run here {reads}, and replacing it. Pass "
         "--directory . to set up this folder on its own."
     ) in caplog.messages
     assert "aristotle ci --dry-run --directory .." in caplog.text
+
+
+async def test_a_folder_named_like_the_manifest_at_the_top_is_passed_over_as_ci_passes_over_it(
+    repo: Path, monkeypatch, caplog
+):
+    _subfolders(repo, "hw/rtl")
+    (repo / "aristotle.toml").mkdir()
+    monkeypatch.chdir(repo / "hw" / "rtl")
+
+    code, _ = await _setup([], [_proposal("p", "It holds.", 1)])
+
+    assert code == EXIT_SUCCESS
+    assert (repo / "hw" / "rtl" / "aristotle.toml").is_file()
 
 
 async def test_force_says_nothing_of_replacing_when_a_later_check_refuses(repo: Path, monkeypatch, caplog):
@@ -1914,14 +1960,21 @@ async def test_a_path_that_cannot_be_written_or_entered_is_refused_before_the_ru
     assert expected in caplog.text
 
 
-async def test_a_manifest_path_that_is_a_directory_is_refused_even_with_force(repo: Path, caplog):
-    (repo / "ci").mkdir()
+@pytest.mark.parametrize("linked", [False, True], ids=["a folder", "a link to a folder"])
+async def test_a_manifest_path_that_is_a_directory_is_refused_even_with_force(repo: Path, caplog, linked: bool):
+    """--manifest names it, so even a link to one is a folder named in place of a file, not one to replace."""
+    if linked:
+        (repo / "shared" / "cfg").mkdir(parents=True)
+        _link(repo / "ci", Path("shared", "cfg"), folder=True)
+    else:
+        (repo / "ci").mkdir()
 
     code, create = await _setup(["--manifest", "ci", "--force"], [])
 
     assert code == EXIT_USAGE_ERROR
     assert create is None
     assert "ci is a directory" in caplog.text
+    assert (repo / "ci").is_symlink() is linked
 
 
 async def test_the_next_steps_are_shell_quoted(repo: Path, caplog):

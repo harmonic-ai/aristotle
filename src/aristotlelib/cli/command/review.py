@@ -29,7 +29,6 @@ class ReviewAction(VerifyAction):
     """Verify the files in scope with the properties Aristotle proposes; advisory unless --fail-on says otherwise."""
 
     default_fail_on = results.FailOn.NEVER
-    name_example = "rtl/hw: review changed @ main 1a2b3c4"
 
     @property
     def command_name(self) -> str:
@@ -49,35 +48,26 @@ class ReviewAction(VerifyAction):
             type=env_type("ARISTOTLE_SCOPE", scope.Scope, list(scope.Scope)),
             metavar="{" + ",".join(map(str, scope.Scope)) + "}",
             default=env_default("ARISTOTLE_SCOPE", scope.Scope.CHANGED.value),
-            help=(
-                "Which files to verify (default: changed). 'changed' takes the source files changed since --base-ref "
-                "or the base the CI system reports: a pull request's target; on GitLab, the default branch, for a "
-                "pipeline on another branch; or, on GitHub and on GitLab's default branch, the commit before a push. "
-                "Elsewhere it takes those changed by the last commit; the log says which. 'paths' takes the files "
-                "--path matches, and 'all' every source file."
-            ),
+            help="Which files to verify (default: changed).",
         )
         self.parser.add_argument(
             "--path",
             dest="paths",
             action=AppendOverEnv,
             default=env_paths("ARISTOTLE_PATHS"),
-            help=(
-                "Glob of files to verify. Repeatable. With --scope changed, the default, only the changed files it "
-                "matches are verified; with --scope paths, which requires it, every file it matches is."
-            ),
+            help="A glob limiting the files to verify; repeatable.",
         )
         self.parser.add_argument(
             "--base-ref",
             type=str,
             default=os.environ.get("ARISTOTLE_BASE_REF"),
-            help="Branch this change is proposed against, as `main` or `origin/main`. Detected from the CI environment by default.",
+            help="The branch this change is proposed against.",
         )
         self.parser.add_argument(
             "--instructions",
             type=str,
             default=os.environ.get("ARISTOTLE_INSTRUCTIONS"),
-            help="Extra instructions appended to the verification prompt.",
+            help="Extra instructions for the verification prompt.",
         )
 
     def preflight(self, args: argparse.Namespace) -> int | None:

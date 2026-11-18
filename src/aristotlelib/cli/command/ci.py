@@ -4,16 +4,19 @@ import argparse
 import asyncio
 import contextlib
 import dataclasses
+import functools
 import logging
 import math
 import os
 import posixpath
 import signal
+import stat
+import sys
 import tempfile
 import time
 from abc import abstractmethod
 from collections.abc import Callable, Generator, Iterable, Sequence
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePath, PurePosixPath
 from typing import TypeVar
 
 from aristotlelib import local_file_utils
@@ -22,7 +25,7 @@ from aristotlelib.api_request import AristotleAPIError, set_surface
 from aristotlelib.ci import console, context, github, junit, manifest, naming, results, runner, scope
 from aristotlelib.ci.record import RunRecord
 from aristotlelib.cli import ci_setup
-from aristotlelib.cli.api_action import PROJECT_REFERENCE_HELP, APIAction, project_from_reference
+from aristotlelib.cli.api_action import CI_GUIDE_URL, APIAction, project_from_reference
 from aristotlelib.declaration import DeclarationFailureReason, DeclarationStatus
 from aristotlelib.exit_codes import (
     EXIT_INFRASTRUCTURE_ERROR,
@@ -252,11 +255,10 @@ REVIEW_VARIABLES = ("ARISTOTLE_SCOPE", "ARISTOTLE_PATHS", "ARISTOTLE_BASE_REF", 
 class VerifyAction(APIAction):
     """Submit the checkout for verification, wait for the verdict, and report each property as a test."""
 
+    docs_url = CI_GUIDE_URL
     default_fail_on = results.FailOn.FAILURE
     timeout_default_help = str(DEFAULT_TIMEOUT_MINUTES)
-    on_timeout_default_help = "cancel"
-    local_root_help = "the repository's top level"
-    name_example = "rtl/hw: ci @ main 1a2b3c4"
+    on_timeout_help = "Cancel or leave a run cut short (default: cancel)."
     _allowed: tuple[AllowedFolder, ...] = ()
     """The folders --allow-untracked names, as preflight reads them."""
 
@@ -282,10 +284,7 @@ class VerifyAction(APIAction):
             type=env_type("ARISTOTLE_TIMEOUT", _positive_minutes),
             # None when unset, so that a default from elsewhere can apply.
             default=os.environ.get("ARISTOTLE_TIMEOUT") or None,
-            help=(
-                "Wall-clock budget in minutes for the whole command, waiting for a free slot included, at most "
-                f"{MAX_TIMEOUT_MINUTES} (default: {self.timeout_default_help})."
-            ),
+            help=f"Time budget in minutes (default: {self.timeout_default_help}).",
         )
         self.parser.add_argument(
             "--on-timeout",
@@ -293,10 +292,7 @@ class VerifyAction(APIAction):
             type=env_type("ARISTOTLE_ON_TIMEOUT", str, ["cancel", "leave"]),
             metavar="{cancel,leave}",
             default=env_default("ARISTOTLE_ON_TIMEOUT", "cancel"),
-            help=(
-                "Whether to cancel the run when the budget is exhausted or the job is cancelled "
-                f"(default: {self.on_timeout_default_help})."
-            ),
+            help=self.on_timeout_help,
         )
         self.parser.add_argument(
             "--fail-on",
@@ -304,19 +300,14 @@ class VerifyAction(APIAction):
             type=env_type("ARISTOTLE_FAIL_ON", results.FailOn, list(results.FailOn), results.FAIL_ON_ALIASES),
             metavar="{" + ",".join(map(str, results.FailOn)) + "}",
             default=env_default("ARISTOTLE_FAIL_ON", self.default_fail_on.value),
-            help=(
-                f"Which results fail the build (default: {self.default_fail_on}). 'never' exits 0 once a run "
-                "finishes, even if the run failed; it still fails when no run can be started or followed. 'no-verdict' "
-                "also fails it on any property without a verdict: in progress, unresolved, unchecked or not "
-                "registered. 'unresolved', its old name, still works."
-            ),
+            help=f"Which results fail the build (default: {self.default_fail_on}).",
         )
         self.parser.add_argument(
             "--junit",
             action=Noted,
             type=Path,
             default=env_default("ARISTOTLE_JUNIT", DEFAULT_JUNIT_PATH),
-            help=f"Where to write the JUnit report (default: {DEFAULT_JUNIT_PATH}).",
+            help="Where to write the JUnit report.",
         )
         self.parser.add_argument(
             "--no-junit",
@@ -330,10 +321,7 @@ class VerifyAction(APIAction):
             "--directory",
             type=Path,
             default=_env_path("ARISTOTLE_DIRECTORY"),
-            help=(
-                "The repository, or the subproject in it, to check (default: the checkout the CI system reports; "
-                f"outside CI, {self.local_root_help})."
-            ),
+            help="The repository, or the subproject in it, to check.",
         )
         self.parser.add_argument(
             "--allow-untracked",
@@ -341,26 +329,14 @@ class VerifyAction(APIAction):
             type=_folder_argument,
             default=[],
             metavar="FOLDER",
-            help=(
-                "Let a file the root aristotle.f reaches go up from FOLDER though git doesn't track it in the folder "
-                "the step uploads, such as a generated source, or a file in a shared folder outside it. Repeatable. A "
-                "relative FOLDER is from the current directory. FOLDER can't be a network path, be reached through a "
-                "link, or be or hold the folder the step uploads, the CI system's folder of the job's credential "
-                "files, the home folder or a temporary folder. Only the command line gives it, never a file in the "
-                "repository. A file in a .git folder, named like a credential, or in /proc, /sys or /dev outside the "
-                "folder still stops the step, as does one a link leads out of every FOLDER."
-            ),
+            help="Let aristotle.f reach untracked files in FOLDER.",
         )
         self.parser.add_argument(
             "--name",
             action=Noted,
             type=env_type("ARISTOTLE_NAME", validate_project_name),
             default=os.environ.get("ARISTOTLE_NAME") or None,
-            help=(
-                "Name for the project the run creates, shown by `aristotle list` and the web app (default: the "
-                "repository and the directory in it, what the run checks, and the branch and commit, as "
-                f"'{self.name_example}')."
-            ),
+            help="Name for the project the run creates.",
         )
         self.parser.add_argument(
             "--dry-run",
@@ -368,7 +344,7 @@ class VerifyAction(APIAction):
             nargs=0,
             const=True,
             default=False,
-            help="Resolve and print what would be verified, then exit without submitting.",
+            help="Print what would be verified, and submit nothing.",
         )
 
     def _read_allowed(self, root: Path, args: argparse.Namespace) -> int | None:
@@ -772,8 +748,8 @@ class VerifyAction(APIAction):
             logger.warning(_not_registered_warning(run_results))
         if registered_none:
             access = await _language_access(root, scope_result, checked)
-            off, unknown = _language_causes(access)
-            causes = f" {_causes_sentence(off + unknown)}" if off or unknown else ""
+            off = _language_causes(access)
+            causes = f" {_causes_sentence(off)}" if off else ""
             logger.warning(
                 f"The run registered no properties, so nothing was verified.{causes} --fail-on no-verdict fails a "
                 f"run with no properties. {_summary_pointer(run_results)} {project.web_url()}"
@@ -844,12 +820,9 @@ class VerifyAction(APIAction):
 class CIAction(VerifyAction):
     """Check the properties in the manifest and report each as a test."""
 
-    timeout_default_help = f"check.max_wall_time_seconds from the manifest, else {DEFAULT_TIMEOUT_MINUTES}"
-    on_timeout_default_help = "cancel, or leave with --project"
-    local_root_help = (
-        f"the nearest folder up to the repository's top level that holds {manifest.MANIFEST_NAME}, else the top level; "
-        "with --manifest, the top level"
-    )
+    timeout_default_help = f"manifest, else {DEFAULT_TIMEOUT_MINUTES}"
+    # --project leaves the run going by default, so the help names no default.
+    on_timeout_help = "Cancel or leave a run cut short."
     _build: context.CIContext
     _root: Path
     _manifest_path: Path
@@ -876,21 +849,14 @@ class CIAction(VerifyAction):
             "--manifest",
             type=Path,
             default=_env_path("ARISTOTLE_MANIFEST"),
-            help=f"The manifest of properties to check (default: {manifest.MANIFEST_NAME} in --directory).",
+            help=f"The manifest to check (default: {manifest.MANIFEST_NAME}).",
         )
         self.parser.add_argument(
             "--project",
             action=Noted,
             metavar="PROJECT",
             default=os.environ.get("ARISTOTLE_PROJECT") or None,
-            help=(
-                "Report on a run already started instead of starting one, such as a run left going with "
-                f"--on-timeout leave: {PROJECT_REFERENCE_HELP}. It uploads nothing, waits for the run within the "
-                "time budget, and reports the manifest's properties as a new run would. It exits 2 first unless "
-                "`aristotle ci` started the project's only run on the files this checkout would upload, and the same "
-                "properties. When the budget runs out or the command is stopped, it leaves the run going unless "
-                "--on-timeout cancel is given."
-            ),
+            help="Report on a run already started instead of a new one.",
         )
         # Caught here, so that argparse doesn't read the option's value as a command or report it as unrecognized.
         self.parser.add_argument(
@@ -934,6 +900,9 @@ class CIAction(VerifyAction):
             )
 
         path = self._manifest_path = args.manifest or self._root / manifest.MANIFEST_NAME
+        if problem := _manifest_problem(path, self._root, self._build, args.directory):
+            logger.error(problem)
+            return EXIT_USAGE_ERROR
         try:
             self._manifest = manifest.load(path)
         except FileNotFoundError:
@@ -1379,6 +1348,301 @@ def _checkout_link(current: str, directory: Path) -> str | None:
     return None
 
 
+class _Checkout:
+    """The folders a manifest link may lead into: ``root`` and those of _checkout_folders(), found when first asked
+    about, as that runs git, but the file system's root, which never counts, as for the JUnit report."""
+
+    def __init__(self, root: Path, build: context.CIContext, directory: Path | None) -> None:
+        self._root, self._build, self._directory = root, build, directory
+
+    @functools.cached_property
+    def _folders(self) -> list[Path]:
+        folders = [self._root, *_checkout_folders(self._build, self._directory)]
+        return [folder for folder in folders if os.path.dirname(real := os.path.realpath(folder)) != real]
+
+    @functools.cached_property
+    def _spellings(self) -> list[str]:
+        """Each folder's path as given, such as the CI system names its workspace, as resolved, and on Windows as the
+        walk spells it through the machine's links."""
+        spellings = [os.path.abspath(folder) for folder in self._folders]
+        spellings += [os.path.realpath(folder) for folder in self._folders]
+        if os.name == "nt":
+            # realpath() spells a folder as the disk does, where a junction's target can name it in another case. A
+            # spelling that isn't the folder itself, should the walk part from Windows somewhere, is dropped.
+            for folder in self._folders:
+                walked = _as_walked(os.path.abspath(folder))
+                if (identity := _identity(walked)) is not None and identity == _identity(str(folder)):
+                    spellings.append(walked)
+        return [_by_name(spelled) for spelled in spellings]
+
+    def holds(self, path: str) -> bool:
+        """Whether ``path`` is in one of the folders, by name or by identity."""
+        return any(_holds(str(folder), Path(path)) for folder in self._folders)
+
+    def contains(self, path: str) -> bool:
+        """Whether ``path``, named with no link on the way, is in one of the folders, by name alone."""
+        named = _by_name(path)
+        return any(_is_within(named, spelled) for spelled in self._spellings)
+
+    def above(self, path: str) -> bool:
+        """Whether ``path``, named with no link on the way, is above one of the folders, by name alone, so that looking
+        it up says nothing of what is outside them."""
+        named = _by_name(path)
+        return any(_is_within(spelled, named) for spelled in self._spellings)
+
+
+def _by_name(path: str) -> str:
+    """``path`` as _Checkout compares it by name: on Windows, only its drive's case folds, as a folder there can be
+    case-sensitive, as WSL makes its own, where a name in another case is another folder."""
+    if os.name != "nt":
+        return path
+    drive, rest = os.path.splitdrive(path.replace("/", "\\"))
+    return drive.upper() + rest
+
+
+def _as_walked(path: str) -> str:
+    """``path``, a full one, as _manifest_problem() spells it on Windows, each link on the way taken as its target
+    names it; as given where a name on the way can't be looked up."""
+    folder, names = _anchored(Path(path))
+    followed = 0
+    while names:
+        name = names.pop(0)
+        if name == os.pardir:
+            folder = _parent(folder)
+            continue
+        candidate = os.path.join(folder, name)
+        try:
+            linked = local_file_utils.is_link(os.lstat(candidate))
+        except OSError:
+            return path
+        if not linked:
+            folder = candidate
+            continue
+        followed += 1
+        if followed > local_file_utils.MAX_LINKS:
+            return path
+        anchor, parts = _anchored(Path(os.path.normpath(local_file_utils.link_target(candidate))))
+        folder = (_volume_root(candidate) if _rooted(anchor) else anchor) or folder
+        names[:0] = parts
+    return folder
+
+
+def _parent(folder: str) -> str:
+    """The folder a link's .. leads to from ``folder``: on Windows, which takes it from the folder on the volume,
+    past the root of a drive that stands for a folder, as a subst drive does, to that folder's parent."""
+    parent = os.path.dirname(folder)
+    if parent == folder and os.name == "nt":
+        parent = os.path.dirname(os.path.realpath(folder))
+    return parent
+
+
+def _anchored(path: PurePath) -> tuple[str, list[str]]:
+    """``path``'s anchor, as Python 3.12 takes a \\\\?\\ path's, and the names after it: before 3.12, pathlib makes
+    names after a bare \\\\?\\ of a volume's ``Volume{...}``, or of a share's server and share after a ``UNC`` in
+    other than upper case, which joined back would be no path."""
+    anchor = path.anchor
+    names = list(path.parts[1:] if anchor else path.parts)
+    if anchor == "\\\\?\\" and names:
+        # A share's root holds its server and share too, as \\?\UNC\server\share\ does, in any case.
+        size = 3 if names[0].upper() == "UNC" and len(names) >= 3 else 1
+        anchor, names = anchor + "".join(f"{name}\\" for name in names[:size]), names[size:]
+    return anchor, names
+
+
+def _rooted(anchor: str) -> bool:
+    """Whether a target's ``anchor`` is, on Windows, a root with no drive, as ``\\x``'s."""
+    return os.name == "nt" and anchor == "\\"
+
+
+def _volume_root(link: str) -> str:
+    """The root of the volume the link at ``link`` is on, where Windows starts a target rooted with no drive: past a
+    drive that stands for a folder, as a subst drive does, the root of that folder's volume."""
+    root = _anchored(Path(link))[0]
+    return _anchored(Path(os.path.realpath(root)))[0] or root
+
+
+_WINDOWS_MAX_PATH = 260
+"""The length of the shortest path, in UTF-16 code units, that Windows can't look up unless long paths are on."""
+
+
+def _past_max_path(path: str) -> bool:
+    """Whether Windows can't look up ``path``: it is past MAX_PATH, and long paths are off. A \\\\?\\ path, which
+    Windows reads as given, has no such limit."""
+    if sys.platform != "win32" or path.startswith("\\\\?\\"):
+        return False
+    if len(path.encode("utf-16-le", "surrogatepass")) // 2 < _WINDOWS_MAX_PATH:
+        return False
+    return not _long_paths_on()
+
+
+@functools.cache
+def _long_paths_on() -> bool:
+    """Whether Windows looks up paths past MAX_PATH for this process; False where it can't say."""
+    if sys.platform != "win32":
+        return False
+    # Here, not at the top: only Windows needs it, and a Python built without _ctypes still runs the CLI elsewhere.
+    import ctypes
+
+    try:
+        enabled = ctypes.WinDLL("ntdll").RtlAreLongPathsEnabled
+    except (AttributeError, OSError):
+        return False
+    # It returns a BOOLEAN, one byte, and leaves the rest of the register undefined.
+    enabled.restype, enabled.argtypes = ctypes.c_ubyte, ()
+    return bool(enabled())
+
+
+_TARGET_END = ""
+"""Among the names the walk takes, where a link's target's names end; no name is empty."""
+
+
+def _manifest_problem(path: Path, root: Path, build: context.CIContext, directory: Path | None) -> str | None:
+    """Why the manifest at ``path`` can't be read: following its path one name at a time, each link's target too, as
+    the system does, a symbolic link or Windows junction in the checkout leads out of it or nowhere, or a name can't be
+    looked up; None otherwise. After such a link, nothing outside the checkout but the folders above it is looked up,
+    and a target that is a network path, a device or a drive's current folder never is."""
+    checkout = _Checkout(root, build, directory)
+    # As the system takes the path: on Windows a .. drops the name before it unfollowed, elsewhere it leaves the folder
+    # reached so far.
+    whole = Path(os.path.abspath(path)) if os.name == "nt" else Path(os.getcwd(), path)
+    folder, own_names = _anchored(whole)
+    # Each name to follow, with the link in the checkout whose target names it, if any; after a link's target's names,
+    # _TARGET_END and the link.
+    names: list[tuple[str, str | None]] = [(name, None) for name in own_names]
+    # Each link in the checkout followed, with its target; the last of them; the link the manifest's path ends at; and
+    # one whose target ended out of the checkout, until the walk is back in it.
+    targets: dict[str, Path] = {}
+    last: str | None = None
+    own: str | None = None
+    escaped: str | None = None
+    followed = 0
+
+    def refuse(link: str, leads: str) -> str:
+        return _manifest_link_error(path, whole, link, targets[link], leads, link == own)
+
+    def refuse_out(link: str | None, after: str) -> str:
+        """The error for a path out of the checkout: through ``link``, else by the manifest's own .. after ``after``."""
+        return _manifest_path_error(path, after, targets[after]) if link is None else refuse(link, "out of it")
+
+    while names:
+        name, owner = names.pop(0)
+        if name == _TARGET_END:
+            # ``owner`` is the link whose target's names are all taken, judged by where they end.
+            if checkout.holds(folder):
+                escaped = None
+            elif escaped is None:
+                escaped = owner
+            continue
+        if name == os.pardir:
+            folder = _parent(folder)
+            continue
+        if owner is not None and os.path.splitdrive(name)[0]:
+            # Joined, a later name of a target that starts with a drive would put that drive's current folder in place
+            # of the folder, which never_read() refuses at a target's start.
+            return refuse(owner, "out of it")
+        candidate = os.path.join(folder, name)
+        more = any(entry != _TARGET_END for entry, _ in names)
+        if last is not None:
+            # A name in a folder of the checkout is in it too, however the folder is spelled.
+            inside = checkout.contains(candidate) or checkout.holds(folder)
+            if not (inside or checkout.above(candidate)):
+                return refuse_out(escaped or owner, last)
+            if inside:
+                escaped = None
+        if (
+            owner is not None
+            and os.name == "nt"
+            and not filelist.never_read(candidate)
+            and filelist.never_read(os.path.abspath(candidate))
+        ):
+            # Windows takes a device's name, as COM1 or NUL, in a folder of a drive as that device, which looking it up
+            # would open, where following the link takes it as a name in the folder. It takes no name so in a network
+            # path or a \\?\ one, as the walk is on for a checkout on a share.
+            return refuse(owner, "out of it")
+        try:
+            found = os.lstat(candidate)
+        except (FileNotFoundError, NotADirectoryError):
+            # Windows says a path past MAX_PATH isn't there while long paths are off, though it follows a link along
+            # one; before any link, reading the manifest meets the same limit.
+            if followed and _past_max_path(candidate):
+                return (
+                    f"Cannot look up {candidate} on the way to {path}: Windows looks up no path that long while long "
+                    "paths are off."
+                )
+            found = None
+        except OSError as e:
+            # As reading the manifest says it, before any link or at the manifest's own name.
+            if not followed or (owner is None and not more):
+                return f"Cannot read {path}: {e.strerror or e}"
+            return f"Cannot look up {candidate} on the way to {path}: {e.strerror or e}"
+        linked = found is not None and local_file_utils.is_link(found)
+        if found is None or (more and not linked and not stat.S_ISDIR(found.st_mode)):
+            # The path ends here, as at a name the system can't find, or a file before more names: reading it says so,
+            # unless a link in the checkout led here.
+            if owner is None:
+                return None
+            return refuse(owner, "nowhere" if found is None else "to a file, where the path needs a folder")
+        if not linked:
+            folder = candidate
+            continue
+        followed += 1
+        target = local_file_utils.link_target(candidate)
+        # Windows takes a target's .. as text, from the link's folder.
+        followed_to = Path(os.path.normpath(target)) if os.name == "nt" else target
+        anchor, parts = _anchored(followed_to)
+        if owner is None and not more:
+            own = candidate
+        judged = checkout.holds(folder)
+        if judged:
+            owner = last = candidate
+            targets[candidate] = target
+            # Judged as written and as followed, which can be a drive's current folder, as `sub\..\D:x` is; one from a
+            # root that isn't above the checkout by name, as another drive's, is out of it before anything looks there,
+            # and so is one from a root with no drive, which starts on the link's volume, as a subst drive can hide.
+            if (
+                filelist.never_read(str(target))
+                or filelist.never_read(str(followed_to))
+                or _rooted(anchor)
+                or (anchor and not checkout.above(anchor))
+            ):
+                return refuse(candidate, "out of it")
+        elif _rooted(anchor):
+            anchor = _volume_root(candidate)
+        if followed > local_file_utils.MAX_LINKS:
+            return None if owner is None else refuse(owner, "nowhere")
+        folder = anchor or folder
+        taken = [(part, owner) for part in parts]
+        if judged:
+            taken.append((_TARGET_END, candidate))
+        names[:0] = taken
+    if last is not None and not checkout.holds(folder):
+        return refuse_out(escaped, last)
+    return None
+
+
+def _manifest_path_error(path: Path, link: str, target: Path) -> str:
+    """The error for the manifest at ``path``, which climbs out of the checkout with its own .. after ``link``, a link
+    in the checkout to ``target``."""
+    return (
+        f"After {link}, a link in the checkout to {target}, {path} climbs out of the checkout. Pass --manifest a path "
+        "that stays in it."
+    )
+
+
+def _manifest_link_error(path: Path, whole: Path, link: str, target: Path, leads: str, own: bool) -> str:
+    """The error for the manifest at ``path``, ``whole`` made absolute, read through ``link``, a link in the checkout
+    to ``target`` that leads as ``leads`` says, with what to do: ``own`` when the manifest's own path ends at it."""
+    described = f"a link in the checkout to {target}, which leads {leads}"
+    named = described if link == str(whole) else f"reached through {link}, {described}"
+    if leads != "out of it":
+        fix = "Fix the link, or commit the manifest in its place." if own else "Fix the link."
+    elif own:
+        fix = "Commit the manifest in place of the link, or pass --manifest the path of the file it leads to."
+    else:
+        fix = "Fix the link, or pass --manifest the manifest's path outside the checkout."
+    return f"{path} is {named}. {fix}"
+
+
 async def _fetch_summary(project: Project) -> tuple[str | None, BudgetFailureReason | None]:
     """The run's summary, and why billing stopped it; both None, with a warning, when they can't be fetched within
     SUMMARY_FETCH_SECONDS."""
@@ -1437,12 +1701,12 @@ def _cut_short_error(run_results: results.RunResults, url: str, access: dict[str
         advice = f" Raise --timeout.{note}" if timed_out else ""
         return f"{run_results.unchecked_reason} None of them counts as proved or refuted.{advice}"
     see = f"See how far it got at {url}" if timed_out else f"{_summary_pointer(run_results)} {url}"
-    off, unknown = _language_causes(access)
-    if not off and not unknown:
+    off = _language_causes(access)
+    if not off:
         advice = f", and raise --timeout if it needs longer.{note}" if timed_out else ""
         return f"{run_results.unchecked_reason} {see}{advice}"
     longer = ["the run needs longer than the time budget, so raise --timeout"] if timed_out else []
-    return f"{run_results.unchecked_reason} {_causes_sentence(off + longer + unknown)}{note} {see}"
+    return f"{run_results.unchecked_reason} {_causes_sentence(off + longer)}{note} {see}"
 
 
 def _no_verdict(run_results: results.RunResults) -> str:
@@ -1478,28 +1742,19 @@ def _not_registered_warning(run_results: results.RunResults) -> str:
     )
 
 
-def _language_causes(access: dict[str, bool | None]) -> tuple[list[str], list[str]]:
-    """Causes in the account's languages: those Aristotle says are not enabled, and those it gives no way to ask about."""
-    off = [
+def _language_causes(access: dict[str, bool | None]) -> list[str]:
+    """Causes in the account's languages: those Aristotle says are not enabled."""
+    return [
         f"{language} is not enabled for this account, so Aristotle left it out"
         for language, on in access.items()
         if on is False
     ]
-    # Verilog and C are on for every account, so a check that didn't answer names neither. A language Aristotle gives no
-    # way to ask about is never named.
-    unknown = (
-        ["files in a language this account can't verify are left out, which Aristotle gives no way to check"]
-        if any(on is None and language not in runner.LANGUAGE_ACCESS_ENDPOINTS for language, on in access.items())
-        else []
-    )
-    return off, unknown
 
 
 def _likely_causes(run_results: results.RunResults, access: dict[str, bool | None]) -> list[str]:
     """Why a manifest run verified nothing, leaving out causes the results and the account's languages rule out."""
     registered = [p.declaration for p in run_results.properties if p.declaration is not None]
-    off, unknown = _language_causes(access)
-    causes = list(off)
+    causes = _language_causes(access)
     if run_results.not_registered:
         causes.append(f"Aristotle registered nothing under {'some of ' if registered else ''}the manifest's ids")
     if any(d.status != DeclarationStatus.FAILED for d in registered):
@@ -1511,7 +1766,7 @@ def _likely_causes(run_results: results.RunResults, access: dict[str, bool | Non
     named = (DeclarationFailureReason.OUT_OF_BUDGET, DeclarationFailureReason.PROOF_CHECK_FAILED)
     if any(d.status == DeclarationStatus.FAILED and d.failure_reason not in named for d in registered):
         causes.append("Aristotle stopped short of a verdict, for the reason the property's result names")
-    return causes + unknown
+    return causes
 
 
 def _causes_sentence(causes: list[str]) -> str:

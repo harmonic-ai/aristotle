@@ -13,7 +13,7 @@ import pydantic
 import pytest
 
 from aristotlelib import api_request
-from aristotlelib.agent_task import AgentTask, BudgetFailureReason, TaskStatus
+from aristotlelib.agent_task import INCOMPLETE_ENDING, AgentTask, BudgetFailureReason, TaskStatus
 from aristotlelib.api_request import AristotleAPIError
 from aristotlelib.cli.api_action import resume_hint
 from aristotlelib.cli.command.show import ShowAction, broken_proofs_note, format_property_counts, log_property_counts
@@ -200,13 +200,13 @@ async def test_show_task_checks_the_task_against_the_project_a_name_resolves_to(
     parser = argparse.ArgumentParser()
     action = ShowAction(parser.add_subparsers())
     action.add_action_arguments()
-    resolve_project.side_effect = lambda reference: (PROJECT_ID, None)
+    resolve_project.side_effect = lambda reference, archived: (PROJECT_ID, None)
     task = _completed_task(project_id=task_project)
 
     with patch("aristotlelib.cli.command.show.AgentTask.from_id", return_value=task):
         assert await action.run_action(action.parser.parse_args(["FIFO overflow", "--task", "task-456"])) == code
 
-    resolve_project.assert_awaited_once_with("FIFO overflow")
+    resolve_project.assert_awaited_once_with("FIFO overflow", archived=False)
     if code is None:
         task.show.assert_awaited_once()
     else:
@@ -695,6 +695,8 @@ async def test_show_follows_a_running_task_to_its_end_and_exits_on_how_it_ended_
 
 
 DOWNLOAD_HINT = "Get the project's files with:\n  aristotle download project-123"
+WEB_LINK = "Open in Aristotle Web: https://aristotle.harmonic.fun/projects/project-123"
+PROPERTIES_HINT = "See each property with:\n  aristotle properties project-123"
 SPACED = "my results/run 1.tar.gz"
 """A --destination the shell must quote."""
 NOT_SAVED = "The project's files were not saved, since the command was interrupted."
@@ -709,10 +711,11 @@ def _get_them(destination: str = SPACED) -> str:
     ("status", "counts", "code"),
     [
         (TaskStatus.COMPLETE, "1 proved · 1 refuted · 0 in progress", 0),
+        (TaskStatus.COMPLETE_WITH_ERRORS, "1 proved · 1 refuted · 0 in progress", 1),
         # The counts stand as the task's end left them checked.
         (TaskStatus.OUT_OF_BUDGET, "0 proved · 0 refuted · 0 in progress · 2 unchecked", 1),
     ],
-    ids=["complete", "out of budget"],
+    ids=["complete", "review suggested", "out of budget"],
 )
 async def test_show_counts_the_properties_once_it_has_followed_a_running_task_to_its_end(
     status, counts, code, properties, caplog
@@ -738,7 +741,13 @@ async def test_show_counts_the_properties_once_it_has_followed_a_running_task_to
         assert await action.run_action(action.parser.parse_args(["project-123", "--task", "task-456"])) == code
 
     properties.assert_awaited_once()
-    assert caplog.messages[-2:] == [f"Properties: {counts}", DOWNLOAD_HINT]
+    listed = [] if status == TaskStatus.OUT_OF_BUDGET else [PROPERTIES_HINT]
+    assert caplog.messages[caplog.messages.index(f"Properties: {counts}") :] == [
+        f"Properties: {counts}",
+        DOWNLOAD_HINT,
+        WEB_LINK,
+        *listed,
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1715,7 +1724,7 @@ async def test_show_wait_follows_a_running_task_even_when_piped_and_exits_on_how
         num_events=3, interactive=True, title=None, carry_on=ANY, resume=ANY
     )
     assert "aristotle show project-123 --task task-456 --wait" in task.wait_for_completion.await_args.kwargs["carry_on"]
-    assert caplog.messages[-1] == DOWNLOAD_HINT
+    assert caplog.messages[-2:] == [DOWNLOAD_HINT, WEB_LINK]
 
 
 async def test_show_wait_of_a_finished_task_saves_its_files_and_exits_on_how_it_ended(tmp_path, caplog):
@@ -1735,7 +1744,26 @@ async def test_show_wait_of_a_finished_task_saves_its_files_and_exits_on_how_it_
         assert await action.run_action(args) == 1
 
     project.get_files.assert_awaited_once_with(destination=str(tmp_path))
-    assert caplog.messages[-1] == f"Saved the project's files to {saved}"
+    assert caplog.messages[-2:] == [f"Saved the project's files to {saved}", WEB_LINK]
+
+
+@pytest.mark.parametrize(("argv", "code"), [(["--wait"], 1), ([], None)], ids=["--wait", "plain"])
+async def test_show_wait_of_a_run_that_already_ended_with_a_review_suggested_says_it_finished(argv, code, caplog):
+    caplog.set_level(logging.INFO)
+    project = _project_with(_real_task(TaskStatus.COMPLETE_WITH_ERRORS))
+    action = ShowAction(argparse.ArgumentParser().add_subparsers())
+    action.add_action_arguments()
+
+    with (
+        patch("aristotlelib.cli.command.show.Project.from_id", return_value=project),
+        patch.object(AgentTask, "show", AsyncMock()),
+    ):
+        assert await action.run_action(action.parser.parse_args(["project-123", *argv])) == code
+
+    if argv:
+        assert caplog.messages[-3:] == [INCOMPLETE_ENDING, DOWNLOAD_HINT, WEB_LINK]
+    else:
+        assert INCOMPLETE_ENDING not in caplog.messages
 
 
 async def test_show_json_without_non_interactive_does_not_say_how_to_get_the_files(capsys, caplog):
@@ -1840,6 +1868,37 @@ def test_show_counts_a_refutation_whose_evidence_kind_this_version_does_not_know
         assert [p["evidence"] for p in snapshot["properties"]] == [0]
     else:
         assert "Properties: 0 proved · 1 refuted · 0 in progress" in caplog.messages
+
+
+@pytest.mark.parametrize("json_flag", [[], ["--json"]], ids=["text", "--json"])
+def test_show_names_a_run_that_ended_complete_with_errors_as_the_web_app_does_and_json_keeps_its_status(
+    json_flag, api_server, capsys, caplog
+):
+    caplog.set_level(logging.INFO)
+    tasks = _finished_tasks().json()
+    tasks["agent_tasks"][0]["status"] = "COMPLETE_WITH_ERRORS"
+
+    def serve(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/tasks"):
+            return httpx.Response(200, json=tasks)
+        if path.endswith("/events"):
+            return httpx.Response(200, json={"events": [], "pagination_key": None})
+        return _project_record()
+
+    api_server(*[serve] * 20)
+
+    with patch("sys.argv", ["aristotle", "show", RETRIED_ID, *json_flag]):
+        assert main() == 0
+
+    out, _ = capsys.readouterr()
+    if json_flag:
+        assert json.loads(out)["task"]["status"] == "COMPLETE_WITH_ERRORS"
+        assert "REVIEW SUGGESTED" not in out
+    else:
+        [display] = [message for message in caplog.messages if message.startswith("REVIEW SUGGESTED (started ")]
+        assert display.splitlines()[1:] == ["Prove it", "Task: task-1", f"Project: {RETRIED_ID}"]
+        assert "COMPLETE_WITH_ERRORS" not in caplog.text
 
 
 @pytest.mark.parametrize(

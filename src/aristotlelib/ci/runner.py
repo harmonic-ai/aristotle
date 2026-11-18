@@ -79,7 +79,8 @@ LANGUAGE_ACCESS_ENDPOINTS = {
     "Verilog": "/user/has-hardware-verification-access",
     "C": "/user/has-software-verification-access",
 }
-"""Where Aristotle says whether this account may verify a gated language; it says nothing of Rust."""
+"""Where Aristotle says whether this account may verify a gated language; it says nothing of Rust, which every account
+may verify."""
 
 LANGUAGE_CHECK_SECONDS = 10
 """Longest language_access may take, after which every language it was asked about counts as unknown."""

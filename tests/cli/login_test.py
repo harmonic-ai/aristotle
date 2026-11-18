@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import gc
+import io
 import json
 import logging
 import os
@@ -32,7 +33,7 @@ from tests.cli.conftest import (
     ctrl_c_before_answering,
     token_error,
 )
-from tests.conftest import user_agent_of
+from tests.conftest import FAKE_KEY, shown_key_runs, user_agent_of
 
 NOT_FOUND = httpx.Response(404, json={"detail": "Not Found"})
 """How a server without device login answers its start."""
@@ -193,6 +194,18 @@ def test_ctrl_c_or_ctrl_d_at_the_key_prompt_of_a_real_terminal_ends_login(key, t
 
     assert code == 130
     assert output.endswith("Paste your API key (input is hidden): \nCancelled. Nothing was stored.\n")
+    assert credentials.credentials_path().exists() is False
+
+
+def test_a_key_that_isnt_utf8_at_the_prompt_of_a_real_terminal_is_refused_on_a_line_of_its_own(tmp_path):
+    typed = f"{FAKE_KEY}\u00a0\n".encode("cp1252")
+    code, output = _run_at_a_terminal(tmp_path, ["login", "--no-browser"], [(b"Paste your API key", typed)])
+
+    assert code == 5
+    assert output.endswith(
+        "Paste your API key (input is hidden): \nThe API key you pasted isn't UTF-8 text. Nothing was stored.\n"
+    )
+    assert shown_key_runs(output, FAKE_KEY) == []
     assert credentials.credentials_path().exists() is False
 
 
@@ -386,6 +399,23 @@ def test_login_checks_and_stores_the_key_given_with_api_key(argv: list[str], mon
     assert main() == 0
     verify.assert_awaited_once_with("given-key")
     assert credentials.read_api_key() == "given-key"
+
+
+def test_a_piped_key_that_isnt_utf8_exits_5_without_a_traceback_and_stores_nothing(monkeypatch, capsys):
+    # A strict decoder, as stdin's is in a UTF-8 locale such as en_US.UTF-8.
+    stdin = io.TextIOWrapper(io.BytesIO(f"{FAKE_KEY}\u00a0\n".encode("cp1252")), encoding="utf-8")
+    monkeypatch.setattr("sys.stdin", stdin)
+    monkeypatch.setattr("sys.argv", ["aristotle", "login"])
+    verify = AsyncMock()
+    monkeypatch.setattr("aristotlelib.cli.login_flow._verify", verify)
+
+    with pytest.raises(SystemExit) as exited:
+        main()
+
+    assert exited.value.code == 5
+    assert capsys.readouterr().err == "The API key from stdin isn't UTF-8 text. Nothing was stored.\n"
+    verify.assert_not_awaited()
+    assert credentials.read_api_key() is None
 
 
 @pytest.mark.parametrize("blank", ["", " \t"], ids=["empty", "whitespace"])

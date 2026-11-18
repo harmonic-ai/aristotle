@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import contextlib
 import getpass
+import locale
 import logging
 import math
 import os
@@ -119,8 +121,16 @@ def _immediate_ctrl_c() -> Generator[None, None, None]:
         signal.signal(signal.SIGINT, previous)
 
 
+def _not_text(where: str, encoding: str) -> LoginError:
+    """The LoginError, exit 5, for a key ``where``, such as "from stdin", that ``encoding`` can't decode; it doesn't say
+    where in the key the decoding failed."""
+    name = codecs.lookup(encoding).name.upper()
+    return LoginError(f"The API key {where} isn't {name} text. Nothing was stored.")
+
+
 def _read_key() -> str:
-    """A hidden prompt at a terminal, where Ctrl-D cancels as Ctrl-C does; otherwise stdin's first line, if it is open."""
+    """A hidden prompt at a terminal, where Ctrl-D cancels as Ctrl-C does; otherwise stdin's first line, if it is open.
+    A key the locale's encoding, which getpass decodes with, can't decode raises _not_text's LoginError."""
     if sys.stdin is None:
         return ""
     if sys.stdin.isatty():
@@ -128,6 +138,10 @@ def _read_key() -> str:
             return getpass.getpass("Paste your API key (input is hidden): ")
         except EOFError:
             raise KeyboardInterrupt from None
+        except UnicodeDecodeError:
+            # getpass ends the prompt's line only once it has read the key.
+            sys.stderr.write("\n")
+            raise _not_text("you pasted", locale.getpreferredencoding(False)) from None
     return sys.stdin.readline()
 
 
@@ -141,9 +155,25 @@ def _stdin_would_wait() -> bool:
     return not ready
 
 
+def _first_line() -> str:
+    """stdin's first line; _not_text's LoginError when stdin's encoding can't decode it, but not for a later line."""
+    buffer = getattr(sys.stdin, "buffer", None)
+    if buffer is None:
+        return sys.stdin.readline()
+    # Decoded from its bytes: stdin's own decoder, when strict, fails on all it has read, later lines included.
+    try:
+        line = buffer.readline().decode(sys.stdin.encoding, "surrogateescape")
+    except UnicodeDecodeError:
+        # surrogateescape can't stand in for a byte below 128, as in an incomplete ISO-2022-JP escape.
+        raise _not_text("from stdin", sys.stdin.encoding) from None
+    if any("\udc80" <= char <= "\udcff" for char in line):
+        raise _not_text("from stdin", sys.stdin.encoding)
+    return line
+
+
 def _piped_key() -> str | None:
     """stdin's first line when stdin is a pipe or a file; None at a terminal, with stdin closed, or at the end of stdin.
-    Says what it waits for when stdin has nothing in it yet."""
+    Says what it waits for when stdin has nothing in it yet, and raises _first_line's LoginError."""
     if sys.stdin is None or sys.stdin.isatty():
         return None
     if _stdin_would_wait():
@@ -152,7 +182,7 @@ def _piped_key() -> str | None:
             "it none: aristotle login < /dev/null"
         )
     with _immediate_ctrl_c():
-        return sys.stdin.readline() or None
+        return _first_line() or None
 
 
 def _pasted_key(open_browser: bool) -> str:
@@ -304,15 +334,17 @@ async def _wait(seconds: float, deadline: float, progress: _ProgressLine | None)
         await asyncio.sleep(end - now if progress is None else min(1.0, end - now))
 
 
-def _refused(error: AristotleAPIError, code: str | None) -> LoginError:
-    """The LoginError for a poll whose answer ends the login: denied, expired, refused otherwise, or failed."""
+def _refused(error: AristotleAPIError, code: str | None, redact: Callable[[str], str]) -> LoginError:
+    """The LoginError for a poll whose answer ends the login: denied, expired, refused otherwise, or failed; another
+    ``code`` shows through ``redact``, then as the server's text does."""
     if code == "access_denied":
         return LoginError("The login was denied in the browser. Nothing was stored.")
     if code == "expired_token":
         return LoginError(EXPIRED)
     if code is not None:
+        shown = api_request._without_key(code, None, redact)
         return LoginError(
-            f"Aristotle refused the login ({code}). Nothing was stored. Try again with:\n  aristotle login"
+            f"Aristotle refused the login ({shown}). Nothing was stored. Try again with:\n  aristotle login"
         )
     return _failed("finish the login", error)
 
@@ -410,7 +442,7 @@ async def _poll(
             if code not in ("authorization_pending", "slow_down"):
                 if lost is not None and code != "access_denied":
                     raise _maybe_lost(lost, device.replaces_key) from e
-                raise _refused(e, code) from e
+                raise _refused(e, code, without_code) from e
             lost = None
             leftover.note = None
             if code == "slow_down":
@@ -509,8 +541,8 @@ async def login(
     ``on_stored`` receives the result as soon as the key is stored, before the login asks who pays.
 
     Raises:
-        LoginError: no key was entered or approved, api_request.api_key_problem() refused it, Aristotle did not accept
-            it, or it could not be stored.
+        LoginError: no key was entered or approved, one read from stdin or the prompt couldn't be decoded,
+            api_request.api_key_problem() refused it, Aristotle did not accept it, or it could not be stored.
         KeyboardInterrupt: Ctrl-C before the key was read, or Ctrl-D at the prompt; said on stderr, with where to revoke
             a key the login may have made, before it is raised. Ctrl-C once the key is stored says it stays stored.
         asyncio.CancelledError: Ctrl-C under asyncio.run while the login waits for approval, or once the key is stored;

@@ -31,12 +31,12 @@ class DeleteAction(APIAction):
         return 86
 
     def add_action_arguments(self) -> None:
-        self.parser.add_argument("project", type=str, help=f"The project to delete: {PROJECT_REFERENCE_HELP}")
+        self.parser.add_argument("project", type=str, help=f"The project: {PROJECT_REFERENCE_HELP}")
         self.parser.add_argument(
             "--yes",
             "-y",
             action="store_true",
-            help="Delete without asking first. Required without a terminal, and with --json.",
+            help="Delete without asking first.",
         )
         self.parser.add_argument(
             "--json",

@@ -237,10 +237,6 @@ def write(results: RunResults, destination: Path, workspace: Path | None = None,
     logger.info(f"Wrote JUnit report to {destination}")
 
 
-_MAX_LINKS = 40
-"""The most links _resolve() follows, as Linux's MAXSYMLINKS."""
-
-
 def _holder(folders: Iterable[Path]) -> Callable[[str], bool]:
     """Whether a folder, named by a path with no link on the way, is or is in one of ``folders``, by identity or by name;
     the file system's root never counts."""
@@ -270,7 +266,8 @@ def _resolve(path: Path, inside: Callable[[str], bool]) -> str:
     far, so that a folder that doesn't exist yet hides no link after it.
 
     Raises:
-        OSError: If a link on the way is in a folder ``inside`` holds, or links nest more than _MAX_LINKS deep.
+        OSError: If a link on the way is in a folder ``inside`` holds, or links nest more than
+            local_file_utils.MAX_LINKS deep.
     """
     folder = path.anchor or os.getcwd()
     names = list(path.parts[1:] if path.anchor else path.parts)
@@ -290,22 +287,12 @@ def _resolve(path: Path, inside: Callable[[str], bool]) -> str:
                 "or pass --junit another path."
             )
         followed += 1
-        if followed > _MAX_LINKS:
+        if followed > local_file_utils.MAX_LINKS:
             raise OSError(errno.ELOOP, os.strerror(errno.ELOOP), str(path))
-        target = _link_target(candidate)
+        target = local_file_utils.link_target(candidate)
         folder = target.anchor or folder
         names[:0] = target.parts[1:] if target.anchor else target.parts
     return folder
-
-
-def _link_target(link: str) -> Path:
-    """Where the link at ``link`` points, without the \\\\?\\ prefix Windows gives a target on a drive or a share."""
-    target = os.readlink(link)
-    if os.name == "nt" and target.startswith("\\\\?\\UNC\\"):
-        return Path("\\\\" + target[8:])
-    if os.name == "nt" and target.startswith("\\\\?\\") and target[5:7] == ":\\":
-        return Path(target[4:])
-    return Path(target)
 
 
 def _replace(path: str, text: str) -> None:

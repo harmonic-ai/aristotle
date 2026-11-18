@@ -4,6 +4,139 @@ All notable changes to `aristotlelib`, the Aristotle Python SDK and `aristotle` 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.4.0] - 2026-11-18
+
+### Added
+
+- `aristotle balance` reads the authenticated organization's credit balance without starting a run. Admins see Credits
+  and members see credit status, with clear restricted or unavailable output. `--json` gives explicit units, in
+  `{"status", "unit", "small_credits_per_credit", "decimal_places", "balance", "credit_status", "error"}`, whose
+  `balance`, when an admin's key read it, holds `credits`, `paid_credits`, `free_credits`, `granted_credits`,
+  `observed_at`, `next_expiry_at` and `credit_display_config`. In the SDK, `aristotlelib.billing.get_credit_balance()`
+  returns that `CreditBalance`, which only an organization admin's key can read. Its amounts are `SmallCredits`, whole
+  small credits, and `format_credits()` shows one in Credits, as `balance` does, given its `CreditDisplayConfig`, which
+  holds `small_credits_per_credit` and `decimal_places`. `get_credit_status()`, which a member's key can call too,
+  returns a `CreditStatus`, whose `state` is a `CreditState`. `aristotlelib.billing.BalanceResult` is what
+  `balance --json` prints. (#348)
+- Events for the changes Aristotle makes to properties and definitions: `EventType.PROPERTY_ADDED` (`19`),
+  `PROPERTY_MODIFIED` (`20`), `PROPERTY_STATUS_CHANGED` (`21`), `PROPERTY_REMOVED` (`22`), `DEFINITION_ADDED` (`23`),
+  `DEFINITION_MODIFIED` (`24`) and `DEFINITION_REMOVED` (`25`). Their `content` names the property or definition and
+  says what changed, such as `` `Spec.noOverflow`: In progress → Proved ``, and `Event.declaration_id` says which
+  one it is. A status change also carries `Event.declaration_status`, the `DeclarationStatus` it moved to. `--json`
+  gives both. Earlier versions report them as `UNKNOWN` (`0`) and log a warning for each. (#377)
+- `aristotle archive <project>` takes a project out of `aristotle list`, `aristotle list --archived` lists archived
+  projects, and `aristotle unarchive <project>` brings one back. With `--json`, `archive` and `unarchive` print the
+  project. `unarchive` looks a name or id prefix up among archived projects alone, and every other command takes an
+  archived project only by its full id. Archiving a project whose run is still going exits 4, saying to wait for the run
+  to end or to stop it with `aristotle cancel`. In the SDK, `Project.archive_by_id()` and `Project.unarchive_by_id()`,
+  or `archive()` and `unarchive()` on a `Project`, do the same, `Project.list_projects(archived=True)` and
+  `Project.resolve_id(..., archived=True)` look among archived projects, and `Project.archived_at`, also in `--json`,
+  says when a project was archived. (#392)
+
+### Changed
+
+- A run that ended `COMPLETE_WITH_ERRORS` shows as `REVIEW SUGGESTED`, as on the web, in `aristotle show`, in the
+  display of a wait, and in the tables that `aristotle tasks` and `aristotle list` print. They gave the status's name,
+  which reads as a failure. A wait that ends on such a run, and `aristotle ci setup` when such a run proposed no
+  property, now say `Aristotle finished, but the results might not match what you asked for. Its summary says what to
+  review.` They said that Aristotle made progress but did not fully complete the request. `show --wait` of a run that
+  had already ended this way says it too, where it said nothing. `--json` still gives `COMPLETE_WITH_ERRORS`, and a
+  wait on such a run still exits 1. In the SDK, `str()` of an `AgentTask` and `AgentTask.show()` show the status the
+  same way. (#384)
+- The README, the GitHub Action's description, the CI guide, the help for `submit --project-dir` and the messages for
+  the removed `aristotle formalize` and a folder of `.lean` files name Rust with Verilog and C, now that Aristotle
+  verifies Rust on every account. They named only Verilog and C. (#394, #395)
+- When a run verified nothing, `aristotle ci` no longer gives `files in a language this account can't verify are left
+  out, which Aristotle gives no way to check` as a likely cause. Only a project with Rust files got it, and every
+  account now verifies Rust. (#394)
+- The agent setup guide tells agents that users send their code as it is, whatever its language, and that Aristotle
+  says what it can't verify, as the skill does. It said Aristotle verifies their Verilog and C. (#385)
+- The agent skill tells assistants that most runs take under an hour, about one in ten a few hours and a rare one a
+  day or more, and to say so when one starts, so a long run isn't mistaken for a stuck one. (#386)
+- `aristotle ci` stops with exit 2, naming the link, when the manifest is reached through a symbolic link in the
+  checkout, or a junction on Windows, that leads out of the checkout or nowhere: a link at `aristotle.toml` or the file
+  `--manifest` names, or one on the way to either. A pull request could commit such a link to a file elsewhere on the CI
+  machine, such as another job's manifest, and the run checked that manifest's properties, so their text showed up in
+  the job's log and reports. A link to a file in the checkout, such as a manifest that subprojects share, still works,
+  as do a link above the checkout, such as a mount, and a manifest outside the checkout that `--manifest` names: to read
+  one that a build step links to, pass `--manifest` the file's own path. Run outside CI from a subfolder, `aristotle ci`
+  also stops at a broken `aristotle.toml` link on its way up, where it read a manifest further up, and `aristotle ci
+  setup` run there replaces that link only with `--force`, as it does a manifest. (#390)
+- Each command's `--help` gives one line per option at 80 columns, and ends with a link to the doc that has the detail:
+  the CLI reference, or the CI guide for `aristotle ci`, `aristotle review` and `aristotle ci setup`. `submit --help`
+  runs 40 lines, where it ran 103. The CLI reference now says what only the help said: the name `submit` gives a project
+  without `--name`, how `aristotle property` matches a name, the order of each `properties --sort`, that `delete` needs
+  `--yes` without a terminal or with `--json`, and that `continue --send-folder --dry-run` needs no key. The CI guide
+  does the same for `--junit`'s default path, the folder `ci setup --manifest` sets up, `review --path` under
+  `--scope changed`, and the forms `--base-ref` takes. Help breaks lines only at spaces, so a link or an option's name
+  stays whole in a narrow terminal. (#380)
+
+### Deprecated
+
+- `aristotlelib.progress_utils.print_progress_lines()` and `clear_progress_lines()` warn with a `DeprecationWarning`,
+  and will be removed in 4.0. The CLI's wait no longer calls them. (#389)
+
+### Fixed
+
+- A 404 or 409 answered with an HTML page, as a proxy or a firewall may send, reads `Error: request refused` or
+  `Error: request blocked by a proxy`, with its hint, as such a 403 does. Commands printed
+  `API request failed with status 404:`, or `409:`, and the page, and a lookup of a project by its id, as in `show` and
+  `properties`, said the project was not found or not accessible. Some commands still read either status as Aristotle's
+  answer, as in 3.3.0. For example, `rename` and `delete` read a 404 as a project not found or not yours,
+  `download --artifact` a 404 as a file the project doesn't have, and `questions` a 409 as a question already closed.
+  Exit codes are unchanged. In the SDK, `from_id()` raises such a 404 as an `AristotleAPIError` with status 404, where
+  it raised `AristotleNotFoundError`. (#348)
+- The progress display of `submit --wait`, `continue --wait` and `show --wait` prints only what is new when piped, in
+  a CI log or under `TERM=dumb`: its header once, then each new event and each change of status or property counts,
+  and the status again after five minutes with nothing new. It printed the whole frame again on every event and every
+  30 seconds. At a terminal, there and in `show` of a running task, it redraws only its frame, below what the command
+  printed before, such as `Project created: ...`, the project's link, `Prompt submitted to project ...` and the files
+  `continue --files` sent. A message logged during the wait stays above the frame, and so does an event the frame has no
+  room for. A frame taller than the terminal drops its oldest lines while it is redrawn, and the last one is printed
+  whole. The display cleared the screen on every event, even under `TERM=dumb`, so a tall frame landed in the scrollback
+  again and again. A question asked during the wait is shown once, where every frame repeated it until it scrolled out.
+  A wait that saw its task end now prints the project's link and, if the task completed and the project has
+  properties, the `aristotle properties` command. The wait of `aristotle ci setup`, and
+  `AgentTask.wait_for_completion(interactive=True)` in the SDK, show their progress the same way. `--json` output and
+  exit codes are unchanged. (#389)
+- A `submit --wait` with only a prompt and without `--json` says again in one line, when its wait ends, that only the
+  prompt went up, since the wait's last frame and closing lines can push the warning printed before it off the screen.
+  (#389)
+- `aristotle login` says the key isn't UTF-8 text, and exits 5 with nothing stored, when the first line piped to it, or
+  the key pasted at its prompt, holds a byte that isn't UTF-8, such as a no-break space a Windows editor saved. In a
+  locale such as `en_US.UTF-8` it ended in a traceback that gave the byte's position, which for a byte after the key is
+  the key's length, and a byte on a later line did the same, though only the first line is the key. Where stdin's
+  encoding isn't UTF-8, the message names it, and a line it can't decode for any reason, such as one ending in an
+  unfinished ISO-2022-JP escape, is refused the same way. (#371)
+- A value after `--api-key` that starts with `-` is no longer named in the usage error, exit 2 as before:
+  `aristotle --api-key -abc list` said `unknown option -abc`, on GitHub in an annotation too, and now says
+  `argument --api-key: expected one argument`. After `logout`, which takes no key, it says only
+  `unknown option --api-key`. (#371)
+- An error that shows the server's text shows the API key the request sent, and anything shaped like an Aristotle key,
+  as `[redacted]`, as `--verbose` already did. Both now also hide the key where the text escapes it, as a quoted header
+  line, a JSON string or an HTML page does. A proxy that copied a request's headers into its error page, a JSON
+  `detail` or a header line it got wrong put the key in the error, in each retry's warning and in the `--json` result,
+  and in the SDK in the error's cause, which a traceback or `logging.exception()` prints, and in httpx's and httpcore's
+  own logs of its requests, which an application's INFO or DEBUG logging shows. `aristotle login` also hides the key and
+  its device code in the code of a refusal it doesn't know, and `--verbose` no longer ends in a traceback that quotes an
+  error page the HTML parser of an older Python can't read. A refusal whose JSON nests too deep to parse, or whose
+  charset can't decode its body, now gets its usual error where it ended in a traceback that showed the key. (#371)
+- A wait skips an event id the event stream can't send back as it is, one with a non-ASCII or control character or
+  whitespace at either end, and resumes from the last one it can. A non-ASCII id ended the wait in a traceback, and one
+  ending in a space made every reconnect fail before it was sent, while the wait said the connection failed and kept
+  trying for up to 10 minutes. A request for the events that can't be sent at all now stops the wait at once, saying
+  so, and in the SDK `AristotleRequestClient.stream_sse()` raises its `LocalProtocolError` at once. (#371)
+- Following the skill, a coding agent sends each property as the user stated it, tells the user of any assumption it
+  adds, and reports a refutation of the user's statement as its result, even when a weaker statement was proved. It
+  added an assumption to the user's property in its own prompt, then reported the property proved, without saying
+  that what was proved is weaker than what was asked. (#387)
+- The skill's commands for `submit`, `show` and `continue` send stderr to `run.log`, apart from the JSON in
+  `run.json`, and its notes for PowerShell keep stderr on the console. Agents sent both into one file, which then
+  didn't parse as JSON. (#387)
+- Following the skill, a coding agent reports results only from projects started in its session, unless the user
+  names one or it writes a manifest from one. It reported the results of a matching project that `aristotle list`
+  showed, which another session had started, instead of submitting. (#387)
+
 ## [3.3.0] - 2026-11-06
 
 ### Added

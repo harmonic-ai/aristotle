@@ -127,12 +127,12 @@ async def test_rename_json_prints_the_renamed_project(capsys):
 
 async def test_rename_renames_the_project_a_name_resolves_to(resolve_project, caplog):
     action = _action()
-    resolve_project.side_effect = lambda reference: (PROJECT_ID, None)
+    resolve_project.side_effect = lambda reference, archived: (PROJECT_ID, None)
 
     with patch(RENAME_BY_ID, return_value=_project("solana proj, take 2")) as mock_rename:
         with caplog.at_level(logging.INFO):
             await action.run_action(action.parser.parse_args(["solana proj", "solana proj, take 2"]))
 
-    resolve_project.assert_awaited_once_with("solana proj")
+    resolve_project.assert_awaited_once_with("solana proj", archived=False)
     mock_rename.assert_called_once_with(PROJECT_ID, "solana proj, take 2")
     assert f'Project {PROJECT_ID} renamed to "solana proj, take 2".' in caplog.messages

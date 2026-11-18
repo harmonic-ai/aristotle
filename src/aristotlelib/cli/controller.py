@@ -17,9 +17,10 @@ from collections.abc import Iterable, Sequence
 from typing import Any, ClassVar, NoReturn
 
 import aristotlelib.cli.command as _command_pkg
+from aristotlelib import progress_utils
 from aristotlelib.api_request import get_web_url, set_surface
 from aristotlelib.ci import context, github
-from aristotlelib.cli.api_action import VERBOSE_HELP, APIAction
+from aristotlelib.cli.api_action import VERBOSE_HELP, APIAction, HelpFormatter
 from aristotlelib.cli.version import get_version
 from aristotlelib.exit_codes import EXIT_BROKEN_PIPE, EXIT_INFRASTRUCTURE_ERROR, EXIT_USAGE_ERROR
 from aristotlelib.printable import printable
@@ -30,7 +31,7 @@ VERILOG_REMOVED_MESSAGE = (
     'out the sources, includes and macros itself:\n  aristotle submit "<prompt>" --project-dir rtl'
 )
 FORMALIZE_REMOVED_MESSAGE = (
-    "`aristotle formalize` has been removed. Aristotle verifies Verilog and C code: submit the folder that "
+    "`aristotle formalize` has been removed. Aristotle verifies Verilog, C, and Rust code: submit the folder that "
     'holds it, with the property to prove in the prompt:\n  aristotle submit "<prompt>" --project-dir <folder>'
 )
 RETIRED_COMMANDS = {
@@ -98,7 +99,9 @@ class CLIParser(argparse.ArgumentParser):
         return []
 
     def _read(self, args: list[str]) -> tuple[list[str], tuple[str, ...]]:
-        """``args`` with this parser's own ``--x_y`` and ``--x_y=v`` spelled ``--x-y``, and the options it lacks.
+        """``args`` with this parser's own ``--x_y`` and ``--x_y=v`` spelled ``--x-y``, and the options it lacks, except
+        a value after --api-key that looks like one, which argparse then refuses without naming it, or which goes with
+        an --api-key this parser lacks.
 
         Its own arguments end at ``--`` and, in a parser with subcommands, at the subcommand.
         """
@@ -106,6 +109,7 @@ class CLIParser(argparse.ArgumentParser):
         unknown: list[str] = []
         value_next = False
         values_continue = False
+        key_next = False
         for index, arg in enumerate(args):
             if arg == "--":
                 break
@@ -115,16 +119,21 @@ class CLIParser(argparse.ArgumentParser):
                 if self._subparsers is not None and not value_next:
                     break
                 value_next = value_next and values_continue
+                key_next = False
                 continue
             hyphenated = name.replace("_", "-")
             if name not in self._option_string_actions and hyphenated in self._option_string_actions:
                 name = hyphenated
                 respelled[index] = name + equals + value
             action = self._find(name)
-            if action is None:
+            if action is None and not key_next:
                 unknown.append(name)
             value_next = action is not None and action.nargs != 0 and not equals
             values_continue = action is not None and action.nargs in ("*", "+")
+            if action is None:
+                key_next = not equals and "--api-key".startswith(hyphenated)
+            else:
+                key_next = value_next and action.dest == "api_key"
         return respelled, tuple(unknown)
 
     def _option_like(self, arg: str, name: str) -> bool:
@@ -208,16 +217,18 @@ class _LogFormatter(logging.Formatter):
 
 class _AfterStdoutHandler(logging.StreamHandler):
     """Log to stderr after flushing stdout, so a message follows what was printed before it where both go to one pipe
-    or file, as with ``2>&1``: stdout is block-buffered there, and stderr isn't."""
+    or file, as with ``2>&1``: stdout is block-buffered there, and stderr isn't. A wait's progress frame on the terminal
+    moves below the message."""
 
     def emit(self, record: logging.LogRecord) -> None:
-        try:
-            if sys.stdout is not None:
-                sys.stdout.flush()
-        except (OSError, ValueError):
-            # A closed pipe or stream fails again at the next flush, where it is reported.
-            pass
-        super().emit(record)
+        with progress_utils.frame_lifted():
+            try:
+                if sys.stdout is not None:
+                    sys.stdout.flush()
+            except (OSError, ValueError):
+                # A closed pipe or stream fails again at the next flush, where it is reported.
+                pass
+            super().emit(record)
 
 
 def _configure_logging() -> None:
@@ -290,6 +301,7 @@ def _main() -> int:
         prog="aristotle",
         description="Aristotle SDK - formally verify your code from Python or the command line",
         epilog=f"For more information, visit {web_url}",
+        formatter_class=HelpFormatter,
     )
 
     parser.add_argument("--version", action="version", version=f"aristotlelib {get_version()}")
@@ -297,10 +309,7 @@ def _main() -> int:
     parser.add_argument(
         "--api-key",
         type=str,
-        help=(
-            "Aristotle API key for this command only, in place of the key `aristotle login` stored or the "
-            "ARISTOTLE_API_KEY environment variable. With `login`, the key to check and store."
-        ),
+        help="Aristotle API key for this command; `login` stores it.",
     )
     subparsers = parser.add_subparsers(dest="command")
     for cls in action_classes():

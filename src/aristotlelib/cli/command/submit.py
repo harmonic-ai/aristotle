@@ -16,6 +16,7 @@ from aristotlelib.api_request import (
 )
 from aristotlelib.ci.runner import describe_upload
 from aristotlelib.cli.api_action import (
+    NON_INTERACTIVE_HELP,
     APIAction,
     add_prompt_arguments,
     carry_on_hint,
@@ -24,6 +25,7 @@ from aristotlelib.cli.api_action import (
     fetch_properties_and_tasks,
     interrupted_save_hint,
     judge_properties,
+    log_next_steps,
     log_unjudged,
     print_json,
     print_questions_pending,
@@ -66,6 +68,8 @@ PROMPT_ONLY_WARNING = (
     "submit the folder that holds it:\n"
     '  aristotle submit "<prompt>" --project-dir <folder>'
 )
+
+PROMPT_ONLY_REMINDER = "WARNING: Only the prompt went up, since no --project-dir, -f or -F was given."
 
 
 class _BlockOption(argparse.Action):
@@ -207,145 +211,93 @@ class SubmitAction(APIAction):
         return 10
 
     def add_action_arguments(self) -> None:
-        add_prompt_arguments(self.parser, "The property to prove or refute, and what Aristotle may assume")
+        add_prompt_arguments(self.parser, "The property to prove")
 
         self.parser.add_argument(
             "--project-dir",
             type=project_dir_argument,
-            help=(
-                "The folder holding the code to verify, as it is, and what the proof needs: Verilog and C. "
-                "Aristotle writes the Lean itself, so don't send Lean or "
-                "pure mathematics, which it doesn't verify. Without --project-dir, -f or -F, only the prompt goes up. "
-                "Files git ignores (unless --include-ignored), files named like credentials or kept in a folder that "
-                "holds them, result archives an earlier run saved and files whose names aren't UTF-8 are left out, "
-                "and the rest goes up as one compressed archive of at most 100 MB. An aristotle.f there is read as a "
-                "Verilog filelist, and every file it names or includes goes up too, from outside the directory under "
-                "_ext/."
-            ),
+            help="The folder of Verilog, C, or Rust code to verify.",
         )
 
         self.parser.add_argument(
             "--include-ignored",
             action="store_true",
-            help=(
-                "Also upload the files in --project-dir that git ignores, such as sources a build generates: those a "
-                ".gitignore, .git/info/exclude or the global excludes file matches, or, outside a git repository or in "
-                "a folder git ignores, the folder's top-level .gitignore. Files named like credentials or kept in a "
-                "folder that holds them, .git folders, result archives an earlier run saved and files whose names "
-                "aren't UTF-8 still stay out, and --dry-run marks each file it adds. Only the command line turns it "
-                "on, never an aristotle.f."
-            ),
+            help="Also upload the files that git ignores.",
         )
 
         self.parser.add_argument(
             "--name",
             type=project_name_argument,
-            help=(
-                "Name for the project, shown by `aristotle list` and the web app. "
-                "Default: the --project-dir folder's name, else the top module of a block given with -f or -F (or "
-                "block), else the prompt."
-            ),
+            help="Project name (default: the folder, module or prompt).",
         )
 
         self.parser.add_argument(
             "--wait",
             action="store_true",
-            help="Wait for completion before returning (default: don't wait)",
+            help="Wait for the run to finish.",
         )
 
         self.parser.add_argument(
             "--destination",
             # Expanded here, as a shell would: --destination=~/out reaches argparse with the ~ unexpanded.
             type=os.path.expanduser,
-            help=(
-                "Where --wait saves the result archive, checked before submitting. A directory, or a path ending "
-                "in /, gets it under its default name; missing directories are made. Default: the current directory."
-            ),
+            help="Where --wait saves the result archive.",
         )
 
         self.parser.add_argument(
             "--json",
             action="store_true",
-            help=(
-                "Print the project, its task and its properties as one JSON object. With --wait, print them when "
-                "the wait ends (still running if it broke off), with no progress display and no prompts."
-            ),
+            help="Print the project, its task and properties as JSON.",
         )
 
         self.parser.add_argument(
             "--non-interactive",
             action="store_true",
-            help=(
-                "For scripts and agents: --wait and --json, but never prompt, and stop as soon as Aristotle asks "
-                "something, printing the questions as JSON and exiting with code 10. Answer with `aristotle "
-                "questions <project-id> --answer <question-id>=<answer>`, then carry on with `aristotle show "
-                "<project-id> --non-interactive`."
-            ),
+            help=NON_INTERACTIVE_HELP,
         )
 
         verilog = self.parser.add_argument_group(
-            "Verilog block",
-            f"Each option adds a line to the --project-dir folder's {verilog_bundle.FILELIST_NAME}, or makes one. The "
-            f"block needs a filelist that names a source file, that {verilog_bundle.FILELIST_NAME} or one -f or -F "
-            "names: without one, --top and --blackbox exit 2. The files the block names and includes go up too, from "
-            "outside the folder under _ext/; without --project-dir, they are all that goes up.",
+            "Verilog block", f"Each option adds a line to the folder's {verilog_bundle.FILELIST_NAME}."
         )
         verilog.add_argument(
             "--top",
             action=_BlockOption,
             dest="block_arguments",
             metavar="MODULE",
-            help=(
-                "The block's top module, in place of any the filelists name. Needs a filelist that names a source file."
-            ),
+            help="The block's top module.",
         )
         verilog.add_argument(
             "-f",
             action=_BlockOption,
             dest="block_arguments",
             metavar="FILELIST",
-            help="A simulator filelist whose paths are relative to the current directory. Repeatable.",
+            help="A filelist, its paths relative to the current folder.",
         )
         verilog.add_argument(
             "-F",
             action=_BlockOption,
             dest="block_arguments",
             metavar="FILELIST",
-            help="A simulator filelist whose paths are relative to its own folder. Repeatable.",
+            help="A filelist, its paths relative to its own folder.",
         )
         verilog.add_argument(
             "--blackbox",
             action=_BlockOption,
             dest="block_arguments",
             metavar="MODULE",
-            help=(
-                "A module for Aristotle to treat as a black box with unconstrained outputs, which the prompt asks for. "
-                "Needs a filelist that names a source file. A file that declares it and nothing but black boxes is "
-                "left out of the upload: one the filelists name, or a .v, .sv, .vh or .svh file in --project-dir. "
-                "Repeatable."
-            ),
+            help="A module for Aristotle to treat as a black box.",
         )
 
         self.parser.add_argument(
             "--dry-run",
             action="store_true",
-            help=(
-                "Send nothing, and need no key: list each file of the Verilog block with where it comes from and why, "
-                "each black box with the files it leaves out, each include rewritten and each option left out, the "
-                "aristotle.f that would go up, the folder's other files, marking those --include-ignored adds, and "
-                "those an ignore rule leaves out, and the prompt, and say how large the upload would be. With --json, "
-                "print that as one JSON object, which doesn't mark the files --include-ignored adds."
-            ),
+            help="List what would go up, and send nothing.",
         )
 
         self.parser.add_argument(
             "--no-questions",
             action="store_true",
-            help=(
-                "Don't let Aristotle ask questions, for a batch run nobody will answer: work that needs a decision only "
-                "you can make is then left unverified and named in the summary. By default it may ask, and waits up "
-                "to 15 minutes for each answer."
-            ),
+            help="Don't let Aristotle ask questions.",
         )
 
     def preflight(self, args: argparse.Namespace) -> int | None:
@@ -392,11 +344,12 @@ class SubmitAction(APIAction):
         )
 
         block_arguments = args.block_arguments or []
+        prompt_only = not (args.project_dir or block_arguments)
         if args.dry_run:
             return self._dry_run(args.prompt, args.project_dir, block_arguments, args.json, args.include_ignored)
 
         try:
-            if args.project_dir or block_arguments:
+            if not prompt_only:
                 if args.project_dir:
                     # Before the block is read from it, as create_from_directory checks it before reading it.
                     check_readable(args.project_dir)
@@ -510,8 +463,10 @@ class SubmitAction(APIAction):
                 )
                 if not questions:
                     unsaved = not task.live
+                    properties = None
                     if not args.json:
-                        log_property_counts(*await fetch_properties_and_tasks(project.project_id, task))
+                        properties, judged_by = await fetch_properties_and_tasks(project.project_id, task)
+                        log_property_counts(properties, judged_by)
                     refresh_error = None
                     # Should the refresh fail, the result's project still says how its run, the task, ended.
                     with_latest_run(project, task)
@@ -549,6 +504,8 @@ class SubmitAction(APIAction):
                     # Fetched before anything is printed, so the JSON is printed once however the command is cut short.
                     if args.json:
                         judged = await judge_properties(project.project_id, task)
+                    elif not task.live:
+                        log_next_steps(task, bool(properties))
             except (KeyboardInterrupt, asyncio.CancelledError):
                 if unsaved:
                     logging.warning(interrupted_save_hint(project.project_id, args.destination))
@@ -564,6 +521,11 @@ class SubmitAction(APIAction):
                         )
                     )
                 raise
+            finally:
+                if prompt_only and not args.json:
+                    # However the wait ends: the warning came before it, and its last frame and closing lines can push
+                    # the warning off screen.
+                    logging.warning(PROMPT_ONLY_REMINDER)
             if questions:
                 return print_questions_pending(task, questions, args.destination)
             if judged is not None:

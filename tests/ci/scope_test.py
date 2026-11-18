@@ -1079,12 +1079,19 @@ def test_is_source_file(filename: str, expected: bool):
 @pytest.mark.parametrize(
     ("files", "expected"),
     [
-        ({"rtl/fifo.v": "module fifo;\nendmodule\n", "sw/main.c": "", "lib.rs": ""}, ["C", "Rust", "Verilog"]),
+        ({"rtl/fifo.v": "module fifo;\nendmodule\n", "sw/main.c": ""}, ["C", "Verilog"]),
+        ({"src/lib.rs": "pub fn f() {}\n"}, []),
         ({"rtl/top.sv": "module top; endmodule", "sim/harness.h": "", "sim/harness.cpp": ""}, ["Verilog"]),
         ({"Theories/Nat.v": "Theorem t : True. Proof. trivial. Qed.\n", "MAIN.C": ""}, []),
         ({"rtl/defs.svh": "`define W 8\n", "rtl/defs.vh": "endmodule"}, []),
     ],
-    ids=["each language", "a header is not C", "Coq and an upper-case .C", "headers are not Verilog"],
+    ids=[
+        "each language",
+        "every account verifies Rust",
+        "a header is not C",
+        "Coq and an upper-case .C",
+        "headers are not Verilog",
+    ],
 )
 def test_gated_languages_follows_aristotles_own_rules(tmp_path: Path, files: dict[str, str], expected: list[str]):
     for name, content in files.items():
@@ -1381,6 +1388,17 @@ def test_outside_ci_the_root_is_the_nearest_folder_up_to_the_top_level_that_hold
     assert scope.local_root(deep, "aristotle.toml") == (git_repo / "rtl").resolve()
     # A file above the top level is no part of the repository.
     assert scope.local_root(deep) == git_repo.resolve()
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink") or os.name == "nt", reason="POSIX symlinks")
+def test_a_link_named_like_the_file_ends_the_search_unfollowed(git_repo: Path):
+    """So that the run judges the link, a broken one included, rather than read a file further up in its place."""
+    deep = git_repo / "rtl" / "deep"
+    deep.mkdir()
+    (git_repo / "aristotle.toml").write_text("")
+    (git_repo / "rtl" / "aristotle.toml").symlink_to("missing.toml")
+
+    assert scope.local_root(deep, "aristotle.toml") == (git_repo / "rtl").resolve()
 
 
 def test_the_search_for_the_file_stops_at_the_top_level(tmp_path: Path):

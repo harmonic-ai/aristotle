@@ -30,13 +30,22 @@ import httpx
 import pytest
 
 from aristotlelib import api_request, local_file_utils
-from aristotlelib.agent_task import ENDED_BADLY, AgentTask, BudgetFailureReason, TaskStatus, ending_notice
+from aristotlelib.agent_task import (
+    ENDED_BADLY,
+    INCOMPLETE_ENDING,
+    AgentTask,
+    BudgetFailureReason,
+    TaskStatus,
+    _told,
+    ending_notice,
+)
 from aristotlelib.api_request import AristotleAPIError, AristotleNotFoundError, set_api_key
 from aristotlelib.cli.command.submit import read_block
 from aristotlelib.cli.question_flow import DEFAULT_DEADLINE_SECONDS, FlowResult, pending_footer, read_stdin_line
 from aristotlelib.declaration import Declaration, DeclarationSource, DeclarationStatus, DeclarationType
 from aristotlelib.event import Event, EventType
 from aristotlelib.local_file_utils import SECRET_FILE_PATTERNS, LeanProjectError
+from aristotlelib.progress_utils import ProgressDisplay
 from aristotlelib.project import (
     ARCHIVE_FILES_HEADER,
     AgentQuestionsSetting,
@@ -61,12 +70,16 @@ from tests.ci.conftest import git, latin1_name, make_declaration
 from tests.conftest import (
     BILLING_PAGE,
     BUY_CREDITS,
+    FRAME_ERASE,
     OUT_OF_CREDITS,
+    Terminal,
     fast_api_clock,
     fstat_on_another_device,
     hard_link,
+    logged_to,
     multipart_parts,
     patched_client,
+    screen_of,
     swapped_for_a_link,
 )
 
@@ -591,6 +604,59 @@ async def test_an_empty_page_ends_the_search_even_with_a_key():
     assert str(info.value) == "No project is named 'fifo'."
 
 
+async def test_an_archived_lookup_reads_only_archived_projects():
+    client = _serving([_listed(OTHER_ID, "other")], [_listed(FIFO_ID, "fifo")])
+
+    with _lookup(client):
+        assert await Project.resolve_id("fifo", archived=True) == FIFO_ID
+
+    assert client.get.await_args_list == [
+        call("/project", params={"pagination_key": None, "limit": 100, "archived": True}),
+        call("/project", params={"pagination_key": "key-0", "limit": 100, "archived": True}),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("reference", "message"),
+    [
+        ("fifo", "No archived project is named 'fifo'."),
+        ("deadbeef", "No archived project has the id prefix or name 'deadbeef'."),
+    ],
+)
+async def test_an_archived_lookup_that_matches_nothing_says_no_archived_project_matches(reference, message):
+    client = _serving([_listed(OTHER_ID, "other")])
+
+    with _lookup(client), pytest.raises(AristotleNotFoundError) as info:
+        await Project.resolve_id(reference, archived=True)
+
+    assert str(info.value) == message
+
+
+async def test_an_archived_lookup_names_the_archived_projects_it_searched_and_did_not(caplog):
+    caplog.set_level(logging.INFO, logger="aristotle")
+    client = _endless([_listed(OTHER_ID, "other")])
+
+    with _lookup(client), pytest.raises(AristotleNotFoundError) as info:
+        await Project.resolve_id("fifo", archived=True)
+
+    assert caplog.messages == [
+        "Searching your 2,000 most recent archived projects for 'fifo'. A full project id needs no search."
+    ]
+    assert str(info.value) == (
+        "No archived project is named 'fifo' among your 2,000 most recent archived projects. Use the full id of an "
+        "older one."
+    )
+
+
+async def test_an_archived_lookup_of_a_uuid_sends_nothing():
+    client = _serving()
+
+    with _lookup(client):
+        assert await Project.resolve_id(FIFO_ID.upper(), archived=True) == FIFO_ID
+
+    client.get.assert_not_awaited()
+
+
 async def test_project_from_id_accepts_a_uuid():
     project_id = uuid.UUID("1b4e28ba-2fa1-11d2-883f-0016d3cca427")
     mock_response = Mock()
@@ -917,6 +983,102 @@ async def test_project_rename_by_id_rejects_bad_input_without_calling_the_api(pr
     mock_client.post.assert_not_called()
 
 
+def _archive_answer(archived_at: str | None) -> httpx.Response:
+    """The project as archive and unarchive answer, archived at ``archived_at`` unless None."""
+    return httpx.Response(
+        200,
+        json={
+            "project_id": RENAMED_ID,
+            "status": 2,
+            "created_at": "2026-11-01T00:00:00",
+            "last_updated": "2026-11-15T07:00:00",
+            "description": "fifo",
+            "has_input": True,
+            "has_files": True,
+            "archived_at": archived_at,
+        },
+    )
+
+
+async def test_archive_by_id_posts_to_the_canonical_id_and_returns_the_archived_project(api_server):
+    sent = api_server(_archive_answer("2026-11-15T07:00:00.123456"))
+
+    project = await Project.archive_by_id("{" + RENAMED_ID.upper() + "}")
+
+    assert [(request.method, request.url.path, request.content) for request in sent] == [
+        ("POST", f"/api/v{api_request.API_VERSION}/project/{RENAMED_ID}/archive", b"")
+    ]
+    assert project.archived_at == datetime(2026, 11, 15, 7, 0, 0, 123456)
+
+
+async def test_unarchive_by_id_posts_to_the_canonical_id_and_returns_the_unarchived_project(api_server):
+    sent = api_server(_archive_answer(None))
+
+    project = await Project.unarchive_by_id(RENAMED_ID.replace("-", ""))
+
+    assert [(request.method, request.url.path) for request in sent] == [
+        ("POST", f"/api/v{api_request.API_VERSION}/project/{RENAMED_ID}/unarchive")
+    ]
+    assert project.archived_at is None
+
+
+@pytest.mark.parametrize("method", ["archive_by_id", "unarchive_by_id"])
+async def test_archiving_is_sent_again_after_a_lost_reply_since_twice_is_once(method: str, api_server):
+    sent = api_server(httpx.ReadTimeout("The read operation timed out"), _archive_answer(None))
+
+    await getattr(Project, method)(RENAMED_ID)
+
+    assert len(sent) == 2
+
+
+async def test_archive_of_a_running_project_raises_the_409(api_server):
+    api_server(httpx.Response(409, json={"detail": "A running or paused project can't be archived"}))
+
+    with pytest.raises(AristotleAPIError) as info:
+        await Project.archive_by_id(RENAMED_ID)
+
+    assert info.value.status_code == 409
+
+
+@pytest.mark.parametrize(("method", "archived_at"), [("archive", datetime(2026, 11, 15, 7)), ("unarchive", None)])
+async def test_archive_and_unarchive_update_the_instance(method: str, archived_at: datetime | None, api_server):
+    project = _unnamed_project()
+    api_server(_archive_answer(None if archived_at is None else archived_at.isoformat()))
+
+    await getattr(project, method)()
+
+    assert (project.archived_at, project.description, project.status) == (archived_at, "fifo", ProjectStatus.IDLE)
+
+
+@pytest.mark.parametrize("method", ["archive_by_id", "unarchive_by_id"])
+@pytest.mark.parametrize("project_id", ["not-a-uuid", "../keys"])
+async def test_archiving_rejects_an_id_that_is_not_a_uuid_without_calling_the_api(method: str, project_id: str):
+    mock_client = AsyncMock()
+
+    with patched_client(mock_client), pytest.raises(ValueError, match=f"'{re.escape(project_id)}' is not a project id"):
+        await getattr(Project, method)(project_id)
+
+    mock_client.post.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("sent", "archived_at"),
+    [
+        ({"archived_at": "2026-11-15T07:00:00+00:00"}, datetime(2026, 11, 15, 7)),
+        ({"archived_at": None}, None),
+        ({}, None),
+    ],
+    ids=["archived", "not archived", "older server"],
+)
+def test_a_project_says_when_it_was_archived(sent: dict, archived_at: datetime | None):
+    record = _unnamed_project().model_dump(mode="json")
+    record.pop("archived_at")
+
+    project = Project.model_validate({**record, **sent})
+
+    assert project.archived_at == archived_at
+
+
 async def test_task_cancel():
     """Test canceling a task."""
     task = AgentTask(
@@ -1053,6 +1215,21 @@ async def test_project_list_projects_by_latest_run_status():
         await Project.list_projects(latest_run_status=[TaskStatus.QUEUED, TaskStatus.IN_PROGRESS])
 
     assert mock_client.get.call_args[1]["params"]["latest_run_status"] == ["QUEUED", "IN_PROGRESS"]
+
+
+@pytest.mark.parametrize(("archived", "params"), [(True, {"archived": True}), (False, {})])
+async def test_project_list_projects_asks_for_archived_projects_only_when_told_to(archived: bool, params: dict):
+    mock_response = Mock()
+    mock_response.json.return_value = {"projects": [], "pagination_key": None}
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=mock_response)
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+
+    with patched_client(mock_client):
+        await Project.list_projects(limit=5, archived=archived)
+
+    mock_client.get.assert_awaited_once_with("/project", params={"pagination_key": None, "limit": 5, **params})
 
 
 async def test_project_get_files():
@@ -2541,6 +2718,13 @@ def test_a_task_that_ended_with_no_progress_recorded_shows_when_it_was_submitted
     assert str(task).splitlines()[0].startswith(f"{status.name} ({verb} ")
 
 
+def test_a_task_that_ended_complete_with_errors_shows_a_review_suggested_as_the_web_app_does():
+    task = _waiting_task()
+    task.status = TaskStatus.COMPLETE_WITH_ERRORS
+
+    assert str(task).splitlines()[0].startswith("REVIEW SUGGESTED (started ")
+
+
 @pytest.mark.parametrize(
     ("fields", "verb"),
     [
@@ -2620,8 +2804,8 @@ async def test_task_wait_for_completion_already_complete():
 
     with patched_client(mock_client):
         with patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])):
-            with patch("aristotlelib.progress_utils.clear_progress_lines"):
-                with patch("aristotlelib.progress_utils.print_progress_lines"):
+            with patch("aristotlelib.progress_utils.ProgressDisplay.clear"):
+                with patch("aristotlelib.progress_utils.ProgressDisplay.draw"):
                     await task.wait_for_completion(interactive=True)
 
     assert task.status == TaskStatus.COMPLETE
@@ -3977,6 +4161,11 @@ def _question_event(event_id: str, status: int = 1, content: str = "Asked a ques
     }
 
 
+def _frames(out: str) -> list[str]:
+    """The frames a wait drew on a terminal, from its stdout: each but the first follows the erasing of the last."""
+    return FRAME_ERASE.split(out)[::2]
+
+
 def _last_live_frame(shown: Mock) -> list[str]:
     """The display's lines before the final frame, which is drawn once the run has ended."""
     return shown.call_args_list[-2].args[0]
@@ -4032,8 +4221,8 @@ async def test_wait_for_completion_displays_follow_up_without_prompting():
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
         patch("aristotlelib.agent_task.can_prompt", return_value=True),
         patch("aristotlelib.agent_task.run_question_flow", new=AsyncMock()) as flow,
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines") as shown,
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw") as shown,
     ):
         pending = await task.wait_for_completion(interactive=True, stop_on_questions=True)
 
@@ -4045,6 +4234,7 @@ async def test_wait_for_completion_displays_follow_up_without_prompting():
     flow.assert_not_awaited()
 
 
+@pytest.mark.usefixtures("terminal_size")
 async def test_a_wait_given_a_title_heads_its_display_with_it(capsys):
     task = _waiting_task()
     task.description = "This is an automated verification run"
@@ -4058,7 +4248,7 @@ async def test_a_wait_given_a_title_heads_its_display_with_it(capsys):
     ):
         await task.wait_for_completion(interactive=True, title="fifo proofs")
 
-    screen = capsys.readouterr().out.split("\033[2J\033[H")[-1].splitlines()
+    screen = screen_of(capsys.readouterr().out)
     assert screen[1:3] == ["fifo proofs", "Task: task-wait-q"]
     assert "automated" not in "\n".join(screen)
 
@@ -4076,12 +4266,18 @@ def test_a_heading_named_after_a_whole_prompt_keeps_its_first_line_cut_short(nam
     assert _waiting_task()._status_lines(name)[1] == heading
 
 
-async def test_a_finished_wait_leaves_its_final_frame_on_a_terminal(capsys, caplog):
+@pytest.mark.parametrize(
+    ("status", "shown", "ending"),
+    [("COMPLETE", "COMPLETE", "Task complete!"), ("COMPLETE_WITH_ERRORS", "REVIEW SUGGESTED", INCOMPLETE_ENDING)],
+    ids=["complete", "review suggested"],
+)
+@pytest.mark.usefixtures("terminal_size")
+async def test_a_finished_wait_leaves_its_final_frame_on_a_terminal(status, shown, ending, capsys, caplog):
     task = _waiting_task()
 
     with (
         patched_client(
-            _streaming_client([_plain_event("event-1", "Summing up")]),
+            _streaming_client([_plain_event("event-1", "Summing up")], end_status=status),
         ),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
         patch("aristotlelib.progress_utils.stdout_is_terminal", return_value=True),
@@ -4089,15 +4285,16 @@ async def test_a_finished_wait_leaves_its_final_frame_on_a_terminal(capsys, capl
     ):
         await task.wait_for_completion(interactive=True)
 
-    screen = capsys.readouterr().out.split("\033[2J\033[H")[-1].splitlines()
-    assert screen[0].startswith("COMPLETE (")
+    screen = screen_of(capsys.readouterr().out)
+    assert screen[0].startswith(f"{shown} (")
     assert screen[1:] == ["Task: task-wait-q", "Project: proj-wait", "MESSAGE: Summing up"]
-    assert caplog.messages[-1] == "Task complete!"
+    assert caplog.messages[-1] == ending
 
 
 @pytest.mark.parametrize(
     ("live_status", "percent_complete", "verb"), [("QUEUED", None, "submitted"), ("IN_PROGRESS", 1, "started")]
 )
+@pytest.mark.usefixtures("terminal_size")
 async def test_a_wait_says_a_run_cancelled_in_the_queue_was_submitted_not_started(
     live_status, percent_complete, verb, capsys
 ):
@@ -4117,7 +4314,7 @@ async def test_a_wait_says_a_run_cancelled_in_the_queue_was_submitted_not_starte
     ):
         await task.wait_for_completion(interactive=True)
 
-    frames = capsys.readouterr().out.split("\033[2J\033[H")
+    frames = _frames(capsys.readouterr().out)
     assert any(frame.startswith(f"{live_status} (") for frame in frames)
     assert frames[-1].startswith(f"CANCELED ({verb} ")
 
@@ -4126,6 +4323,7 @@ async def test_a_wait_says_a_run_cancelled_in_the_queue_was_submitted_not_starte
     ("live_status", "started_at", "verb"),
     [("QUEUED", None, "submitted"), ("IN_PROGRESS", "2024-01-01T00:00:30", "started")],
 )
+@pytest.mark.usefixtures("terminal_size")
 async def test_a_wait_reads_a_cancelled_run_by_its_start_time_from_a_server_that_reports_no_progress(
     live_status, started_at, verb, capsys
 ):
@@ -4147,7 +4345,7 @@ async def test_a_wait_reads_a_cancelled_run_by_its_start_time_from_a_server_that
     ):
         await task.wait_for_completion(interactive=True)
 
-    frames = capsys.readouterr().out.split("\033[2J\033[H")
+    frames = _frames(capsys.readouterr().out)
     assert any(frame.startswith(f"{live_status} (") for frame in frames)
     assert frames[-1].startswith(f"CANCELED ({verb} ")
 
@@ -4171,7 +4369,7 @@ async def test_an_incomplete_run_points_at_its_summary_not_at_the_prompt(caplog)
         await _waiting_task().wait_for_completion(interactive=False)
 
     assert caplog.messages[-1] == (
-        "Aristotle made progress but did not fully complete the request. Its summary says what is left."
+        "Aristotle finished, but the results might not match what you asked for. Its summary says what to review."
     )
 
 
@@ -4406,9 +4604,20 @@ def test_a_tasks_billing_stop_reads_as_a_code_and_prints_with_its_name(sent, rea
     )
 
 
-async def test_a_wait_writes_no_escape_codes_when_stdout_is_not_a_terminal(capsys):
+@pytest.mark.parametrize("terminal", [False, True], ids=["not a terminal", "a dumb terminal"])
+async def test_a_wait_off_a_terminal_prints_its_header_once_then_each_new_event_once(
+    terminal, capsys, caplog, monkeypatch
+):
+    if terminal:
+        monkeypatch.setenv("TERM", "dumb")
     task = _waiting_task()
-    events = [_plain_event("event-1", "Summing up"), _question_event("event-legacy", status=2, content="Which reset?")]
+    events = [
+        _plain_event("event-1", "Summing up"),
+        _plain_event("event-2", "Summing up"),
+        _question_event("event-legacy", status=2, content="Which reset?"),
+        _plain_event("event-3", "Checking"),
+        _plain_event("event-4", "Summing up"),
+    ]
 
     with (
         patched_client(_streaming_client(events)),
@@ -4416,12 +4625,142 @@ async def test_a_wait_writes_no_escape_codes_when_stdout_is_not_a_terminal(capsy
             "aristotlelib.agent_task.Question.list_for_task",
             new=AsyncMock(side_effect=AristotleAPIError("not found", status_code=404)),
         ),
+        patch("aristotlelib.progress_utils.stdout_is_terminal", return_value=terminal),
+        caplog.at_level(logging.INFO, logger="aristotle"),
+    ):
+        await task.wait_for_completion(interactive=True, num_events=2)
+
+    lines = capsys.readouterr().out.splitlines()
+    assert "\033" not in "\n".join(lines)
+    assert [lines[0].partition(" (")[0], lines[-1].partition(" (")[0]] == ["IN_PROGRESS", "COMPLETE"]
+    assert lines[1:-1] == [
+        "Task: task-wait-q",
+        "Project: proj-wait",
+        "MESSAGE: Summing up",
+        "MESSAGE: Checking",
+        "MESSAGE: Summing up",
+    ]
+    # The question, which nobody was prompted to answer, is logged once and not printed again.
+    assert [message for message in caplog.messages if "Which reset?" in message] == ["Aristotle asked: Which reset?"]
+
+
+@pytest.mark.parametrize("terminal", [False, True], ids=["not a terminal", "a dumb terminal"])
+async def test_a_wait_off_a_terminal_prints_the_counts_as_they_change_and_logs_the_pending_questions(
+    terminal, capsys, caplog, monkeypatch
+):
+    if terminal:
+        monkeypatch.setenv("TERM", "dumb")
+    # A refresh, and with it a count, on every event.
+    monkeypatch.setattr("aristotlelib.agent_task.QUESTION_REFRESH_SECONDS", 0)
+    task = _waiting_task()
+    events = [_plain_event(f"event-{number}", f"Step {number}") for number in range(1, 7)]
+    flow = AsyncMock(return_value=FlowResult(summary=["Cancelled."], unanswered=[_pending_question(1)]))
+    counted: list[DeclarationStatus] = []
+
+    async def listed(project_id: str, declaration_type: DeclarationType) -> list[Declaration]:
+        counted.append(DeclarationStatus.IN_PROGRESS if not counted else DeclarationStatus.PROVED)
+        return [_property(1, counted[-1])]
+
+    with (
+        patched_client(_streaming_client(events)),
+        patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[_pending_question(1)])),
+        patch("aristotlelib.agent_task.Declaration.list_all_for_project", new=listed),
+        patch("aristotlelib.cli.api_action.fetch_tasks", new=AsyncMock(return_value=[task])),
+        patch("aristotlelib.progress_utils.stdout_is_terminal", return_value=terminal),
+        patch("aristotlelib.agent_task.can_prompt", return_value=terminal),
+        patch("aristotlelib.agent_task.run_question_flow", new=flow),
+        caplog.at_level(logging.INFO, logger="aristotle"),
     ):
         await task.wait_for_completion(interactive=True)
 
-    out = capsys.readouterr().out
-    assert "\033" not in out
-    assert out.endswith("Task: task-wait-q\nProject: proj-wait\nMESSAGE: Summing up\nAristotle asked: Which reset?\n")
+    footer = pending_footer(1, "proj-wait")
+    lines = capsys.readouterr().out.splitlines()
+    # Counted more than twice, the counts changed once.
+    assert len(counted) > 2
+    counts = [line for line in lines if line.startswith("Properties: ")]
+    assert counts == [
+        "Properties: 0 proved · 0 refuted · 1 in progress",
+        "Properties: 1 proved · 0 refuted · 0 in progress",
+    ]
+    assert footer not in lines
+    # Asked at the prompt, or logged once, and the footer logged once after either, where stderr goes.
+    assert caplog.messages.count(footer) == 1
+    assert flow.await_count == int(terminal)
+    assert (f"Aristotle asked: {_pending_question(1).content}" in caplog.messages) is not terminal
+
+
+async def test_at_a_terminal_the_counts_stay_in_the_frame_and_never_go_above_it(monkeypatch):
+    # A refresh, and with it a count, on every event.
+    monkeypatch.setattr("aristotlelib.agent_task.QUESTION_REFRESH_SECONDS", 0)
+    task = _waiting_task()
+    events = [_plain_event(f"event-{number}", f"Step {number}") for number in range(1, 5)]
+    counted: list[DeclarationStatus] = []
+
+    async def listed(project_id: str, declaration_type: DeclarationType) -> list[Declaration]:
+        counted.append(DeclarationStatus.IN_PROGRESS if not counted else DeclarationStatus.PROVED)
+        return [_property(1, counted[-1])]
+
+    with (
+        patched_client(_streaming_client(events)),
+        patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
+        patch("aristotlelib.agent_task.Declaration.list_all_for_project", new=listed),
+        patch("aristotlelib.cli.api_action.fetch_tasks", new=AsyncMock(return_value=[task])),
+        patch("aristotlelib.progress_utils.stdout_is_terminal", return_value=True),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw") as shown,
+    ):
+        await task.wait_for_completion(interactive=True)
+
+    # Never new to a frame redrawn in place, so a crowded one drops them for now rather than printing them above it.
+    frames = [line for call in shown.call_args_list for line in call.args[0]]
+    new = [line for call in shown.call_args_list for line in call.args[1]]
+    assert "Properties: 1 proved · 0 refuted · 0 in progress" in frames
+    assert not [line for line in new if line.startswith("Properties: ")]
+
+
+@pytest.mark.usefixtures("terminal_size")
+async def test_at_a_terminal_the_pending_questions_footer_is_pinned_to_the_frame_not_logged(caplog):
+    task = _waiting_task()
+    terminal = Terminal()
+
+    with (
+        patch("sys.stdout", new=terminal),
+        patched_client(_streaming_client([_plain_event("event-1", "Reading")])),
+        patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[_pending_question(1)])),
+        patch("aristotlelib.agent_task.can_prompt", return_value=False),
+        caplog.at_level(logging.INFO, logger="aristotle"),
+    ):
+        await task.wait_for_completion(interactive=True)
+
+    assert caplog.messages.count(f"Aristotle asked: {_pending_question(1).content}") == 1
+    assert pending_footer(1, "proj-wait") not in caplog.messages
+    assert pending_footer(1, "proj-wait") in terminal.getvalue()
+
+
+@pytest.mark.parametrize("listed", [True, False], ids=["listed question", "legacy question event"])
+async def test_a_wait_shows_a_question_it_cannot_prompt_for_on_its_display_where_nothing_logs_info(
+    listed, capsys, caplog
+):
+    task = _waiting_task()
+    events = [_plain_event("event-1", "Reading"), _question_event("event-q1", status=2, content="Question number 1?")]
+    listing = (
+        AsyncMock(return_value=[_pending_question(1)])
+        if listed
+        else AsyncMock(side_effect=AristotleAPIError("not found", status_code=404))
+    )
+
+    with (
+        patched_client(_streaming_client(events)),
+        patch("aristotlelib.agent_task.Question.list_for_task", new=listing),
+        patch("aristotlelib.progress_utils.stdout_is_terminal", return_value=False),
+        patch("aristotlelib.agent_task.can_prompt", return_value=False),
+        caplog.at_level(logging.WARNING, logger="aristotle"),
+    ):
+        await task.wait_for_completion(interactive=True)
+
+    # As a program that hasn't configured logging, such as a notebook, sees it: once, and the footer once, on stdout.
+    lines = capsys.readouterr().out.splitlines()
+    assert lines.count("Aristotle asked: Question number 1?") == 1
+    assert lines.count(pending_footer(1, "proj-wait")) == int(listed)
 
 
 @pytest.mark.parametrize("listed", [True, False], ids=["listed question", "legacy question event"])
@@ -4460,20 +4799,109 @@ async def test_a_wait_with_default_arguments_leaves_the_terminal_alone_and_logs_
     ("error", "outcome"),
     [(httpx.ReadError("connection reset"), nullcontext()), (KeyboardInterrupt(), pytest.raises(KeyboardInterrupt))],
 )
-async def test_a_wait_that_breaks_off_leaves_the_last_frame_on_a_terminal(error, outcome, capsys):
+@pytest.mark.usefixtures("terminal_size")
+async def test_a_wait_that_breaks_off_leaves_the_last_frame_above_its_message_on_a_terminal(error, outcome):
     task = _waiting_task()
+    terminal = Terminal()
 
     with (
+        patch("sys.stdout", new=terminal),
+        logged_to(terminal),
         patched_client(_streaming_client([])),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(side_effect=error)),
-        patch("aristotlelib.progress_utils.stdout_is_terminal", return_value=True),
         outcome,
     ):
         await task.wait_for_completion(interactive=True)
 
-    screen = capsys.readouterr().out.split("\033[2J\033[H")[-1].splitlines()
+    screen = screen_of(terminal.getvalue())
     assert screen[0].startswith("IN_PROGRESS (started ")
-    assert screen[1:] == ["Task: task-wait-q", "Project: proj-wait"]
+    assert screen[1:3] == ["Task: task-wait-q", "Project: proj-wait"]
+    assert screen[3].startswith(("The connection to Aristotle kept failing", "Task task-wait-q is still running."))
+
+
+@pytest.mark.usefixtures("terminal_size")
+async def test_at_a_terminal_a_wait_logs_above_its_frame_and_ends_below_it():
+    task = _waiting_task()
+    client = _streaming_client([_plain_event("event-1", "Reading"), _plain_event("event-2", "Proving")])
+    stream_events = client.stream_sse
+
+    async def with_an_outage(endpoint, on_outage, **kwargs):
+        events = stream_events(endpoint, **kwargs)
+        yield await events.__anext__()
+        on_outage(httpx.ConnectError("refused"))
+        on_outage(None)
+        async for event in events:
+            yield event
+
+    client.stream_sse = with_an_outage
+    terminal = Terminal()
+    with (
+        patch("sys.stdout", new=terminal),
+        logged_to(terminal),
+        patched_client(client),
+        patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
+    ):
+        await task.wait_for_completion(interactive=True)
+
+    screen = screen_of(terminal.getvalue())
+    assert screen[:2] == [
+        "The connection to Aristotle failed: ConnectError: refused. Trying again for up to 10 minutes while the task "
+        "goes on.",
+        "The connection to Aristotle is back.",
+    ]
+    assert screen[2].startswith("COMPLETE (")
+    assert screen[3:] == [
+        "Task: task-wait-q",
+        "Project: proj-wait",
+        "MESSAGE: Reading",
+        "MESSAGE: Proving",
+        "Task complete!",
+    ]
+
+
+@pytest.mark.usefixtures("terminal_size")
+@pytest.mark.parametrize(
+    ("ending", "message"),
+    [
+        ("the refresh fails", "The event stream ended, and the task's status could not be checked."),
+        ("the stream gives up", "The task could not be followed:"),
+        ("questions are handed back", "After the wait."),
+        ("an unexpected error", "After the wait."),
+    ],
+)
+async def test_at_a_terminal_what_follows_a_wait_prints_below_its_last_frame(ending, message):
+    task = _waiting_task()
+    client = _streaming_client([_plain_event("event-1", "Reading")])
+    listing = AsyncMock(return_value=[_pending_question(1)] if ending == "questions are handed back" else [])
+    failure = RuntimeError("boom") if ending == "an unexpected error" else AristotleAPIError("Unavailable", 503)
+    if ending == "the refresh fails":
+        client.get = AsyncMock(side_effect=failure)
+    elif ending in ("the stream gives up", "an unexpected error"):
+
+        async def failing(endpoint, **_):
+            raise failure
+            yield
+
+        client.stream_sse = failing
+    terminal = Terminal()
+
+    with (
+        patch("sys.stdout", new=terminal),
+        logged_to(terminal),
+        patched_client(client),
+        patch("aristotlelib.agent_task.Question.list_for_task", new=listing),
+        patch("aristotlelib.agent_task.can_prompt", return_value=False),
+        pytest.raises(RuntimeError) if ending == "an unexpected error" else nullcontext(),
+    ):
+        await task.wait_for_completion(interactive=True, stop_on_questions=True)
+    with logged_to(terminal):
+        logging.getLogger("aristotle").info("After the wait.")
+
+    screen = screen_of(terminal.getvalue())
+    frames = [number for number, line in enumerate(screen) if line.startswith("IN_PROGRESS (")]
+    assert len(frames) == 1
+    assert frames[0] < next(number for number, line in enumerate(screen) if line.startswith(message))
+    assert screen[-1] == "After the wait."
 
 
 def _property(number: int, status: DeclarationStatus, last_updated: datetime = datetime(2024, 1, 1)) -> Declaration:
@@ -4498,7 +4926,7 @@ async def _frames_of_a_wait(
         patched_client(client),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
         patch("aristotlelib.agent_task.Declaration.list_all_for_project", new=list_properties),
-        patch("aristotlelib.progress_utils.print_progress_lines") as shown,
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw") as shown,
     ):
         await (task or _waiting_task()).wait_for_completion(interactive=interactive, **wait)
     return [frame.args[0] for frame in shown.call_args_list]
@@ -4708,8 +5136,8 @@ async def test_wait_for_completion_presents_the_pending_questions_as_a_set():
             "aristotlelib.agent_task.run_question_flow", new=AsyncMock(return_value=FlowResult(answered=[q1, q2]))
         ) as flow,
         patch("aristotlelib.agent_task.can_prompt", return_value=True),
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines") as shown,
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw") as shown,
     ):
         await task.wait_for_completion(interactive=True)
 
@@ -4849,8 +5277,8 @@ async def test_wait_for_completion_does_not_reopen_the_flow_for_events_of_the_sa
             "aristotlelib.agent_task.run_question_flow", new=AsyncMock(return_value=FlowResult(answered=[q1, q2]))
         ) as flow,
         patch("aristotlelib.agent_task.can_prompt", return_value=True),
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw"),
     ):
         await task.wait_for_completion(interactive=True)
 
@@ -4873,8 +5301,8 @@ async def test_wait_for_completion_reopens_the_flow_when_a_new_question_arrives(
             new=AsyncMock(side_effect=[FlowResult(unanswered=[q1]), FlowResult(answered=[q1, q2])]),
         ) as flow,
         patch("aristotlelib.agent_task.can_prompt", return_value=True),
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw"),
     ):
         await task.wait_for_completion(interactive=True)
 
@@ -4898,8 +5326,8 @@ async def test_wait_for_completion_falls_back_to_the_event_when_there_is_no_ques
         ) as listed,
         patch("aristotlelib.agent_task.run_question_flow", new=AsyncMock()) as flow,
         patch.object(AgentTask, "_prompt_for_answer", new=AsyncMock()) as prompt,
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw"),
     ):
         await task.wait_for_completion(interactive=True)
 
@@ -4921,8 +5349,8 @@ async def test_wait_for_completion_uses_the_event_for_a_question_the_list_does_n
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[durable])),
         patch("aristotlelib.agent_task.run_question_flow", new=AsyncMock()) as flow,
         patch.object(AgentTask, "_prompt_for_answer", new=AsyncMock()) as prompt,
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw"),
     ):
         await task.wait_for_completion(interactive=True)
 
@@ -4931,7 +5359,7 @@ async def test_wait_for_completion_uses_the_event_for_a_question_the_list_does_n
     assert prompt.call_args.args[0].event_id == "event-legacy"
 
 
-async def test_wait_for_completion_pins_a_footer_while_questions_stay_pending():
+async def test_wait_for_completion_pins_a_footer_while_questions_stay_pending(caplog):
     task = _waiting_task()
     q1, q2 = _pending_question(1), _pending_question(2)
 
@@ -4945,8 +5373,9 @@ async def test_wait_for_completion_pins_a_footer_while_questions_stay_pending():
             new=AsyncMock(return_value=FlowResult(unanswered=[q1, q2], cancelled=True)),
         ),
         patch("aristotlelib.agent_task.can_prompt", return_value=True),
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines") as shown,
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw") as shown,
+        caplog.at_level(logging.INFO, logger="aristotle"),
     ):
         await task.wait_for_completion(interactive=True)
 
@@ -4957,7 +5386,7 @@ async def test_wait_for_completion_pins_a_footer_while_questions_stay_pending():
     assert not any("pending" in line for line in shown.call_args_list[-1].args[0])
 
 
-async def test_wait_for_completion_clears_the_footer_once_answered_elsewhere():
+async def test_wait_for_completion_clears_the_footer_once_answered_elsewhere(caplog):
     """The periodic refresh re-counts, so an answer given elsewhere clears the footer."""
     task = _waiting_task()
     q1 = _pending_question(1)
@@ -4970,8 +5399,9 @@ async def test_wait_for_completion_clears_the_footer_once_answered_elsewhere():
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(side_effect=lambda _id: listings.pop(0))),
         patch("aristotlelib.agent_task.run_question_flow", new=AsyncMock(return_value=FlowResult(unanswered=[q1]))),
         patch("aristotlelib.agent_task.can_prompt", return_value=True),
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines") as shown,
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw") as shown,
+        caplog.at_level(logging.INFO, logger="aristotle"),
     ):
         await task.wait_for_completion(interactive=True)
 
@@ -4990,16 +5420,17 @@ async def test_wait_for_completion_does_not_prompt_without_a_terminal(caplog):
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[q1])),
         patch("aristotlelib.agent_task.run_question_flow", new=AsyncMock()) as flow,
         patch("aristotlelib.agent_task.can_prompt", return_value=False),
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines") as shown,
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw") as shown,
         caplog.at_level(logging.INFO),
     ):
         await task.wait_for_completion(interactive=True)
 
     flow.assert_not_called()
-    assert "Aristotle asked: Question number 1?" in caplog.text
-    assert "1 question pending — answer with: aristotle questions proj-wait" in caplog.text
-    assert _last_live_frame(shown)[-2:] == ["Aristotle asked: Question number 1?", pending_footer(1, "proj-wait")]
+    # Off a terminal, the footer is logged after the question, and only frames a terminal redraws pin it.
+    assert caplog.messages.count("Aristotle asked: Question number 1?") == 1
+    assert caplog.messages.count(pending_footer(1, "proj-wait")) == 1
+    assert _last_live_frame(shown)[-2:] == ["Project: proj-wait", pending_footer(1, "proj-wait")]
 
 
 def _plain_event(event_id: str, content: str = "Working") -> dict:
@@ -5044,8 +5475,8 @@ async def test_wait_for_completion_keeps_using_the_questions_endpoint_after_a_tr
             "aristotlelib.agent_task.run_question_flow", new=AsyncMock(return_value=FlowResult(answered=[q1]))
         ) as flow,
         patch("aristotlelib.agent_task.can_prompt", return_value=True),
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines") as shown,
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw") as shown,
     ):
         await task.wait_for_completion(interactive=True)
 
@@ -5070,8 +5501,8 @@ async def test_wait_for_completion_presents_a_question_whose_row_was_not_visible
             "aristotlelib.agent_task.run_question_flow", new=AsyncMock(return_value=FlowResult(answered=[q1]))
         ) as flow,
         patch("aristotlelib.agent_task.can_prompt", return_value=True),
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw"),
     ):
         await task.wait_for_completion(interactive=True)
 
@@ -5093,8 +5524,8 @@ async def test_wait_for_completion_keeps_the_footer_when_a_re_count_fails():
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(side_effect=list_for_task)),
         patch("aristotlelib.agent_task.run_question_flow", new=AsyncMock(return_value=FlowResult(unanswered=[q1]))),
         patch("aristotlelib.agent_task.can_prompt", return_value=True),
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines") as shown,
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw") as shown,
     ):
         await task.wait_for_completion(interactive=True)
 
@@ -5116,17 +5547,18 @@ async def test_wait_for_completion_legacy_fallback_never_reads_a_pipe_as_the_ans
         patch("aristotlelib.agent_task.can_prompt", return_value=False),
         patch("builtins.input", Mock(side_effect=AssertionError("must not read stdin"))) as mock_input,
         patch("aristotlelib.agent_task.Event.answer", new=AsyncMock()) as answered,
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines") as shown,
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw") as shown,
         caplog.at_level(logging.INFO),
     ):
         await task.wait_for_completion(interactive=True)
 
     mock_input.assert_not_called()
     answered.assert_not_called()
-    assert "Aristotle asked: Which polarity?" in caplog.text
-    # The redraw clears the terminal, so the question stays on the display, not only in the log.
-    assert any(line.startswith("Aristotle asked: Which polarity?") for line in shown.call_args_list[-1].args[0])
+    assert caplog.messages.count("Aristotle asked: Which polarity?") == 1
+    # Logged above the display, which doesn't repeat it.
+    frames = ["\n".join(call.args[0]) for call in shown.call_args_list]
+    assert not any("Which polarity?" in frame for frame in frames)
 
 
 async def test_wait_for_completion_does_not_prompt_for_a_durable_question_answered_elsewhere():
@@ -5140,8 +5572,8 @@ async def test_wait_for_completion_does_not_prompt_for_a_durable_question_answer
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[answered])),
         patch("aristotlelib.agent_task.run_question_flow", new=AsyncMock()) as flow,
         patch.object(AgentTask, "_prompt_for_answer", new=AsyncMock()) as prompt,
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines") as shown,
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw") as shown,
     ):
         await task.wait_for_completion(interactive=True)
 
@@ -5163,8 +5595,8 @@ async def test_wait_for_completion_still_shows_a_timed_out_question_from_an_olde
         ),
         patch("aristotlelib.agent_task.run_question_flow", new=AsyncMock()) as flow,
         patch.object(AgentTask, "_prompt_for_answer", new=AsyncMock()) as prompt,
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines") as shown,
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw") as shown,
     ):
         await task.wait_for_completion(interactive=True)
 
@@ -5195,8 +5627,8 @@ async def test_wait_for_completion_shows_the_timed_out_notice_for_a_question_it_
         patched_client(_streaming_client(events)),
         patch("aristotlelib.agent_task.Question.list_for_task", new=listing),
         patch.object(AgentTask, "_prompt_for_answer", new=AsyncMock()) as prompt,
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines") as shown,
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw") as shown,
     ):
         await task.wait_for_completion(interactive=True)
 
@@ -5208,8 +5640,8 @@ async def test_wait_for_completion_shows_the_timed_out_notice_for_a_question_it_
     )
 
 
-async def test_wait_for_completion_keeps_the_flow_outcome_on_the_display():
-    """The flow's summary stays in the event window across redraws."""
+async def test_wait_for_completion_leaves_the_flow_outcome_above_the_display():
+    """The flow prints its outcome above the display, which doesn't repeat it, and pins the footer last."""
     task = _waiting_task()
     q1, q2 = _pending_question(1), _pending_question(2)
     summary = ["Answered question 1: Yes", "Question 2 still pending; answer later with: aristotle questions proj-wait"]
@@ -5225,20 +5657,18 @@ async def test_wait_for_completion_keeps_the_flow_outcome_on_the_display():
             new=AsyncMock(return_value=FlowResult(answered=[q1], unanswered=[q2], summary=summary)),
         ),
         patch("aristotlelib.agent_task.can_prompt", return_value=True),
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines") as shown,
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw") as shown,
     ):
         await task.wait_for_completion(interactive=True)
 
     assert remaining == []
     lines = _last_live_frame(shown)
-    outcome = lines.index("\n".join(summary))
-    # After the outcome comes the later event, and the footer is still pinned last.
-    assert lines[outcome + 1] == "MESSAGE: Working"
-    assert lines[-1] == pending_footer(1, "proj-wait")
+    assert "\n".join(summary) not in lines
+    assert lines[-2:] == ["MESSAGE: Working", pending_footer(1, "proj-wait")]
 
 
-async def test_wait_for_completion_reports_a_skipped_question_the_agent_gave_up_on():
+async def test_wait_for_completion_reports_a_skipped_question_the_agent_gave_up_on(caplog):
     """A presented question the re-count finds ignored drops the footer and adds a notice."""
     task = _waiting_task()
     q1 = _pending_question(1)
@@ -5252,8 +5682,9 @@ async def test_wait_for_completion_reports_a_skipped_question_the_agent_gave_up_
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(side_effect=list_for_task)),
         patch("aristotlelib.agent_task.run_question_flow", new=AsyncMock(return_value=FlowResult(unanswered=[q1]))),
         patch("aristotlelib.agent_task.can_prompt", return_value=True),
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines") as shown,
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw") as shown,
+        caplog.at_level(logging.INFO, logger="aristotle"),
     ):
         await task.wait_for_completion(interactive=True)
 
@@ -5296,8 +5727,8 @@ async def test_wait_for_completion_refreshes_on_a_quiet_stream(monkeypatch):
             "aristotlelib.agent_task.run_question_flow", new=AsyncMock(return_value=FlowResult(answered=[q1]))
         ) as flow,
         patch("aristotlelib.agent_task.can_prompt", return_value=True),
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw"),
     ):
         await task.wait_for_completion(interactive=True)
 
@@ -5318,8 +5749,8 @@ async def test_a_lagging_question_row_is_not_reported_as_timed_out():
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(side_effect=list_for_task)),
         patch("aristotlelib.agent_task.run_question_flow", new=AsyncMock(return_value=FlowResult(answered=[q1]))),
         patch("aristotlelib.agent_task.can_prompt", return_value=True),
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines") as shown,
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw") as shown,
     ):
         await task.wait_for_completion(interactive=True)
 
@@ -5339,8 +5770,8 @@ async def test_a_placeholder_no_record_ever_claims_is_shown_without_a_timeout_cl
         ),
         patch("aristotlelib.agent_task.Question.list_for_task", new=list_for_task),
         patch("aristotlelib.agent_task.can_prompt", return_value=True),
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines") as shown,
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw") as shown,
     ):
         await task.wait_for_completion(interactive=True)
 
@@ -5519,8 +5950,8 @@ async def test_a_failed_task_refresh_on_a_quiet_stream_does_not_end_the_wait(mon
     with (
         patched_client(client),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw"),
         caplog.at_level(logging.INFO, logger="aristotle"),
     ):
         await task.wait_for_completion(interactive=True)
@@ -5548,8 +5979,8 @@ async def test_a_stream_that_fails_is_one_error_line(failure, carry_on, caplog):
     with (
         patched_client(client),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw"),
         caplog.at_level(logging.INFO, logger="aristotle"),
     ):
         await task.wait_for_completion(interactive=True, carry_on=carry_on)
@@ -5559,6 +5990,34 @@ async def test_a_stream_that_fails_is_one_error_line(failure, carry_on, caplog):
     assert [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR] == [
         "The connection to Aristotle kept failing for 10 minutes, so the wait stopped. The task goes on.\n"
         f"{follow}\nCancel it with: aristotle cancel proj-wait"
+    ]
+
+
+@pytest.mark.parametrize("carry_on", [None, RESUME], ids=["show", "the caller's command"])
+async def test_a_stream_whose_request_cannot_be_sent_is_one_error_line_without_the_outage_limit(carry_on, caplog):
+    task = _waiting_task()
+    client = _streaming_client([])
+
+    async def fails(endpoint, **_):
+        raise httpx.LocalProtocolError("")
+        yield
+
+    client.stream_sse = fails
+
+    with (
+        patched_client(client),
+        patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw"),
+        caplog.at_level(logging.INFO, logger="aristotle"),
+    ):
+        assert await task.wait_for_completion(interactive=True, carry_on=carry_on) == []
+
+    assert task.live
+    follow = "Follow it with: aristotle show proj-wait" if carry_on is None else RESUME
+    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR] == [
+        "The request for the task's events couldn't be sent (LocalProtocolError), so the wait stopped. The task goes "
+        f"on.\n{follow}\nCancel it with: aristotle cancel proj-wait"
     ]
 
 
@@ -5577,8 +6036,8 @@ async def test_a_stream_that_gives_up_on_a_retryable_status_is_one_error_line(st
     with (
         patched_client(client),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw"),
         caplog.at_level(logging.INFO, logger="aristotle"),
     ):
         assert await task.wait_for_completion(interactive=True) == []
@@ -5607,8 +6066,8 @@ async def test_a_wait_whose_stream_keeps_failing_ends_once_a_refresh_sees_the_ru
     with (
         patched_client(client),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw"),
         caplog.at_level(logging.INFO, logger="aristotle"),
     ):
         assert await asyncio.wait_for(task.wait_for_completion(interactive=True), 5) == []
@@ -5781,10 +6240,9 @@ async def test_a_refresh_after_a_clean_end_runs_quietly(caplog):
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 
-@pytest.mark.parametrize("num_events", [3, 0])
-async def test_a_wait_at_a_terminal_shows_the_outage_while_it_lasts(monkeypatch, num_events):
-    """Each frame clears the terminal, log lines included, so the frames carry the outage, whatever --limit is. The
-    stream's read, which goes on during a question prompt, draws no frame itself."""
+async def test_a_wait_logs_the_outage_once_and_keeps_it_out_of_its_frames(monkeypatch, caplog):
+    """The logged line stays above the frame at a terminal, so no frame repeats it. The stream's read, which goes on
+    during a question prompt, draws no frame itself."""
     monkeypatch.setattr("aristotlelib.agent_task.QUESTION_REFRESH_SECONDS", 0.01)
     task = _waiting_task()
     client = _streaming_client([])
@@ -5820,15 +6278,50 @@ async def test_a_wait_at_a_terminal_shows_the_outage_while_it_lasts(monkeypatch,
     with (
         patched_client(client),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines") as shown,
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw") as shown,
+        caplog.at_level(logging.INFO, logger="aristotle"),
     ):
-        await asyncio.wait_for(task.wait_for_completion(num_events=num_events, interactive=True), 5)
+        await asyncio.wait_for(task.wait_for_completion(interactive=True), 5)
 
-    # Every refresh's frame in the outage carries it, pinned last; once it's back, the frames don't.
+    # The refreshes in the outage go on drawing frames, none of which carries it.
     assert len(during) >= 3
-    assert all(frame[-1] == failed for frame in during)
-    assert failed not in shown.call_args_list[-1].args[0]
+    frames = ["\n".join(frame) for frame in during]
+    assert not any(failed in frame for frame in frames)
+    assert caplog.messages.count(failed) == 1
+    assert caplog.messages.count("The connection to Aristotle is back.") == 1
+
+
+async def test_a_wait_shows_the_outage_among_its_events_where_no_handler_shows_the_log(monkeypatch):
+    """As in a program that hasn't configured logging, whose records reach only the library's NullHandler."""
+    monkeypatch.setattr("aristotlelib.agent_task.QUESTION_REFRESH_SECONDS", 0.01)
+    monkeypatch.setattr(logging.getLogger("aristotle"), "propagate", False)
+    task = _waiting_task()
+    client = _streaming_client([])
+    failed = (
+        "The connection to Aristotle failed: ConnectError: All connection attempts failed. Trying again for up to 10 "
+        "minutes while the task goes on."
+    )
+
+    async def outage_then_back(endpoint, *, on_outage, **_):
+        on_outage(httpx.ConnectError("All connection attempts failed"))
+        while not any(failed in call.args[0] for call in shown.call_args_list):
+            await asyncio.sleep(0.01)
+        on_outage(None)
+        client.stream_ended = True
+        yield _plain_event("event-1", "Done")
+
+    client.stream_sse = outage_then_back
+    with (
+        patched_client(client),
+        patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw") as shown,
+    ):
+        await asyncio.wait_for(task.wait_for_completion(interactive=True), 5)
+
+    new = [line for call in shown.call_args_list for line in call.args[1]]
+    assert new.count(failed) == 1
+    assert new.count("The connection to Aristotle is back.") == 1
 
 
 async def test_a_run_that_ends_in_an_outage_leaves_no_outage_in_the_last_frame(caplog):
@@ -5851,8 +6344,8 @@ async def test_a_run_that_ends_in_an_outage_leaves_no_outage_in_the_last_frame(c
     with (
         patched_client(client),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines") as shown,
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw") as shown,
         caplog.at_level(logging.INFO, logger="aristotle"),
     ):
         await task.wait_for_completion(interactive=True)
@@ -5918,8 +6411,8 @@ async def test_a_stream_refused_with_a_final_status_raises_it():
     with (
         patched_client(client),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw"),
         pytest.raises(api_request.AristotleAPIError) as info,
     ):
         await task.wait_for_completion(interactive=True)
@@ -6086,8 +6579,8 @@ async def test_a_stream_that_ends_before_the_task_does_is_reported(caplog):
     with (
         patched_client(client),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw"),
         caplog.at_level(logging.INFO, logger="aristotle"),
     ):
         await task.wait_for_completion(interactive=True)
@@ -6120,8 +6613,8 @@ async def test_a_stream_that_ends_with_the_status_out_of_reach_still_names_the_n
     with (
         patched_client(client),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw"),
         caplog.at_level(logging.INFO, logger="aristotle"),
     ):
         await task.wait_for_completion(interactive=True, carry_on=carry_on)
@@ -6147,8 +6640,8 @@ async def test_a_stream_that_ends_before_a_queued_run_starts_says_it_never_start
     with (
         patched_client(client),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw"),
         caplog.at_level(logging.INFO, logger="aristotle"),
     ):
         await task.wait_for_completion(interactive=True)
@@ -6200,8 +6693,8 @@ async def test_a_failed_final_refresh_ends_the_wait_with_a_warning(caplog):
     with (
         patched_client(client),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[])),
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw"),
         caplog.at_level(logging.INFO, logger="aristotle"),
     ):
         await task.wait_for_completion(interactive=True)
@@ -6218,12 +6711,53 @@ async def test_the_per_event_prompt_shows_its_question_on_stderr_whatever_loggin
         patch("aristotlelib.agent_task.can_prompt", return_value=True),
         patch("aristotlelib.agent_task.read_stdin_line", new=AsyncMock(return_value="Active low")),
         patch("aristotlelib.agent_task.Event.answer", new=AsyncMock()) as answer,
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
     ):
-        assert await task._prompt_for_answer(event) is True
+        await task._prompt_for_answer(event, ProgressDisplay())
 
     assert capsys.readouterr().err == f"{event}\nType your answer:\n"
     answer.assert_awaited_once_with("Active low")
+
+
+@pytest.mark.parametrize(
+    ("handler_level", "entries"),
+    [(logging.INFO, []), (logging.ERROR, ["Aristotle asked: Which reset?"])],
+    ids=["a handler that takes INFO", "one that takes only errors"],
+)
+def test_a_line_is_logged_where_a_handler_takes_its_level_and_left_to_the_display_where_none_does(
+    handler_level, entries, caplog, monkeypatch
+):
+    aristotle = logging.getLogger("aristotle")
+    # Only its own handlers, not pytest's on the root logger.
+    monkeypatch.setattr(aristotle, "propagate", False)
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setLevel(handler_level)
+    with caplog.at_level(logging.INFO, logger="aristotle"):
+        aristotle.addHandler(handler)
+        try:
+            told = _told(["Aristotle asked: Which reset?"], ProgressDisplay())
+        finally:
+            aristotle.removeHandler(handler)
+
+    assert told == entries
+    assert stream.getvalue() == ("" if entries else "Aristotle asked: Which reset?\n")
+
+
+@pytest.mark.parametrize("info_logged", [True, False], ids=["logged at INFO", "nothing logs INFO"])
+async def test_the_per_event_question_nobody_is_prompted_for_is_logged_or_else_left_to_the_display(info_logged, caplog):
+    task = _waiting_task()
+    event = Event.model_validate(_question_event("event-legacy", status=2, content="Which polarity?"))
+
+    with (
+        patch("aristotlelib.agent_task.can_prompt", return_value=False),
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        caplog.at_level(logging.INFO if info_logged else logging.WARNING, logger="aristotle"),
+    ):
+        entries = await task._prompt_for_answer(event, ProgressDisplay())
+
+    assert entries == ([] if info_logged else [str(event)])
+    assert (str(event) in caplog.messages) is info_logged
 
 
 @pytest.mark.parametrize(
@@ -6243,10 +6777,10 @@ async def test_the_per_event_prompt_reports_a_refused_answer(error, expected, ca
         patch("aristotlelib.agent_task.can_prompt", return_value=True),
         patch("aristotlelib.agent_task.read_stdin_line", new=AsyncMock(return_value="Active low")),
         patch("aristotlelib.agent_task.Event.answer", new=AsyncMock(side_effect=error)),
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
         caplog.at_level(logging.INFO, logger="aristotle"),
     ):
-        assert await task._prompt_for_answer(event) is True
+        await task._prompt_for_answer(event, ProgressDisplay())
 
     assert expected in caplog.text
     if expected == "already closed":
@@ -6268,17 +6802,18 @@ async def test_the_per_event_prompt_does_not_read_for_a_shared_projects_viewer(c
         patch("aristotlelib.agent_task.can_prompt", return_value=True),
         patch("builtins.input", Mock(side_effect=AssertionError("must not read stdin"))) as mock_input,
         patch("aristotlelib.agent_task.Event.answer", new=AsyncMock()) as answered,
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines") as shown,
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw") as shown,
         caplog.at_level(logging.INFO),
     ):
         await task.wait_for_completion(interactive=True)
 
     mock_input.assert_not_called()
     answered.assert_not_called()
-    assert "Aristotle asked: Which polarity?" in caplog.text
-    # The redraw clears the terminal, so the question stays on the display, not only in the log.
-    assert any(line.startswith("Aristotle asked: Which polarity?") for line in shown.call_args_list[-1].args[0])
+    assert caplog.messages.count("Aristotle asked: Which polarity?") == 1
+    # Logged above the display, which doesn't repeat it.
+    frames = ["\n".join(call.args[0]) for call in shown.call_args_list]
+    assert not any("Which polarity?" in frame for frame in frames)
 
 
 @pytest.mark.parametrize("interrupt", [KeyboardInterrupt, asyncio.CancelledError])
@@ -6289,8 +6824,8 @@ async def test_an_interrupted_wait_says_the_task_is_still_running_and_re_raises(
     with (
         patched_client(_streaming_client([])),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(side_effect=interrupt)),
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw"),
         caplog.at_level(logging.INFO, logger="aristotle"),
     ):
         with pytest.raises(interrupt):
@@ -6307,8 +6842,8 @@ async def test_an_interrupted_wait_on_a_queued_run_says_it_has_not_started(inter
     with (
         patched_client(_streaming_client([], live_status="QUEUED")),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(side_effect=interrupt)),
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw"),
         caplog.at_level(logging.INFO, logger="aristotle"),
     ):
         with pytest.raises(interrupt):
@@ -6332,8 +6867,8 @@ async def test_an_interrupted_wait_on_someone_elses_queued_run_names_its_owner_a
             _streaming_client([], read_only=True, live_status="QUEUED"),
         ),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(side_effect=KeyboardInterrupt)),
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw"),
         caplog.at_level(logging.INFO, logger="aristotle"),
     ):
         with pytest.raises(KeyboardInterrupt):
@@ -6354,8 +6889,8 @@ async def test_an_interrupted_wait_on_a_run_that_has_since_started_says_it_is_ru
     with (
         patched_client(_streaming_client([])),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(side_effect=KeyboardInterrupt)),
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw"),
         caplog.at_level(logging.INFO, logger="aristotle"),
     ):
         with pytest.raises(KeyboardInterrupt):
@@ -6374,8 +6909,8 @@ async def test_an_interrupted_wait_names_the_callers_command_to_carry_on(caplog)
     with (
         patched_client(_streaming_client([])),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(side_effect=KeyboardInterrupt)),
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw"),
         caplog.at_level(logging.INFO, logger="aristotle"),
     ):
         with pytest.raises(KeyboardInterrupt):
@@ -6395,8 +6930,8 @@ async def test_an_interrupted_wait_whose_refresh_fails_claims_no_status_and_says
     with (
         patched_client(client),
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(side_effect=KeyboardInterrupt)),
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw"),
         caplog.at_level(logging.INFO, logger="aristotle"),
     ):
         with pytest.raises(KeyboardInterrupt):
@@ -6425,8 +6960,8 @@ async def test_an_interrupt_after_the_stream_ended_during_a_flow_leaves_no_unret
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(side_effect=[[], [q1]])),
         patch("aristotlelib.agent_task.run_question_flow", new=AsyncMock(side_effect=interrupted_flow)),
         patch("aristotlelib.agent_task.can_prompt", return_value=True),
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw"),
     ):
         with pytest.raises(KeyboardInterrupt):
             await task.wait_for_completion(interactive=True)
@@ -6447,8 +6982,8 @@ async def test_a_question_asked_before_the_wait_attached_is_presented():
             "aristotlelib.agent_task.run_question_flow", new=AsyncMock(return_value=FlowResult(answered=[q1]))
         ) as flow,
         patch("aristotlelib.agent_task.can_prompt", return_value=True),
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw"),
     ):
         await task.wait_for_completion(interactive=True)
 
@@ -6471,8 +7006,8 @@ async def test_a_quiet_stream_is_polled_for_questions_without_any_question_event
             "aristotlelib.agent_task.run_question_flow", new=AsyncMock(return_value=FlowResult(answered=[q1]))
         ) as flow,
         patch("aristotlelib.agent_task.can_prompt", return_value=True),
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw"),
     ):
         await task.wait_for_completion(interactive=True)
 
@@ -6492,8 +7027,8 @@ async def test_a_question_of_an_ended_run_is_shown_without_opening_the_flow():
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[q1])),
         patch("aristotlelib.agent_task.run_question_flow", new=AsyncMock()) as flow,
         patch("aristotlelib.agent_task.can_prompt", return_value=True),
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines") as shown,
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw") as shown,
     ):
         await task.wait_for_completion(interactive=True)
 
@@ -6524,8 +7059,8 @@ async def test_a_failed_refresh_before_the_flow_keeps_the_last_known_status():
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[q1])),
         patch("aristotlelib.agent_task.run_question_flow", new=AsyncMock(return_value=FlowResult())) as flow,
         patch("aristotlelib.agent_task.can_prompt", return_value=True),
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw"),
     ):
         await task.wait_for_completion(interactive=True)
 
@@ -6542,17 +7077,18 @@ async def test_no_footer_after_a_flow_that_found_the_run_ended():
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[q1])),
         patch("aristotlelib.agent_task.run_question_flow", new=AsyncMock(return_value=ended)),
         patch("aristotlelib.agent_task.can_prompt", return_value=True),
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines") as shown,
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw") as shown,
     ):
         await task.wait_for_completion(interactive=True)
 
     screens = [line for call in shown.call_args_list for line in call.args[0]]
-    assert "The run has ended, so nothing was sent." in screens
+    # The flow printed its outcome itself.
+    assert "The run has ended, so nothing was sent." not in screens
     assert not any("pending" in line for line in screens)
 
 
-async def test_the_footer_clears_once_the_run_has_ended(monkeypatch):
+async def test_the_footer_clears_once_the_run_has_ended(monkeypatch, caplog):
     """A question left pending stops counting once the run has ended, even before the stream closes."""
     monkeypatch.setattr("aristotlelib.agent_task.QUESTION_REFRESH_SECONDS", 0.05)
     task = _waiting_task()
@@ -6569,8 +7105,9 @@ async def test_the_footer_clears_once_the_run_has_ended(monkeypatch):
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[q1])),
         patch("aristotlelib.agent_task.run_question_flow", new=AsyncMock(side_effect=skipped)),
         patch("aristotlelib.agent_task.can_prompt", return_value=True),
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines") as shown,
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw") as shown,
+        caplog.at_level(logging.INFO, logger="aristotle"),
     ):
         await task.wait_for_completion(interactive=True)
 
@@ -6590,8 +7127,8 @@ async def test_a_viewer_of_a_shared_project_is_not_prompted(caplog):
         patch("aristotlelib.agent_task.Question.list_for_task", new=AsyncMock(return_value=[q1])),
         patch("aristotlelib.agent_task.run_question_flow", new=AsyncMock()) as flow,
         patch("aristotlelib.agent_task.can_prompt", return_value=True),
-        patch("aristotlelib.progress_utils.clear_progress_lines"),
-        patch("aristotlelib.progress_utils.print_progress_lines") as shown,
+        patch("aristotlelib.progress_utils.ProgressDisplay.clear"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw") as shown,
         caplog.at_level(logging.INFO),
     ):
         await task.wait_for_completion(interactive=True)
@@ -6600,8 +7137,8 @@ async def test_a_viewer_of_a_shared_project_is_not_prompted(caplog):
     assert f"Aristotle asked: {q1.content}" in caplog.text
     footers = [line for call in shown.call_args_list for line in call.args[0] if "pending" in line]
     assert footers and all("only the project's owner can answer" in line for line in footers)
-    # The redraw clears the terminal, so the question stays on the display, not only in the log.
-    assert f"Aristotle asked: {q1.content}" in shown.call_args_list[-1].args[0]
+    # Logged above the display, which doesn't repeat it.
+    assert f"Aristotle asked: {q1.content}" not in shown.call_args_list[-1].args[0]
 
 
 # --- Requests that fail: what is sent again, and what is not ---

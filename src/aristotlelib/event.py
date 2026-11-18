@@ -5,6 +5,7 @@ import pydantic
 from aristotlelib import api_request
 from aristotlelib.aristotle_object import AristotleObject, SafeIntEnum
 from aristotlelib.date_utils import UTCDatetime
+from aristotlelib.declaration import DeclarationStatus
 from aristotlelib.question import Question, _question_notice
 
 logger = logging.getLogger("aristotle")
@@ -30,6 +31,13 @@ class EventType(SafeIntEnum):
     SUMMARY = 16
     AGENT_QUESTION = 17
     AGENT_FOLLOW_UP = 18
+    PROPERTY_ADDED = 19
+    PROPERTY_MODIFIED = 20
+    PROPERTY_STATUS_CHANGED = 21
+    PROPERTY_REMOVED = 22
+    DEFINITION_ADDED = 23
+    DEFINITION_MODIFIED = 24
+    DEFINITION_REMOVED = 25
 
 
 class EventStatus(SafeIntEnum):
@@ -57,6 +65,13 @@ _ACTIVITIES = {
     EventType.RUNNING_LEAN: "Running Lean",
     EventType.SUMMARY: "Output summary",
     EventType.AGENT_FOLLOW_UP: "Aristotle",
+    EventType.PROPERTY_ADDED: "Property added",
+    EventType.PROPERTY_MODIFIED: "Property modified",
+    EventType.PROPERTY_STATUS_CHANGED: "Property status changed",
+    EventType.PROPERTY_REMOVED: "Property removed",
+    EventType.DEFINITION_ADDED: "Definition added",
+    EventType.DEFINITION_MODIFIED: "Definition modified",
+    EventType.DEFINITION_REMOVED: "Definition removed",
 }
 
 
@@ -71,6 +86,10 @@ class Event(AristotleObject):
     suggestions: list[str] | None = None
     status: EventStatus
     duration_seconds: float | None = None
+    declaration_id: str | None = None
+    """The property or definition a ``PROPERTY_*`` or ``DEFINITION_*`` event is about; ``None`` for other events."""
+    declaration_status: DeclarationStatus | None = None
+    """The status a ``PROPERTY_STATUS_CHANGED`` event moved its property to; ``None`` for other events."""
     # The line str() prints for a question event, from its task's questions listing; None to print the event itself.
     _notice: str | None = pydantic.PrivateAttr(default=None)
 

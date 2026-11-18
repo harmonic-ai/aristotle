@@ -23,7 +23,7 @@ from aristotlelib.agent_task import AgentTask, TaskStatus
 from aristotlelib.api_request import AristotleAPIError
 from aristotlelib.cli import login_flow
 from aristotlelib.cli.api_action import resume_hint
-from aristotlelib.cli.command.submit import PROMPT_ONLY_WARNING, SubmitAction
+from aristotlelib.cli.command.submit import PROMPT_ONLY_REMINDER, PROMPT_ONLY_WARNING, SubmitAction
 from aristotlelib.cli.controller import main
 from aristotlelib.declaration import (
     Declaration,
@@ -49,11 +49,15 @@ from tests.conftest import (
     SIGNUP_GRANT_PENDING,
     UNREACHABLE_HOST,
     WILDCARD_FOLDERS,
+    Terminal,
     fast_api_clock,
+    logged_to,
+    screen_of,
     shown_key_runs,
 )
 
 PROJECT_ID = "3f1002f7-0b6c-4c1e-9d8e-2a4b5c6d7e8f"
+WEB_LINK = f"Open in Aristotle Web: https://aristotle.harmonic.fun/projects/{PROJECT_ID}"
 RENAME_BY_ID = "aristotlelib.project.Project.rename_by_id"
 SPACED = "my results/run 1.tar.gz"
 """A --destination the shell must quote."""
@@ -768,6 +772,127 @@ def test_a_submit_with_no_files_warns_that_only_the_prompt_goes_up(
     out = capsys.readouterr().out
     if flags:
         assert json.loads(out)["project"]["project_id"] == PROJECT_ID
+
+
+def test_submit_wait_at_a_terminal_keeps_the_prompt_only_warning_above_its_progress_display(
+    api_server, tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("COLUMNS", "300")
+    monkeypatch.setenv("LINES", "40")
+    # Whatever proxy runs the tests says nothing.
+    monkeypatch.setattr(api_request, "_logged_environment", True)
+    task = _real_task(TaskStatus.IN_PROGRESS).model_dump(mode="json")
+    project = {**_project("Prove it").model_dump(mode="json"), "has_files": False}
+    events = [
+        {
+            "event_id": f"event-{number}",
+            "agent_task_id": "task-456",
+            "event_type": 1,
+            "created_at": "2026-09-01T12:00:00",
+            "content": content,
+            "file_path": None,
+            "explanation": None,
+            "suggestions": None,
+            "status": 1,
+        }
+        for number, content in enumerate(["Reading the design", "Writing the reply"], 1)
+    ]
+    streamed: list[httpx.Request] = []
+
+    def serve(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/events-stream"):
+            streamed.append(request)
+            lines = "".join(f"id: {number}\ndata: {json.dumps(event)}\n\n" for number, event in enumerate(events, 1))
+            return httpx.Response(200, headers={"content-type": "text/event-stream"}, text=lines)
+        if path.endswith("/tasks"):
+            return httpx.Response(200, json={"agent_tasks": [task], "pagination_key": None})
+        if path.endswith("/questions"):
+            return httpx.Response(200, json=[])
+        if path.endswith("/declarations"):
+            return httpx.Response(200, json={"declarations": [], "pagination_key": None})
+        if "/task/" in path:
+            return httpx.Response(200, json={**task, "status": "COMPLETE"} if streamed else task)
+        return httpx.Response(200, json=project)
+
+    api_server(*[serve] * 200)
+    terminal = Terminal()
+
+    with (
+        patch("sys.stdout", new=terminal),
+        logged_to(terminal),
+        patch("sys.argv", ["aristotle", "submit", "Prove it", "--wait"]),
+    ):
+        assert main() == 0
+
+    assert "\033[2J" not in terminal.getvalue()
+    screen = screen_of(terminal.getvalue())
+    assert screen[:4] == [*PROMPT_ONLY_WARNING.split("\n"), f"Project created: {PROJECT_ID}", WEB_LINK]
+    assert screen[4].startswith("COMPLETE (started ")
+    assert screen[5:] == [
+        "Prove it",
+        "Task: task-456",
+        f"Project: {PROJECT_ID}",
+        "MESSAGE: Reading the design",
+        "MESSAGE: Writing the reply",
+        "Task complete!",
+        WEB_LINK,
+        PROMPT_ONLY_REMINDER,
+    ]
+
+
+@pytest.mark.parametrize("flags", [[], ["--json"]], ids=["text", "--json"])
+def test_a_prompt_only_submit_wait_ends_with_a_reminder_that_only_the_prompt_went_up(
+    api_server, tmp_path, monkeypatch, caplog, flags
+):
+    caplog.set_level(logging.INFO)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(api_request, "_logged_environment", True)
+    task = _real_task(TaskStatus.IN_PROGRESS).model_dump(mode="json")
+    project = {**_project("Prove it").model_dump(mode="json"), "has_files": False}
+    streamed: list[httpx.Request] = []
+
+    def serve(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/events-stream"):
+            streamed.append(request)
+            return httpx.Response(200, headers={"content-type": "text/event-stream"}, text="")
+        if path.endswith("/tasks"):
+            return httpx.Response(200, json={"agent_tasks": [task], "pagination_key": None})
+        if path.endswith("/questions"):
+            return httpx.Response(200, json=[])
+        if path.endswith("/declarations"):
+            return httpx.Response(200, json={"declarations": [], "pagination_key": None})
+        if "/task/" in path:
+            return httpx.Response(200, json={**task, "status": "COMPLETE"} if streamed else task)
+        return httpx.Response(200, json=project)
+
+    api_server(*[serve] * 200)
+    with patch("sys.argv", ["aristotle", "submit", "Prove it", "--wait", *flags]):
+        assert main() == 0
+
+    # The last line a text wait prints; --json's output stays as it was.
+    warnings = [record.getMessage() for record in caplog.records if record.levelno == logging.WARNING]
+    assert warnings == [PROMPT_ONLY_WARNING] + ([] if flags else [PROMPT_ONLY_REMINDER])
+    assert (caplog.records[-1].getMessage() == PROMPT_ONLY_REMINDER) is not bool(flags)
+
+
+async def test_a_prompt_only_submit_wait_that_fails_still_ends_with_the_reminder(caplog):
+    parser = argparse.ArgumentParser()
+    action = SubmitAction(parser.add_subparsers())
+    action.add_action_arguments()
+    refused = AristotleAPIError("API request failed with status 403: Forbidden", status_code=403)
+
+    with (
+        patch("aristotlelib.cli.command.submit.Project.create", return_value=_project("Test prompt")),
+        patch.object(Project, "get_tasks", AsyncMock(return_value=([_real_task(TaskStatus.IN_PROGRESS)], None))),
+        patch.object(AgentTask, "wait_for_completion", AsyncMock(side_effect=refused)),
+        pytest.raises(AristotleAPIError),
+    ):
+        await action.run_action(action.parser.parse_args(["Test prompt", "--wait"]))
+
+    assert caplog.messages[-1] == PROMPT_ONLY_REMINDER
 
 
 @pytest.mark.parametrize("argv", [["--project-dir", "."], ["--top", "core", "-F", "ip/ip.f"]], ids=["folder", "block"])
@@ -1523,7 +1648,27 @@ async def test_submit_wait_says_where_it_saved_the_archive(tmp_path, caplog):
     ):
         assert await action.run_action(action.parser.parse_args(["Test prompt", "--wait"])) == 0
 
-    assert caplog.messages[-1] == f"Saved the project's files to {archive}"
+    assert caplog.messages[-3:] == [f"Saved the project's files to {archive}", WEB_LINK, PROMPT_ONLY_REMINDER]
+
+
+async def test_a_submit_wait_with_files_ends_without_the_prompt_only_reminder(tmp_path, caplog):
+    caplog.set_level(logging.INFO)
+    parser = argparse.ArgumentParser()
+    action = SubmitAction(parser.add_subparsers())
+    action.add_action_arguments()
+    (tmp_path / "counter.sv").write_text("module counter; endmodule\n")
+
+    with (
+        patch("aristotlelib.cli.command.submit.Project.create_from_directory", return_value=_project("Test prompt")),
+        patch.object(Project, "get_tasks", AsyncMock(return_value=([_real_task(TaskStatus.COMPLETE)], None))),
+        patch.object(Project, "refresh", AsyncMock()),
+        patch.object(AgentTask, "wait_for_completion", AsyncMock(return_value=[])),
+    ):
+        argv = ["Test prompt", "--wait", "--project-dir", str(tmp_path)]
+        assert await action.run_action(action.parser.parse_args(argv)) == 0
+
+    assert caplog.messages[-1] == WEB_LINK
+    assert PROMPT_ONLY_REMINDER not in caplog.messages
 
 
 @pytest.mark.parametrize("json_flag", [[], ["--json"]])
@@ -1573,7 +1718,13 @@ async def test_submit_wait_counts_the_properties_before_saying_where_it_saved_th
         assert caplog.messages[-1] == saved
         assert not [message for message in caplog.messages if message.startswith("Properties:")]
     else:
-        assert caplog.messages[-2:] == ["Properties: 1 proved · 1 refuted · 0 in progress", saved]
+        assert caplog.messages[-5:] == [
+            "Properties: 1 proved · 1 refuted · 0 in progress",
+            saved,
+            WEB_LINK,
+            f"See each property with:\n  aristotle properties {PROJECT_ID}",
+            PROMPT_ONLY_REMINDER,
+        ]
 
 
 async def test_submit_wait_without_json_keeps_the_interactive_display():
@@ -2136,8 +2287,12 @@ async def test_a_submit_wait_cut_short_once_the_run_has_finished_says_the_files_
         await action.run_action(action.parser.parse_args(argv))
 
     assert get_files.await_count == (cut_short == "download")
-    assert caplog.records[-1].levelno == logging.WARNING
-    assert caplog.messages[-1] == f"{NOT_SAVED}\n{shell_hint('Get them with', _download(destination))}"
+    assert caplog.records[-2].levelno == logging.WARNING
+    # The reminder that only the prompt went up ends a wait without --json, however it ends.
+    assert caplog.messages[-2:] == [
+        f"{NOT_SAVED}\n{shell_hint('Get them with', _download(destination))}",
+        PROMPT_ONLY_REMINDER,
+    ]
 
 
 @pytest.mark.parametrize("flags", [["--wait"], ["--wait", "--json"], ["--non-interactive"]], ids=" ".join)
@@ -2152,16 +2307,19 @@ async def test_an_interrupted_wait_names_the_wait_that_carries_on_and_saves_to_t
         patch("aristotlelib.cli.command.submit.Project.create", return_value=_project("Test prompt")),
         patch.object(Project, "get_tasks", AsyncMock(return_value=([_real_task(TaskStatus.IN_PROGRESS)], None))),
         patch("aristotlelib.agent_task.Question.list_for_task", AsyncMock(side_effect=KeyboardInterrupt)),
-        patch("aristotlelib.progress_utils.print_progress_lines"),
+        patch("aristotlelib.progress_utils.ProgressDisplay.draw"),
         pytest.raises(KeyboardInterrupt),
     ):
         await action.run_action(action.parser.parse_args(["Test prompt", *flags, "--destination", SPACED]))
 
     show = ["aristotle", "show", PROJECT_ID, "--task", "task-456", *flags, f"--destination={SPACED}"]
-    assert caplog.messages[-1] == (
+    # Without --json, the reminder that only the prompt went up follows.
+    reminded = flags == ["--wait"]
+    assert caplog.messages[-1 - reminded] == (
         f"Task task-456 is still running.\n{shell_hint('Carry on waiting with', show)}\n"
         f"Cancel it with: aristotle cancel {PROJECT_ID}"
     )
+    assert (caplog.messages[-1] == PROMPT_ONLY_REMINDER) is reminded
 
 
 def test_a_submit_wait_interrupted_in_its_download_exits_130_and_says_how_to_save_the_files_there(
@@ -2188,7 +2346,7 @@ def test_a_submit_wait_interrupted_in_its_download_exits_130_and_says_how_to_sav
         assert main() == 130
 
     assert requests[-1].url.path.endswith("/result")
-    assert caplog.messages[-1] == f"{NOT_SAVED}\n{shell_hint('Get them with', _download())}"
+    assert caplog.messages[-2:] == [f"{NOT_SAVED}\n{shell_hint('Get them with', _download())}", PROMPT_ONLY_REMINDER]
     assert list(tmp_path.iterdir()) == []
 
 
@@ -3608,24 +3766,13 @@ INCLUDE_IGNORED_HINT = (
 )
 
 
-def test_include_ignored_is_off_unless_given_and_its_help_says_what_still_stays_out(monkeypatch):
-    # Wide enough that argparse wraps no line, as textwrap may break one after a hyphen.
-    monkeypatch.setenv("COLUMNS", "2000")
+def test_include_ignored_is_off_unless_given():
     parser = argparse.ArgumentParser()
     action = SubmitAction(parser.add_subparsers())
     action.add_action_arguments()
 
     assert action.parser.parse_args(["Prove it"]).include_ignored is False
     assert action.parser.parse_args(["Prove it", "--include-ignored"]).include_ignored is True
-    help_text = " ".join(action.parser.format_help().split())
-    assert "Files git ignores (unless --include-ignored), files named like credentials" in help_text
-    assert (
-        "--include-ignored Also upload the files in --project-dir that git ignores, such as sources a build generates: "
-        "those a .gitignore, .git/info/exclude or the global excludes file matches, or, outside a git repository or in "
-        "a folder git ignores, the folder's top-level .gitignore. Files named like credentials or kept in a folder "
-        "that holds them, .git folders, result archives an earlier run saved and files whose names aren't UTF-8 still "
-        "stay out, and --dry-run marks each file it adds. Only the command line turns it on, never an aristotle.f."
-    ) in help_text
 
 
 def test_include_ignored_uploads_generated_verilog_but_no_credential_or_result_archive(tmp_path, monkeypatch, caplog):
@@ -3673,19 +3820,6 @@ def test_a_dry_run_with_include_ignored_marks_each_file_it_adds(tmp_path, monkey
     result = json.loads(capsys.readouterr().out)
     assert {"build/out.bin", "sim.log"} <= set(result["paths"])
     assert result["left_out"] == []
-
-
-def test_dry_runs_help_says_its_json_doesnt_mark_what_include_ignored_adds(monkeypatch):
-    monkeypatch.setenv("COLUMNS", "2000")
-    parser = argparse.ArgumentParser()
-    action = SubmitAction(parser.add_subparsers())
-    action.add_action_arguments()
-
-    help_text = " ".join(action.parser.format_help().split())
-
-    assert (
-        "With --json, print that as one JSON object, which doesn't mark the files --include-ignored adds." in help_text
-    )
 
 
 @pytest.mark.skipif(os.name == "nt", reason="symlinks need privileges on Windows")

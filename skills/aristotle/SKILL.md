@@ -6,7 +6,7 @@ description: Formally verify code with Harmonic's Aristotle through the `aristot
 # Aristotle
 
 Aristotle formally verifies code. You state a property in plain language, or name an assertion or a function in the
-code, and Aristotle either proves it or finds a counterexample. This skill targets **aristotlelib 3.3.0**. Its commands are for POSIX shells; in
+code, and Aristotle either proves it or finds a counterexample. This skill targets **aristotlelib 3.4.0**. Its commands are for POSIX shells; in
 Windows PowerShell, read [references/windows.md](references/windows.md) first.
 
 ## Before the first command
@@ -20,7 +20,7 @@ Windows PowerShell, read [references/windows.md](references/windows.md) first.
      `aristotle` on `PATH`: run Aristotle's by its full path, such as `"$(uv tool dir --bin)/aristotle"`, or ask the
      user to fix `PATH`.
    - A command or flag below that the CLI rejects means the CLI is older than this skill. Check
-     `aristotle <command> --help`, which has every flag's detail, and work with what it offers.
+     `aristotle <command> --help`, which lists every flag, and work with what it offers.
 2. Check access with `aristotle list --limit 1 --json`. Exit 5 means there is no API key, or Aristotle
    rejected it, or it can't be sent: it is blank, or holds a space, a control character or a non-ASCII character
    (whitespace around it is ignored). If stderr says that of the key in `ARISTOTLE_API_KEY`, or that it is not valid,
@@ -64,14 +64,18 @@ Windows PowerShell, read [references/windows.md](references/windows.md) first.
   mathematics or Lean: a project with only Lean files runs, costs money and verifies nothing, so tell the user that
   rather than submitting one. To verify existing code, always pass `--project-dir`: without it only the prompt goes up,
   and unless the prompt includes the code itself or asks Aristotle to design new hardware, the run verifies nothing.
-- Every run is a paid agent run that takes tens of minutes, and can take an hour or more. Start one only when the user
-  asked for verification or agreed to one, never as a side effect.
+- Every run is a paid agent run. Most take under an hour, about one in ten a few hours and a rare one a day or more,
+  since a proof can take verification specialists weeks to months by hand: tell the user so when one starts (in a
+  [headless session](#long-waits), in your final report instead), and treat a long run as working, not stuck. Start
+  one only when the user asked for verification or agreed to one, never as a side effect.
 - Many accounts can have only one project in progress: a second exits 6 or waits in a queue. Never cancel, continue
-  or answer questions on a project you did not start.
+  or answer questions on a project you did not start. Report results only from projects started in this session,
+  unless the user names one or you write a manifest from one: a matching project in `aristotle list` may be another
+  session's.
 - Never submit the same work twice. Once stderr shows `Project created: <id>`, the project exists: resume it. A
   `submit` or `continue` that exits 7 may have gone through too: [look for it](#finding-a-run-that-may-exist) first.
 - With `--json` or `--non-interactive`, the result is JSON on stdout, and progress and errors go to stderr. Redirect
-  stdout to a file, read it, and check the exit code every time.
+  stdout and stderr to separate files, read both, and check the exit code every time.
 - Keep outputs (JSON, logs, archives) in a private directory, never in the project directory, whose files go up with
   the next run. Make one with `mktemp -d`, and write its path out in full wherever the commands below say `<out>`:
   each command may run in a fresh shell.
@@ -91,13 +95,14 @@ so the shell leaves its backticks, `$` signs and quotes alone. Then:
 ```bash
 timeout -s INT 540 aristotle submit --prompt-file <out>/prompt.md \
   --project-dir <dir> --name "<short name>" --destination <out>/result.tar.gz \
-  --non-interactive > <out>/run.json
+  --non-interactive > <out>/run.json 2> <out>/run.log
 echo "exit $?"
 ```
 
 - **The prompt:** state each property precisely: the module or function, the file, the signals or variables, the
   assumptions (reset, input ranges, preconditions) and what must hold, as in
-  `Prove that <property> for <module or function> in <file>.` Ask for one property, or a few, per run.
+  `Prove that <property> for <module or function> in <file>.` Ask for one property, or a few, per run. Keep each
+  property as the user stated it, and tell the user of any assumption you add.
 - **The folder:** pass the directory that holds the code to verify, as it is, with what the proof needs, such as the
   headers, build files and spec, and nothing secret: files named like credentials stay out, but the check goes by
   names only.
@@ -129,11 +134,12 @@ A run usually outlasts a tool's limit on one command (10 minutes in Claude Code)
 `claude -p` or `codex exec`, ends as soon as you reply, losing any run left in the background. So wait in slices,
 each in the foreground and never in the background, and in a headless session don't reply before the run has
 finished: `submit` above waits 9 minutes. Give each slice your tool's longest time limit (`600000` ms in Claude
-Code), so the slice ends first; under a shorter limit, shorten the slice. Save the id from stderr's
-`Project created: <id>` line to `<out>/project-id` at once: an error can leave `run.json` empty. Then **resume**:
+Code), so the slice ends first; under a shorter limit, shorten the slice. Save the id from the `Project created: <id>`
+line in `<out>/run.log` to `<out>/project-id` at once: an error can leave `run.json` empty. Then **resume**:
 
 ```bash
-timeout -s INT 540 aristotle show <project-id> --non-interactive --destination <out>/result.tar.gz > <out>/run.json; echo "exit $?"
+timeout -s INT 540 aristotle show <project-id> --non-interactive --destination <out>/result.tar.gz \
+  > <out>/run.json 2> <out>/run.log; echo "exit $?"
 ```
 
 Exit 124 or 130 means the slice ended. Then, by `task.status` in `run.json`:
@@ -187,7 +193,7 @@ command again, or resume a run it had already started rather than start another.
 | 6 | Rate limited: too many projects in progress, or too many requests. Or the organization doesn't have the credits to start a run. | If stderr says the organization needs credits, tell the user what it says: where to buy them, and, when Aristotle names it, which organization needs them. Run the command again only once that's done, or, when it says each active run needs a credit, once another of the organization's runs has finished. If it says too many runs or projects are in progress, `aristotle list --status RUNNING --json` shows what is running: wait for one to finish and retry, or ask the user whether to cancel one of theirs. Otherwise wait a minute and run the same command again. |
 | 7 | The request may have gone through, but its response was lost. | Don't send it again yet: [look for it](#finding-a-run-that-may-exist). If stderr says an earlier copy was still in progress, wait a minute first. |
 | 124, 130 | `timeout` ended a slice (124), or Ctrl-C did (130). | Resume, as under [Long waits](#long-waits). |
-| 141 | stdout or stderr was closed early, for example by `\| head`. | Don't send it again: resume, with stdout going to a file. |
+| 141 | stdout or stderr was closed early, for example by `\| head`. | Don't send it again: resume, with stdout and stderr going to files. |
 
 After `questions --answer` exits 3 or 6, send again only the answers it says were not answered. For `aristotle ci`
 and `aristotle review`, see steps 3 and 4 under [Keeping aristotle.toml current](#keeping-aristotletoml-current).
@@ -252,7 +258,8 @@ reproduces it. Fetch them with `aristotle download <id> --artifact <path> --dest
 wrote: read it before you run it, with the interpreter its `#!` line names, such as `bash`.
 
 When you report, remember that a proof is only as strong as its statement. Compare each `description` with what the
-user meant, and say when it is weaker, for example because of an extra assumption or a narrower range. For a
+user asked for, and say when it is weaker, for example because of an extra assumption or a narrower range.
+Report a refutation of the user's statement as its result, even if a weaker statement was proved. For a
 refutation, describe the failing scenario and where the code goes wrong: `task.output_summary` usually describes it,
 and the project's files may hold a reproducer under `sim/`. A property in progress or unresolved is neither proved
 nor refuted. Aristotle checks a run's results when it finishes, so a run that ran out of budget never checked what
@@ -264,8 +271,8 @@ Don't send a `continue` just to ask about them: on an idle project it starts a n
 user asked for one, read the results instead, say why, and send it only if they still want it.
 
 To give an idle project another instruction, write it to `<out>/next.md` and run
-`timeout -s INT 540 aristotle continue <id> --prompt-file <out>/next.md --non-interactive > <out>/run.json`. It works
-like `submit`, with the same exit codes, questions and slices, but downloads nothing: save the files with
+`timeout -s INT 540 aristotle continue <id> --prompt-file <out>/next.md --non-interactive > <out>/run.json 2> <out>/run.log`.
+It works like `submit`, with the same exit codes, questions and slices, but downloads nothing: save the files with
 `aristotle download <id> --destination <out>/result.tar.gz`. `--files <path>...` sends selected local files with it.
 Their paths relative to `--project-dir <root>` are preserved; the root defaults to the current directory and never
 changes based on which files you select. For example, `--project-dir downloaded --files downloaded/rtl/alu.sv`

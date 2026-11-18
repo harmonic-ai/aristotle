@@ -36,25 +36,19 @@ class LoginAction(APIAction):
             "--api-key",
             type=str,
             default=argparse.SUPPRESS,
-            help=(
-                "Check this API key and store it, instead of logging in in the browser. A key piped to stdin stays "
-                "out of the process list and the shell history; one given here does not."
-            ),
+            help="Check this API key and store it.",
         )
 
     def add_action_arguments(self) -> None:
         self.parser.add_argument(
             "--no-browser",
             action="store_true",
-            help="Don't open the page in a browser. It is printed either way, to open yourself.",
+            help="Don't open the page in a browser.",
         )
         self.parser.add_argument(
             "--json",
             action="store_true",
-            help=(
-                "Print the page to open and the code to enter there as JSON while the login waits, and then where "
-                "the key was stored."
-            ),
+            help="Print the page, the code and the key's path as JSON.",
         )
 
     async def run_action(self, args: argparse.Namespace) -> int | None:

@@ -29,34 +29,26 @@ class DownloadAction(APIAction):
         return 40
 
     def add_action_arguments(self) -> None:
-        self.parser.add_argument("project_id", type=str, help=f"The project to download: {PROJECT_REFERENCE_HELP}")
+        self.parser.add_argument("project_id", type=str, help=f"The project: {PROJECT_REFERENCE_HELP}")
 
         self.parser.add_argument(
             "--destination",
             # Expanded here, as a shell would: --destination=~/out reaches argparse with the ~ unexpanded.
             type=os.path.expanduser,
-            help=(
-                "Where to save the result archive. A directory, or a path ending in /, gets it under its default "
-                "name; missing directories are made. Default: the current directory. With --artifact, the folder to "
-                f"save the files in, at their paths in the project; default: {ARTIFACTS_FOLDER}, which must not be a link."
-            ),
+            help="Where to save the archive, or the --artifact files.",
         )
 
         self.parser.add_argument(
             "--artifact",
             action="append",
             metavar="PATH",
-            help=(
-                "Save the project's file at PATH, its path in the project, such as one a property's artifact_paths "
-                "name, instead of the archive; repeat it for more files. Each is saved at that path under "
-                "--destination, keeping its folders, and replaces a file there."
-            ),
+            help="Save the project's file at PATH instead; repeatable.",
         )
 
         self.parser.add_argument(
             "--json",
             action="store_true",
-            help="Print where the archive, or each --artifact, was saved as JSON.",
+            help="Print where the files were saved as JSON.",
         )
 
     def preflight(self, args: argparse.Namespace) -> int | None:

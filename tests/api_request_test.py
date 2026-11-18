@@ -3,13 +3,17 @@
 import asyncio
 import contextlib
 import gc
+import html
+import json
 import logging
 import re
 import socket
 import ssl
 import threading
+import time
+import traceback
 import weakref
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -17,6 +21,8 @@ from pathlib import Path
 from unittest.mock import AsyncMock, Mock, call, patch
 from urllib.request import getproxies_environment
 
+import h11
+import httpcore
 import httpx
 import pydantic
 import pytest
@@ -417,7 +423,8 @@ async def test_request_client_generic_http_error():
     mock_response.status_code = 500
     mock_response.headers = httpx.Headers()
 
-    error = httpx.HTTPStatusError("Internal Server Error", request=Mock(), response=mock_response)
+    request = httpx.Request("GET", "https://aristotle.harmonic.fun/api/v3/test", headers={"X-API-Key": "test-key"})
+    error = httpx.HTTPStatusError("Internal Server Error", request=request, response=mock_response)
 
     mock_client = AsyncMock(spec=httpx.AsyncClient)
     mock_client.request = AsyncMock(side_effect=error)
@@ -628,13 +635,16 @@ def _event(event_id: str, status: int = 1) -> bytes:
 
 
 def _serve(monkeypatch, connections: list) -> tuple[list[httpx.Request], AsyncMock]:
-    """Serve one scripted connection per stream request; returns the requests seen and the patched sleep."""
+    """Serve one scripted connection per stream request, or what a function of the request makes; returns the requests
+    seen and the patched sleep."""
     set_api_key("test-key")
     requests: list[httpx.Request] = []
 
     def handle(request: httpx.Request) -> httpx.Response:
         requests.append(request)
         connection = connections[len(requests) - 1]
+        if callable(connection):
+            connection = connection(request)
         if isinstance(connection, Exception):
             raise connection
         if isinstance(connection, httpx.Response):
@@ -842,9 +852,8 @@ async def test_an_outage_the_wait_gives_up_on_is_reported_once(monkeypatch):
     on_outage.assert_called_once_with(unreachable)
 
 
-async def test_a_streams_local_protocol_error_is_reported_and_raised_by_its_class_alone(monkeypatch):
-    _serve(monkeypatch, [httpx.LocalProtocolError(HEADER_REFUSAL)] * 100)
-    fast_api_clock(monkeypatch)
+async def test_a_streams_local_protocol_error_is_raised_at_once_by_its_class_alone(monkeypatch):
+    requests, sleep = _serve(monkeypatch, [httpx.LocalProtocolError(HEADER_REFUSAL)] * 100)
     outages: list[Exception | None] = []
 
     with pytest.raises(httpx.LocalProtocolError) as info:
@@ -855,8 +864,128 @@ async def test_a_streams_local_protocol_error_is_reported_and_raised_by_its_clas
             )
         ]
 
-    assert [(type(error), str(error)) for error in outages] == [(httpx.LocalProtocolError, "")]
-    assert str(info.value) == ""
+    assert (str(info.value), info.value.__cause__, info.value.__context__) == ("", None, None)
+    assert len(requests) == 1
+    assert outages == []
+    sleep.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "event_id",
+    [
+        "2026-01-01T00:00:02 ",
+        " 2026-01-01T00:00:02",
+        "2026-01-01T00:00:02\t",
+        "2026-01-01T00:00:02\x00",
+        "2026-01-01T00:00:02\x1b",
+        "2026-01-01T00:00:02\u00e9",
+        "2026-01-01T00:00:02\u200b",
+    ],
+    ids=["space after", "space before", "tab", "NUL", "escape", "e acute", "zero-width space"],
+)
+async def test_an_event_id_a_header_cannot_carry_as_it_is_is_not_resumed_from(event_id, monkeypatch):
+    dropped = httpx.RemoteProtocolError("closed")
+    first = _Body([b"id: 2026-01-01T00:00:01\n", _event("e-1"), f"id: {event_id}\n".encode(), _event("e-2")], dropped)
+    requests, _ = _serve(monkeypatch, [first, _Body([_event("e-3")])])
+
+    events = [event async for event in AristotleRequestClient().stream_sse("/events")]
+
+    assert [event["event_id"] for event in events] == ["e-1", "e-2", "e-3"]
+    assert requests[1].headers["Last-Event-ID"] == "2026-01-01T00:00:01"
+
+
+async def test_an_event_id_with_a_space_inside_is_resumed_from(monkeypatch):
+    dropped = httpx.RemoteProtocolError("closed")
+    first = _Body([b"id: 2026-01-01 00:00:02\n", _event("e-1")], dropped)
+    requests, _ = _serve(monkeypatch, [first, _Body([_event("e-2")])])
+
+    [event async for event in AristotleRequestClient().stream_sse("/events")]
+
+    assert requests[1].headers["Last-Event-ID"] == "2026-01-01 00:00:02"
+
+
+async def test_the_key_a_streams_refusal_quotes_is_redacted(monkeypatch):
+    refused = _quoting_the_key(lambda key: httpx.Response(400, json={"detail": f"Bad header X-API-Key: {key}"}))
+    _serve(monkeypatch, [refused])
+    set_api_key(FAKE_KEY)
+
+    with pytest.raises(AristotleAPIError) as info:
+        [event async for event in AristotleRequestClient().stream_sse("/events")]
+
+    assert str(info.value) == "API request failed with status 400: Bad header X-API-Key: [redacted]"
+
+
+async def test_the_key_a_streams_refusal_quotes_in_its_reason_phrase_is_hidden_from_its_traceback(monkeypatch):
+    refused = _quoting_the_key(lambda key: httpx.Response(400, extensions={"reason_phrase": f"Bad {key}".encode()}))
+    _serve(monkeypatch, [refused])
+    set_api_key(FAKE_KEY)
+
+    with pytest.raises(AristotleAPIError) as info:
+        [event async for event in AristotleRequestClient().stream_sse("/events")]
+
+    assert isinstance(info.value.__cause__, httpx.HTTPStatusError)
+    assert shown_key_runs("".join(traceback.format_exception(info.value)), FAKE_KEY) == []
+
+
+async def test_the_key_a_streams_refusal_quotes_in_its_reason_phrase_is_hidden_from_a_failure_to_decode_its_body(
+    monkeypatch,
+):
+    refused = _quoting_the_key(
+        lambda key: httpx.Response(
+            400,
+            stream=_Body([b"not gzip"]),
+            headers={"Content-Encoding": "gzip"},
+            extensions={"reason_phrase": f"Bad {key}".encode()},
+        )
+    )
+    _serve(monkeypatch, [refused])
+    set_api_key(FAKE_KEY)
+
+    with pytest.raises(httpx.DecodingError) as info:
+        [event async for event in AristotleRequestClient().stream_sse("/events")]
+
+    assert shown_key_runs("".join(traceback.format_exception(info.value)), FAKE_KEY) == []
+
+
+@pytest.mark.usefixtures("no_proxy_settings")
+async def test_the_key_a_proxys_connect_refusal_quotes_is_redacted_on_a_stream(monkeypatch):
+    forbidden = _quoting_the_key(lambda key: httpx.ProxyError(f"403 Forbidden {key}"))
+    _serve(monkeypatch, [forbidden] * 5)
+    set_api_key(FAKE_KEY)
+
+    with pytest.raises(api_request._IntermediaryError) as info:
+        [event async for event in AristotleRequestClient().stream_sse("/events")]
+
+    assert str(info.value) == (
+        "Error: request blocked by a proxy (403 Forbidden [redacted], via unknown proxy)\n\n"
+        "Hint: ask your network admin to allow aristotle.harmonic.fun."
+    )
+
+
+async def test_the_key_a_stream_line_it_cannot_parse_quotes_is_redacted(monkeypatch, caplog):
+    line = _quoting_the_key(
+        lambda key: httpx.Response(200, content=f"data: not JSON, {key}\n\n".encode(), headers=EVENT_STREAM)
+    )
+    _serve(monkeypatch, [line])
+    set_api_key(FAKE_KEY)
+
+    assert [event async for event in AristotleRequestClient().stream_sse("/events")] == []
+    assert "Failed to parse SSE data: data: not JSON, [redacted]" in caplog.messages
+    assert shown_key_runs(caplog.text, FAKE_KEY) == []
+
+
+async def test_the_key_a_streams_transport_error_quotes_is_redacted(monkeypatch):
+    garbled = _quoting_the_key(
+        lambda key: httpx.RemoteProtocolError(f"illegal header line: bytearray(b'X-API-Key: {key}')")
+    )
+    _serve(monkeypatch, [garbled] * 5)
+    set_api_key(FAKE_KEY)
+
+    with pytest.raises(httpx.RemoteProtocolError) as info:
+        [event async for event in AristotleRequestClient().stream_sse("/events")]
+
+    assert str(info.value) == "illegal header line: bytearray(b'X-API-Key: [redacted]')"
+    assert (info.value.__cause__, info.value.__context__) == (None, None)
 
 
 async def test_a_stream_that_rides_out_nothing_reports_no_outage(monkeypatch):
@@ -1418,6 +1547,33 @@ async def test_an_error_response_carries_its_json_error_code(body, error_code, a
     assert (info.value.status_code, info.value.error_code) == (400, error_code)
 
 
+@pytest.mark.parametrize("status", [404, 409])
+@pytest.mark.parametrize(
+    "body,message,error_code",
+    [
+        ({"detail": "No."}, "No.", None),
+        ({"message": "No.", "error": "NOT_AVAILABLE"}, "No.", "NOT_AVAILABLE"),
+        ({"detail": {"message": "No.", "code": "NOT_AVAILABLE"}}, "No.", "NOT_AVAILABLE"),
+        ("No.", "No.", None),
+    ],
+)
+async def test_other_404_and_409_errors_keep_their_message_and_code(api_server, status, body, message, error_code):
+    response = httpx.Response(status, json=body) if isinstance(body, dict) else httpx.Response(status, text=body)
+    requests = api_server(response)
+    async with AristotleRequestClient() as client:
+        with pytest.raises(AristotleAPIError) as info:
+            await client.get("/project")
+    assert type(info.value) is AristotleAPIError
+    expected = (
+        message
+        if isinstance(body, dict) and isinstance(body.get("detail"), dict)
+        else f"API request failed with status {status}: {message}"
+    )
+    assert str(info.value) == expected
+    assert (info.value.status_code, info.value.error_code) == (status, error_code)
+    assert len(requests) == 1
+
+
 SECRET_IN_THE_BODY = "a-secret-the-request-carries"
 
 
@@ -1509,6 +1665,601 @@ async def test_a_redacted_transport_failure_keeps_its_class_without_its_request_
     assert SECRET_IN_THE_BODY not in str(info.value)
 
 
+def _quoting_the_key(answer: Callable[[str], httpx.Response]) -> Callable[[httpx.Request], httpx.Response]:
+    return lambda request: answer(request.headers["X-API-Key"])
+
+
+@pytest.mark.parametrize(
+    ("answer", "error_class", "message"),
+    [
+        pytest.param(
+            lambda key: httpx.Response(400, text=f"Blocked by the gateway.\nRequest headers:\n  X-API-Key: {key}\n"),
+            AristotleAPIError,
+            "API request failed with status 400: Blocked by the gateway.\nRequest headers:\n  X-API-Key: [redacted]\n",
+            id="page",
+        ),
+        pytest.param(
+            lambda key: httpx.Response(400, json={"detail": f"Malformed header X-API-Key: {key}"}),
+            AristotleAPIError,
+            "API request failed with status 400: Malformed header X-API-Key: [redacted]",
+            id="detail",
+        ),
+        pytest.param(
+            lambda key: httpx.Response(409, json={"detail": {"code": "CONFLICT", "message": f"No run for {key}."}}),
+            AristotleAPIError,
+            "No run for [redacted].",
+            id="detail object",
+        ),
+        pytest.param(
+            lambda key: httpx.Response(402, json={"detail": {**OUT_OF_CREDITS, "message": f"No credits for {key}."}}),
+            AristotleNotProcessedError,
+            f"No credits for [redacted]. {BUY_CREDITS}",
+            id="credits",
+        ),
+        pytest.param(
+            lambda key: httpx.Response(429, json={"detail": f"Too many runs in progress for {key}."}),
+            AristotleProjectLimitError,
+            "Too many runs in progress for [redacted].",
+            id="project limit",
+        ),
+        pytest.param(
+            lambda key: httpx.Response(400, extensions={"reason_phrase": f"Bad {key}".encode()}),
+            AristotleAPIError,
+            "API request failed with status 400: Bad [redacted]",
+            id="reason phrase",
+        ),
+        pytest.param(
+            lambda key: httpx.Response(403, text="denied", extensions={"reason_phrase": f"Forbidden {key}".encode()}),
+            api_request._IntermediaryError,
+            "Error: request refused (403 Forbidden [redacted])\n\nHint: this may come from a proxy or firewall on your "
+            "network. Run with --verbose to see the response headers.",
+            id="refusal",
+        ),
+    ],
+)
+@pytest.mark.usefixtures("no_proxy_settings")
+async def test_the_key_a_server_quotes_in_an_error_is_redacted(answer, error_class, message, api_server, monkeypatch):
+    api_server(_quoting_the_key(answer))
+    monkeypatch.setattr(api_request, "API_KEY", FAKE_KEY)
+
+    async with AristotleRequestClient() as client:
+        with pytest.raises(AristotleAPIError) as info:
+            await client.post("/project", json={})
+
+    assert (type(info.value), str(info.value)) == (error_class, message)
+
+
+async def test_the_key_a_server_quotes_is_redacted_from_every_retry_logged_and_the_error(
+    api_server, monkeypatch, caplog
+):
+    down = _quoting_the_key(lambda key: httpx.Response(503, json={"detail": f"Upstream down for X-API-Key: {key}"}))
+    api_server(*[down] * api_request.RETRY_ATTEMPTS)
+    monkeypatch.setattr(api_request, "API_KEY", FAKE_KEY)
+
+    async with AristotleRequestClient() as client:
+        with pytest.raises(AristotleAPIError) as info:
+            await client.get("/project")
+
+    assert info.value.status_code == 503
+    assert caplog.text.count("503 on GET /project: Upstream down for X-API-Key: [redacted]") == 4
+    assert str(info.value).endswith("API request failed with status 503: Upstream down for X-API-Key: [redacted]")
+    assert shown_key_runs(caplog.text + str(info.value), FAKE_KEY) == []
+
+
+async def test_the_key_a_reason_phrase_quotes_is_hidden_from_the_status_errors_cause_and_traceback(
+    api_server, monkeypatch
+):
+    api_server(_quoting_the_key(lambda key: httpx.Response(400, extensions={"reason_phrase": f"Bad {key}".encode()})))
+    monkeypatch.setattr(api_request, "API_KEY", FAKE_KEY)
+
+    async with AristotleRequestClient() as client:
+        with pytest.raises(AristotleAPIError) as info:
+            await client.get("/project")
+
+    cause = info.value.__cause__
+    assert isinstance(cause, httpx.HTTPStatusError)
+    assert cause.response.status_code == 400
+    assert shown_key_runs("".join(traceback.format_exception(info.value)), FAKE_KEY) == []
+
+
+@pytest.mark.usefixtures("no_proxy_settings")
+@pytest.mark.parametrize(
+    ("key", "refusal", "shown"),
+    [
+        (FAKE_KEY, f"403 Forbidden {FAKE_KEY}", "403 Forbidden [redacted]"),
+        ("403", "403 Forbidden", "[redacted] Forbidden"),
+    ],
+    ids=["key in the reason", "key that reads as the status"],
+)
+async def test_a_proxys_connect_refusal_is_redacted_and_classified_as_it_was_raised(
+    key, refusal, shown, api_server, monkeypatch
+):
+    requests = api_server(httpx.ProxyError(refusal))
+    monkeypatch.setattr(api_request, "API_KEY", key)
+
+    async with AristotleRequestClient() as client:
+        with pytest.raises(api_request._IntermediaryError) as info:
+            await client.get("/project")
+
+    assert str(info.value) == (
+        f"Error: request blocked by a proxy ({shown}, via unknown proxy)\n\n"
+        "Hint: ask your network admin to allow aristotle.harmonic.fun."
+    )
+    assert len(requests) == 1
+
+
+@pytest.mark.parametrize("key", ["fake-Q7zP\\3wK9vX2m", "fake-Q7zP'3wK\"9vX2m"], ids=["backslash", "both quotes"])
+async def test_a_key_a_garbled_line_quotes_escaped_is_redacted(key, api_server, monkeypatch, caplog):
+    def garbled(request: httpx.Request) -> httpx.RemoteProtocolError:
+        line = f"Request header X-API-Key: {request.headers['X-API-Key']}".encode()
+        return httpx.RemoteProtocolError(f"illegal header line: {bytearray(line)!r}")
+
+    api_server(*[garbled] * api_request.RETRY_ATTEMPTS)
+    monkeypatch.setattr(api_request, "API_KEY", key)
+
+    async with AristotleRequestClient() as client:
+        with pytest.raises(AristotleAPIError) as info:
+            await client.get("/project")
+
+    assert str(info.value).endswith("illegal header line: bytearray(b'Request header X-API-Key: [redacted]')")
+    assert shown_key_runs(caplog.text + str(info.value) + str(info.value.__cause__), key) == []
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["fake-Q7zP\\3wK9vX2m", "fake-Q7zP'3wK\"9vX2m", "\\" * 12 + "fake-Q7zP3wK9vX2m"],
+    ids=["backslash", "both quotes", "leading backslashes"],
+)
+def test_a_key_quoted_twice_as_httpcore_traces_an_h11_error_or_as_json_inside_json_is_redacted(key):
+    line = bytearray(f"Request header X-API-Key: {key}".encode())
+    error = httpcore.RemoteProtocolError(h11.RemoteProtocolError(f"illegal header line: {line!r}"))
+    trace = f"receive_response_headers.failed exception={error!r}"
+    nested = json.dumps(json.dumps({"detail": f"X-API-Key: {key}"}))
+
+    assert shown_key_runs(api_request._without_sent(trace, key) + api_request._without_sent(nested, key), key) == []
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["fake-Q7zP\\3wK9vX2m", "fake-Q7zP'3wK\"9vX2m", "\\" * 12 + "fake-Q7zP3wK9vX2m"],
+    ids=["backslash", "both quotes", "leading backslashes"],
+)
+async def test_a_key_a_refusals_json_quotes_escaped_is_redacted_from_its_verbose_report(
+    key, api_server, monkeypatch, caplog
+):
+    caplog.set_level(logging.DEBUG, logger=api_request.http_logger.name)
+    api_server(_quoting_the_key(lambda sent: httpx.Response(403, json={"detail": f"Blocked X-API-Key: {sent}"})))
+    monkeypatch.setattr(api_request, "API_KEY", key)
+
+    async with AristotleRequestClient() as client:
+        with pytest.raises(AristotleAPIError) as info:
+            await client.get("/project")
+
+    assert 'Response excerpt: {"detail":"Blocked X-API-Key: [redacted]"}' in caplog.text
+    assert shown_key_runs(caplog.text + str(info.value), key) == []
+
+
+@pytest.mark.usefixtures("no_proxy_settings")
+async def test_a_refusal_page_the_html_parser_fails_on_quoting_the_key_is_reported_without_it(
+    api_server, monkeypatch, caplog
+):
+    caplog.set_level(logging.DEBUG, logger=api_request.http_logger.name)
+
+    def fail(self: api_request._ResponseText, data: str) -> None:
+        raise AssertionError(f"unknown status keyword {FAKE_KEY!r} in marked section")
+
+    # As HTMLParser does before CPython's 2025 fixes.
+    monkeypatch.setattr(api_request._ResponseText, "feed", fail)
+    api_server(
+        _quoting_the_key(
+            lambda key: httpx.Response(
+                403,
+                html=f"<html><![{key} ]><p>Blocked</p></html>",
+                extensions={"reason_phrase": f"Forbidden {key}".encode()},
+            )
+        )
+    )
+    monkeypatch.setattr(api_request, "API_KEY", FAKE_KEY)
+
+    async with AristotleRequestClient() as client:
+        with pytest.raises(api_request._IntermediaryError) as info:
+            await client.get("/project")
+
+    assert str(info.value) == (
+        "Error: request refused (403 Forbidden [redacted])\n\nHint: this may come from a proxy or firewall on your "
+        "network. Run with --verbose to see the response headers."
+    )
+    assert shown_key_runs("".join(traceback.format_exception(info.value)) + caplog.text, FAKE_KEY) == []
+
+
+QUOTED_KEY = "fake-Q7zP\"3wK'9vX&2m</x>"
+"""A key holding each character a JSON string or an HTML page escapes."""
+
+
+@pytest.mark.parametrize(
+    "escape",
+    [
+        html.escape,
+        lambda key: (
+            key.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&#34;")
+            .replace("'", "&#39;")
+        ),
+        lambda key: json.dumps(key)[1:-1].replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026"),
+        lambda key: json.dumps(key)[1:-1].replace("/", "\\/"),
+    ],
+    ids=["html.escape", "numeric entities", "JSON with \\u escapes", "JSON with \\/"],
+)
+async def test_a_key_a_refusals_body_escapes_is_redacted(escape, api_server, monkeypatch):
+    api_server(_quoting_the_key(lambda key: httpx.Response(400, text=f"<p>X-API-Key: {escape(key)}</p>")))
+    monkeypatch.setattr(api_request, "API_KEY", QUOTED_KEY)
+
+    async with AristotleRequestClient() as client:
+        with pytest.raises(AristotleAPIError) as info:
+            await client.get("/project")
+
+    assert str(info.value) == "API request failed with status 400: <p>X-API-Key: [redacted]</p>"
+
+
+@pytest.mark.parametrize(
+    ("key", "escape"),
+    [("fake-Q7zP3wK9vX2m&", html.escape), ("fake-Q7zP3wK9vX2m\\", lambda key: json.dumps(key)[1:-1])],
+    ids=["an ampersand", "a backslash"],
+)
+async def test_a_key_that_ends_in_its_escapes_first_character_is_redacted_with_the_whole_escape(
+    key, escape, api_server, monkeypatch
+):
+    api_server(_quoting_the_key(lambda sent: httpx.Response(400, text=f"<p>X-API-Key: {escape(sent)}</p>")))
+    monkeypatch.setattr(api_request, "API_KEY", key)
+
+    async with AristotleRequestClient() as client:
+        with pytest.raises(AristotleAPIError) as info:
+            await client.get("/project")
+
+    assert str(info.value) == "API request failed with status 400: <p>X-API-Key: [redacted]</p>"
+
+
+@pytest.mark.usefixtures("frozen_api_clock", "no_proxy_settings")
+@pytest.mark.parametrize(
+    ("key", "on_github"),
+    [
+        ("fake-Q7zP##vso[3wK9vX2m", False),
+        ("fake-Q7zP##teamcity[3wK9vX2m", False),
+        ("fake-Q7zP##[3wK9vX2m", True),
+    ],
+    ids=["##vso[", "##teamcity[", "##[ on GitHub"],
+)
+@pytest.mark.parametrize(
+    "answer",
+    [
+        lambda key: httpx.Response(200, html="<p>Signed in</p>", extensions={"reason_phrase": f"OK {key}".encode()}),
+        lambda key: httpx.Response(200, content=b"<p>Signed in</p>", headers={"Content-Type": f"text/{key}"}),
+        lambda key: httpx.Response(403, text="Forbidden", extensions={"reason_phrase": f"Forbidden {key}".encode()}),
+        lambda key: httpx.Response(
+            404, html="<p>Not here</p>", extensions={"reason_phrase": f"Not Found {key}".encode()}
+        ),
+    ],
+    ids=["a 2xx status line", "a 2xx content type", "a 403 status line", "a 404 page's status line"],
+)
+async def test_a_key_holding_a_ci_log_command_is_redacted_before_the_command_is_escaped(
+    key, on_github, answer, api_server, monkeypatch, caplog
+):
+    if on_github:
+        monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    api_server(*[_quoting_the_key(answer)] * api_request.RETRY_ATTEMPTS)
+    monkeypatch.setattr(api_request, "API_KEY", key)
+
+    async with AristotleRequestClient() as client:
+        with pytest.raises(AristotleAPIError) as info:
+            await client.get("/project")
+
+    assert "[redacted]" in str(info.value)
+    assert shown_key_runs(str(info.value) + caplog.text, key) == []
+
+
+@pytest.mark.parametrize(
+    ("key", "near_miss"),
+    [
+        ("fake-" + "\\" * 26 + "x", "fake-" + "\\\\" * 26 + "y"),
+        ("fake-" + "\\'" * 24 + "x", "fake-" + "\\\\'" * 24 + "y"),
+    ],
+    ids=["a run of backslashes", "backslashes and quotes in turn"],
+)
+async def test_a_text_that_nearly_holds_a_key_whose_escapes_could_overlap_is_scanned_without_backtracking(
+    key, near_miss, api_server, monkeypatch
+):
+    api_server(httpx.Response(400, text=f"Bad key: {near_miss}"))
+    monkeypatch.setattr(api_request, "API_KEY", key)
+    started = time.perf_counter()
+
+    async with AristotleRequestClient() as client:
+        with pytest.raises(AristotleAPIError):
+            await client.get("/project")
+
+    assert time.perf_counter() - started < 1
+
+
+async def _get(path: str) -> None:
+    async with AristotleRequestClient() as client:
+        await client.get(path)
+
+
+async def _stream(path: str) -> None:
+    [event async for event in AristotleRequestClient().stream_sse(path, max_retries=1)]
+
+
+@pytest.mark.parametrize("send", [_get, _stream], ids=["request", "stream"])
+@pytest.mark.usefixtures("no_proxy_settings")
+async def test_a_403_whose_json_nests_too_deep_to_parse_is_a_refusal_whose_traceback_hides_the_key(send, monkeypatch):
+    def too_deep(self: httpx.Response, **kwargs: object) -> object:
+        raise RecursionError("maximum recursion depth exceeded while decoding a JSON array from a unicode string")
+
+    monkeypatch.setattr(httpx.Response, "json", too_deep)
+    _serve(
+        monkeypatch,
+        [
+            _quoting_the_key(
+                lambda key: httpx.Response(
+                    403,
+                    content=b"[" * 1100,
+                    headers={"Content-Type": "application/json"},
+                    extensions={"reason_phrase": f"Forbidden {key}".encode()},
+                )
+            )
+        ],
+    )
+    set_api_key(FAKE_KEY)
+
+    with pytest.raises(api_request._IntermediaryError) as info:
+        await send("/project")
+
+    assert str(info.value) == (
+        "Error: request refused (403 Forbidden [redacted])\n\nHint: this may come from a proxy or firewall on your "
+        "network. Run with --verbose to see the response headers."
+    )
+    assert shown_key_runs("".join(traceback.format_exception(info.value)), FAKE_KEY) == []
+
+
+@pytest.mark.parametrize("send", [_get, _stream], ids=["request", "stream"])
+async def test_an_error_raised_while_a_refusal_is_described_doesnt_chain_the_key_its_reason_phrase_quotes(
+    send, monkeypatch
+):
+    def fails(error: httpx.HTTPStatusError, redact: object = None) -> AristotleAPIError:
+        raise RuntimeError("describing the refusal failed")
+
+    monkeypatch.setattr(api_request, "_status_error", fails)
+    _serve(
+        monkeypatch,
+        [_quoting_the_key(lambda key: httpx.Response(400, extensions={"reason_phrase": f"Bad {key}".encode()}))],
+    )
+    set_api_key(FAKE_KEY)
+
+    with pytest.raises(RuntimeError) as info:
+        await send("/project")
+
+    assert shown_key_runs("".join(traceback.format_exception(info.value)), FAKE_KEY) == []
+
+
+@pytest.mark.parametrize("send", [_get, _stream], ids=["request", "stream"])
+@pytest.mark.parametrize("charset", ["utf-16", "base64"])
+async def test_a_404_whose_charset_cant_decode_its_body_is_a_refusal_whose_traceback_hides_the_key(
+    charset, send, monkeypatch
+):
+    _serve(
+        monkeypatch,
+        [
+            _quoting_the_key(
+                lambda key: httpx.Response(
+                    404,
+                    content=b"not found",
+                    headers={"Content-Type": f"text/plain; charset={charset}"},
+                    extensions={"reason_phrase": f"Refused {key}".encode()},
+                )
+            )
+        ],
+    )
+    set_api_key(FAKE_KEY)
+
+    with pytest.raises(AristotleAPIError) as info:
+        await send("/project")
+
+    assert info.value.status_code == 404
+    assert shown_key_runs("".join(traceback.format_exception(info.value)), FAKE_KEY) == []
+
+
+@pytest.mark.usefixtures("no_proxy_settings")
+async def test_verbose_reports_a_refusal_page_whose_charset_cant_decode_it_without_the_key(
+    api_server, monkeypatch, caplog
+):
+    caplog.set_level(logging.DEBUG, logger=api_request.http_logger.name)
+    api_server(
+        _quoting_the_key(
+            lambda key: httpx.Response(
+                403,
+                content=b"<html><p>Blocked</p></html>",
+                headers={"Content-Type": "text/html; charset=base64"},
+                extensions={"reason_phrase": f"Forbidden {key}".encode()},
+            )
+        )
+    )
+    monkeypatch.setattr(api_request, "API_KEY", FAKE_KEY)
+
+    async with AristotleRequestClient() as client:
+        with pytest.raises(api_request._IntermediaryError) as info:
+            await client.get("/project")
+
+    assert "Response excerpt: Blocked" in caplog.text
+    assert shown_key_runs("".join(traceback.format_exception(info.value)) + caplog.text, FAKE_KEY) == []
+
+
+@pytest.mark.parametrize("send", [_get, _stream], ids=["request", "stream"])
+async def test_httpxs_own_log_of_an_sdk_request_hides_the_key_its_status_line_quotes(send, monkeypatch, caplog):
+    monkeypatch.setattr(logging.getLogger("httpx"), "disabled", False)
+    caplog.set_level(logging.INFO, logger="httpx")
+    _serve(
+        monkeypatch,
+        [_quoting_the_key(lambda key: httpx.Response(400, extensions={"reason_phrase": f"Bad {key}".encode()}))],
+    )
+    set_api_key(FAKE_KEY)
+
+    with pytest.raises(AristotleAPIError):
+        await send("/project")
+
+    assert '"HTTP/1.1 400 Bad [redacted]"' in caplog.text
+    assert shown_key_runs(caplog.text, FAKE_KEY) == []
+
+
+async def test_httpxs_log_record_of_an_sdk_request_keeps_its_arguments(api_server, monkeypatch, caplog):
+    monkeypatch.setattr(logging.getLogger("httpx"), "disabled", False)
+    caplog.set_level(logging.INFO, logger="httpx")
+    reason = _quoting_the_key(lambda key: {"reason_phrase": f"OK {key}".encode()})
+    api_server(lambda request: httpx.Response(200, json={"projects": []}, extensions=reason(request)))
+    monkeypatch.setattr(api_request, "API_KEY", FAKE_KEY)
+
+    async with AristotleRequestClient() as client:
+        await client.get("/project")
+
+    [record] = [record for record in caplog.records if record.name == "httpx"]
+    url = httpx.URL(f"{api_request.get_base_url()}/project")
+    assert record.args == ("GET", url, "HTTP/1.1", 200, "OK [redacted]")
+
+
+@pytest.mark.parametrize("key", ["200", "%d"], ids=["the status code", "part of the format"])
+async def test_httpxs_log_record_of_an_sdk_request_still_formats_whatever_text_of_it_the_key_matches(
+    key, api_server, monkeypatch, caplog
+):
+    monkeypatch.setattr(logging.getLogger("httpx"), "disabled", False)
+    caplog.set_level(logging.INFO, logger="httpx")
+    api_server(httpx.Response(200, json={"projects": []}))
+    monkeypatch.setattr(api_request, "API_KEY", key)
+
+    async with AristotleRequestClient() as client:
+        await client.get("/project")
+
+    [record] = [record for record in caplog.records if record.name == "httpx"]
+    assert record.getMessage() == f'HTTP Request: GET {api_request.get_base_url()}/project "HTTP/1.1 200 OK"'
+
+
+async def test_httpxs_log_of_a_request_the_sdk_doesnt_send_is_left_as_it_is(monkeypatch, caplog):
+    monkeypatch.setattr(logging.getLogger("httpx"), "disabled", False)
+    caplog.set_level(logging.INFO, logger="httpx")
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(400, extensions={"reason_phrase": b"Bad arstl_Q7zP"})
+    )
+
+    async with httpx.AsyncClient(transport=transport) as client:
+        await client.get("http://127.0.0.1:9/")
+
+    assert '"HTTP/1.1 400 Bad arstl_Q7zP"' in caplog.text
+
+
+@pytest.mark.parametrize(
+    "key", [FAKE_KEY, "fake-Q7zP\\3wK9vX2m", "fake-Q7zP'3wK\"9vX2m"], ids=["key", "backslash", "both quotes"]
+)
+@pytest.mark.parametrize("send", [_get, _stream], ids=["request", "stream"])
+@pytest.mark.parametrize(
+    "answer",
+    [
+        b"HTTP/1.1 400 Bad %s\r\nContent-Length: 0\r\n\r\n",
+        b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nRequest header X-API-Key: %s\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\nX-API-Key: %s\r\n",
+        b"HTTP/1.1 400 Bad Request\r\nTransfer-Encoding: chunked\r\n\r\nX-API-Key: %s\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX-API-Key %s\r\n\r\n",
+    ],
+    ids=[
+        "status line",
+        "header line h11 can't parse",
+        "chunk h11 can't parse",
+        "refusal's chunk h11 can't parse",
+        "trailer h11 can't parse",
+    ],
+)
+async def test_httpx_and_httpcore_logs_of_an_sdk_request_hide_the_key_its_answer_quotes(
+    answer, send, key, monkeypatch, caplog
+):
+    for name in api_request._TRANSPORT_LOGGERS:
+        monkeypatch.setattr(logging.getLogger(name), "disabled", False)
+    caplog.set_level(logging.DEBUG)
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        await reader.readuntil(b"\r\n\r\n")
+        writer.write(answer % key.encode())
+        await writer.drain()
+        writer.close()
+
+    for variable in ("HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"):
+        monkeypatch.delenv(variable, raising=False)
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    monkeypatch.setenv("ARISTOTLE_WEB_URL", f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}")
+    monkeypatch.setattr(api_request, "API_KEY", key)
+    try:
+        with pytest.raises((AristotleAPIError, httpx.TransportError)):
+            await send("/project")
+    finally:
+        server.close()
+
+    assert "receive_response_headers" in caplog.text
+    assert shown_key_runs(caplog.text, key) == []
+
+
+async def test_text_shaped_like_another_aristotle_key_is_redacted_from_a_servers_error(api_server):
+    api_server(httpx.Response(400, json={"detail": "The key arstl_Q7zP3wK9-vX2m_ab was revoked."}))
+
+    async with AristotleRequestClient() as client:
+        with pytest.raises(AristotleAPIError) as info:
+            await client.get("/project")
+
+    assert str(info.value) == "API request failed with status 400: The key [redacted] was revoked."
+
+
+@pytest.mark.usefixtures("frozen_api_clock", "no_proxy_settings")
+async def test_the_key_in_a_foreign_answers_status_line_is_redacted(api_server, monkeypatch, caplog):
+    page = _page().text
+    signed_in = _quoting_the_key(
+        lambda key: httpx.Response(200, html=page, extensions={"reason_phrase": f"OK {key}".encode()})
+    )
+    api_server(*[signed_in] * api_request.RETRY_ATTEMPTS)
+    monkeypatch.setattr(api_request, "API_KEY", FAKE_KEY)
+
+    async with AristotleRequestClient() as client:
+        with pytest.raises(AristotleAPIError) as info:
+            await client.get("/project")
+
+    redacted = PAGE_ERROR.replace("200 OK", "200 OK [redacted]")
+    assert str(info.value) == f"GET /project after 5 attempts over 0 s: {redacted}"
+    assert shown_key_runs(caplog.text, FAKE_KEY) == []
+
+
+GARBLED_LINE = "illegal header line: bytearray(b'Request header X-API-Key: {key}')"
+"""h11's error for a response header line it couldn't parse, which quotes the line."""
+
+
+async def test_the_key_a_response_line_quotes_is_redacted_from_every_retry_logged_and_the_error(
+    api_server, monkeypatch, caplog
+):
+    garbled = _quoting_the_key(lambda key: httpx.RemoteProtocolError(GARBLED_LINE.format(key=key)))
+    api_server(*[garbled] * api_request.RETRY_ATTEMPTS)
+    monkeypatch.setattr(api_request, "API_KEY", FAKE_KEY)
+
+    async with AristotleRequestClient() as client:
+        with pytest.raises(AristotleAPIError) as info:
+            await client.get("/project")
+
+    quoted = GARBLED_LINE.format(key="[redacted]")
+    assert caplog.text.count(f"RemoteProtocolError on GET /project: {quoted}") == api_request.RETRY_ATTEMPTS - 1
+    assert str(info.value).endswith(quoted)
+    cause = info.value.__cause__
+    assert (type(cause), str(cause), cause.__cause__, cause.__context__) == (
+        httpx.RemoteProtocolError,
+        quoted,
+        None,
+        None,
+    )
+    assert shown_key_runs(caplog.text + str(info.value), FAKE_KEY) == []
+
+
 HEADER_REFUSAL = f"Illegal header value b'{FAKE_KEY}\\n'"
 """h11's error for a header value it won't send, which quotes the value."""
 
@@ -1567,6 +2318,49 @@ async def test_a_header_h11_refuses_to_send_is_not_quoted_and_nothing_reaches_th
     assert str(info.value) == "LocalProtocolError on POST /project. Aristotle didn't act on it."
     assert str(info.value.__cause__) == ""
     assert received == []
+
+
+async def test_httpx_raises_a_local_protocol_error_only_before_it_writes_a_byte_of_the_request(monkeypatch):
+    """What _UNSENT_ERRORS relies on: httpcore maps h11's refusal of the request line and headers, which comes before
+    anything is written, to LocalProtocolError, and leaves a refusal after them, such as of a body longer than its
+    Content-Length, as h11's own error."""
+    accepted = 0
+    received: list[bytes] = []
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        nonlocal accepted
+        accepted += 1
+        data = b""
+        while chunk := await reader.read(65536):
+            data += chunk
+        received.append(data)
+        writer.close()
+
+    async def overlong() -> AsyncIterator[bytes]:
+        yield b"two"
+
+    for variable in ("HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"):
+        monkeypatch.delenv(variable, raising=False)
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    url = f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}/project"
+    try:
+        async with api_request.new_http_client() as client:
+            with pytest.raises(httpx.LocalProtocolError):
+                await client.post(url, json={}, headers={"X-API-Key": f"{FAKE_KEY}\n"})
+            with pytest.raises(h11.LocalProtocolError) as after_the_headers:
+                await client.post(url, content=overlong(), headers={"Content-Length": "1"})
+        # The client has closed its connections; the server reads each to its end.
+        for _ in range(500):
+            if any(received) and len(received) == accepted:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        server.close()
+
+    assert not isinstance(after_the_headers.value, api_request._UNSENT_ERRORS)
+    [sent] = [data for data in received if data]
+    assert sent.startswith(b"POST /project HTTP/1.1\r\n")
+    assert FAKE_KEY.encode() not in sent
 
 
 async def test_an_unauthenticated_request_needs_no_key_and_sends_none(api_server, monkeypatch):
@@ -1697,6 +2491,23 @@ async def test_a_certificate_this_machine_doesnt_trust_is_not_retried_and_names_
 
     assert str(info.value) == (
         "ConnectError on GET /project: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed "
+        "certificate. This machine doesn't trust the server's certificate. Behind a proxy that inspects TLS, set "
+        "ARISTOTLE_CA_BUNDLE to the PEM file of the proxy's certificate authority."
+    )
+    assert len(requests) == 1
+
+
+async def test_a_redaction_never_changes_whether_a_transport_failure_is_retried(api_server, monkeypatch):
+    requests = api_server(*[_certificate_failure()] * api_request.RETRY_ATTEMPTS)
+    # A key whose text the certificate error happens to hold, so its copy for reporting has the key hidden.
+    monkeypatch.setattr(api_request, "API_KEY", "self-signed")
+
+    async with AristotleRequestClient() as client:
+        with pytest.raises(AristotleAPIError) as info:
+            await client.get("/project")
+
+    assert str(info.value) == (
+        "ConnectError on GET /project: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: [redacted] "
         "certificate. This machine doesn't trust the server's certificate. Behind a proxy that inspects TLS, set "
         "ARISTOTLE_CA_BUNDLE to the PEM file of the proxy's certificate authority."
     )
@@ -2130,6 +2941,23 @@ async def test_json_a_read_never_takes_ends_the_request_saying_where_it_failed(a
     assert type(info.value) is AristotleAPIError
     assert isinstance(info.value.__cause__, httpx.HTTPStatusError)
     assert len(requests) == api_request.RETRY_ATTEMPTS
+
+
+@pytest.mark.usefixtures("frozen_api_clock", "no_proxy_settings")
+async def test_the_key_in_the_status_line_of_json_a_read_cant_take_is_redacted(api_server, monkeypatch, caplog):
+    unreadable = _quoting_the_key(
+        lambda key: httpx.Response(200, json={}, extensions={"reason_phrase": f"OK {key}".encode()})
+    )
+    api_server(*[unreadable] * api_request.RETRY_ATTEMPTS)
+    monkeypatch.setattr(api_request, "API_KEY", FAKE_KEY)
+
+    async with AristotleRequestClient() as client:
+        with pytest.raises(AristotleAPIError) as info:
+            await client.get("/project", read=READ_LISTING)
+
+    redacted = UNREADABLE_ERROR.replace("200 OK", "200 OK [redacted]")
+    assert str(info.value) == f"GET /project after 5 attempts over 0 s: {redacted}"
+    assert shown_key_runs("".join(traceback.format_exception(info.value)) + caplog.text, FAKE_KEY) == []
 
 
 @pytest.mark.usefixtures("no_proxy_settings")

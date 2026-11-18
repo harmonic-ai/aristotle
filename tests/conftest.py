@@ -22,6 +22,7 @@ import httpx
 import pytest
 
 from aristotlelib import api_request, credentials
+from aristotlelib.cli.controller import _AfterStdoutHandler
 from aristotlelib.cli.version import get_version
 
 UNREACHABLE_HOST = "192.0.2.1"
@@ -261,6 +262,13 @@ def not_on_github(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.fixture(autouse=True)
+def not_a_dumb_terminal(monkeypatch: pytest.MonkeyPatch):
+    """Clear TERM, which some terminals and CI runners set to dumb: a wait's display then prints only what's new, even
+    at a terminal. A test of that sets it."""
+    monkeypatch.delenv("TERM", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def restore_api_key(monkeypatch: pytest.MonkeyPatch):
     """Undo set_api_key() after each test: a key left set sends a later test's unmocked requests out."""
     monkeypatch.setattr(api_request, "API_KEY", api_request.API_KEY)
@@ -359,6 +367,50 @@ class _Reading:
 def patched_client(client: Any) -> Any:
     """Patch AristotleRequestClient to make ``client``, a mock, whose answers each request reads as the real client's."""
     return patch("aristotlelib.api_request.AristotleRequestClient", return_value=_Reading(client))
+
+
+@pytest.fixture
+def terminal_size(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the terminal 200 columns by 50 rows to shutil.get_terminal_size(), whatever runs the tests."""
+    monkeypatch.setenv("COLUMNS", "200")
+    monkeypatch.setenv("LINES", "50")
+
+
+class Terminal(io.StringIO):
+    """A stdout that is a terminal, which a test patches in itself: pytest's capture replaces a fixture's."""
+
+    def isatty(self) -> bool:
+        return True
+
+
+FRAME_ERASE = re.compile(r"\r\x1b\[2K((?:\x1b\[A\x1b\[2K)+)")
+"""What a wait's display writes to take its frame off a terminal: erase the row below it, then each of its rows going
+up."""
+
+
+def screen_of(out: str) -> list[str]:
+    """The lines a terminal holds once ``out``, whole lines that fit its width, is written to it."""
+    lines: list[str] = []
+    for number, part in enumerate(FRAME_ERASE.split(out)):
+        if number % 2:
+            del lines[len(lines) - part.count("\x1b[A") :]
+        else:
+            lines += part.splitlines()
+    return lines
+
+
+@contextlib.contextmanager
+def logged_to(terminal: Terminal) -> Iterator[None]:
+    """Log from INFO up to ``terminal`` as well, through the CLI's handler."""
+    handler = _AfterStdoutHandler(terminal)
+    level = logging.root.level
+    logging.root.addHandler(handler)
+    logging.root.setLevel(logging.INFO)
+    try:
+        yield
+    finally:
+        logging.root.removeHandler(handler)
+        logging.root.setLevel(level)
 
 
 def give_key(source: str, key: str, monkeypatch: pytest.MonkeyPatch, config_dir: Path) -> list[str]:

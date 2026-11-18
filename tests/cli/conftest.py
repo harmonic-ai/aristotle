@@ -62,7 +62,9 @@ def billed_to() -> Generator[AsyncMock, None, None]:
 def resolve_project():
     """Resolve every project reference to itself, as a UUID is, with no project listed; a test sets ``side_effect`` to
     exercise the lookup."""
-    with patch.object(Project, "_resolve", AsyncMock(side_effect=lambda reference: (reference, None))) as resolve:
+    with patch.object(
+        Project, "_resolve", AsyncMock(side_effect=lambda reference, archived=False: (reference, None))
+    ) as resolve:
         yield resolve
 
 

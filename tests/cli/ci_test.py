@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import contextlib
 import dataclasses
+import errno
 import logging
 import os
 import re
@@ -12,6 +13,7 @@ import sys
 import tarfile
 import tempfile
 import xml.etree.ElementTree as ET
+from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple
@@ -712,17 +714,16 @@ def test_the_likely_causes_leave_out_what_the_results_rule_out(declarations, exp
     assert _likely_causes(run_results, {}) == expected
 
 
-def test_a_language_that_is_off_comes_first_and_one_aristotle_cannot_vouch_for_last():
+def test_a_language_that_is_off_comes_first_and_one_aristotle_cannot_vouch_for_is_not_named():
     requested = manifest.parse(manifest.tomllib.loads(MANIFEST), Path("aristotle.toml")).properties
     run_results = results.RunResults.from_declarations(
         [_declaration("write_when_full", DeclarationStatus.IN_PROGRESS)], duration_seconds=1.0, requested=requested
     )
 
-    assert _likely_causes(run_results, {"C": False, "Rust": None, "Verilog": True}) == [
+    assert _likely_causes(run_results, {"C": False, "Verilog": None}) == [
         "C is not enabled for this account, so Aristotle left it out",
         "Aristotle registered nothing under some of the manifest's ids",
         DECISION,
-        "files in a language this account can't verify are left out, which Aristotle gives no way to check",
     ]
 
 
@@ -2225,6 +2226,946 @@ async def test_a_dot_dot_after_a_junction_outside_the_checkout_is_taken_as_text(
     ]
 
 
+def _manifest_link_error(path: object, target: object, leads: str, via: object = None, own: bool | None = None) -> str:
+    """The error for the manifest at ``path`` read through the link ``via``, else the one at ``path``, to ``target``;
+    ``own`` when the manifest's path ends at that link, as it does unless ``via`` names another."""
+    reached = "" if via is None else f"reached through {via}, "
+    if own is None:
+        own = via is None
+    if leads != "out of it":
+        fix = "Fix the link, or commit the manifest in its place." if own else "Fix the link."
+    elif own:
+        fix = "Commit the manifest in place of the link, or pass --manifest the path of the file it leads to."
+    else:
+        fix = "Fix the link, or pass --manifest the manifest's path outside the checkout."
+    return f"{path} is {reached}a link in the checkout to {target}, which leads {leads}. {fix}"
+
+
+def _commit_links(repo: Path, links: dict[str, str]) -> None:
+    """Commit a symbolic link at each name in ``repo`` to its target, as written, in place of what is there."""
+    for name, target in links.items():
+        (repo / name).parent.mkdir(parents=True, exist_ok=True)
+        (repo / name).unlink(missing_ok=True)
+        (repo / name).symlink_to(target)
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "links")
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink") or os.name == "nt", reason="POSIX symlinks")
+@pytest.mark.parametrize(
+    ("links", "argv", "path", "via", "leads"),
+    [
+        ({"aristotle.toml": "{other}/aristotle.toml"}, [], "{repo}/aristotle.toml", None, "out of it"),
+        ({"aristotle.toml": "../other-job/aristotle.toml"}, [], "{repo}/aristotle.toml", None, "out of it"),
+        ({"hw": "{other}"}, ["--manifest", "hw/aristotle.toml"], "hw/aristotle.toml", "hw", "out of it"),
+        ({"hw": "{other}/rtl"}, ["--manifest", "hw/../aristotle.toml"], "hw/../aristotle.toml", "hw", "out of it"),
+        (
+            {"aristotle.toml": "hw/next.toml", "hw/next.toml": "{other}/aristotle.toml"},
+            [],
+            "{repo}/aristotle.toml",
+            "hw/next.toml",
+            "out of it",
+        ),
+        ({"aristotle.toml": "{other}/missing.toml"}, [], "{repo}/aristotle.toml", None, "out of it"),
+        ({"aristotle.toml": "missing.toml"}, [], "{repo}/aristotle.toml", None, "nowhere"),
+        ({"hw": "missing"}, ["--manifest", "hw/aristotle.toml"], "hw/aristotle.toml", "hw", "nowhere"),
+        ({"aristotle.toml": "missing/../fifo.v"}, [], "{repo}/aristotle.toml", None, "nowhere"),
+        ({"aristotle.toml": "aristotle.toml"}, [], "{repo}/aristotle.toml", None, "nowhere"),
+        (
+            {"f": "fifo.v"},
+            ["--manifest", "f/aristotle.toml"],
+            "f/aristotle.toml",
+            "f",
+            "to a file, where the path needs a folder",
+        ),
+        ({"hw/up": "..", "aristotle.toml": "hw/up/../.."}, [], "{repo}/aristotle.toml", None, "out of it"),
+        ({"hw": ".."}, ["--manifest", "hw/aristotle.toml"], "hw/aristotle.toml", "hw", "out of it"),
+        ({"hw": "/"}, ["--manifest", "hw/aristotle.toml"], "hw/aristotle.toml", "hw", "out of it"),
+        (
+            {"hw/x": "../..", "aristotle.toml": "hw/x/aristotle.toml"},
+            [],
+            "{repo}/aristotle.toml",
+            "hw/x",
+            "out of it",
+        ),
+        (
+            {"up": "..", "hw/y": "{other}"},
+            ["--manifest", "up/repo/hw/y/aristotle.toml"],
+            "up/repo/hw/y/aristotle.toml",
+            "hw/y",
+            "out of it",
+        ),
+        (
+            {"up": "..", "hw/up3": "../.."},
+            ["--manifest", "up/repo/hw/up3/aristotle.toml"],
+            "up/repo/hw/up3/aristotle.toml",
+            "hw/up3",
+            "out of it",
+        ),
+        (
+            {
+                "hw/x": "../..",
+                "hw/common2/aristotle.toml": "{other}/aristotle.toml",
+                "chain.toml": "hw/x/repo/hw/common2/aristotle.toml",
+            },
+            ["--manifest", "chain.toml"],
+            "chain.toml",
+            "hw/common2/aristotle.toml",
+            "out of it",
+        ),
+        (
+            {"a": "up/repo", "up": "..", "hw/y": "{other}"},
+            ["--manifest", "a/hw/y/aristotle.toml"],
+            "a/hw/y/aristotle.toml",
+            "hw/y",
+            "out of it",
+        ),
+    ],
+    ids=[
+        "to another folder",
+        "relative",
+        "a folder on the way",
+        "before a ..",
+        "through another link",
+        "out of it to nothing",
+        "dangling",
+        "a dangling folder on the way",
+        "a .. after a folder it lacks",
+        "a loop",
+        "a file used as a folder",
+        "a .. of its own after a link that stays in",
+        "a folder link to the folder above the checkout",
+        "a folder link to the root",
+        "through another link that climbs out",
+        "back in by name, then out through another link",
+        "back in by name, then up through another link",
+        "back in by name in a chain, then out through another link",
+        "back in where a link's target ends, then out through another link",
+    ],
+)
+async def test_a_manifest_link_in_the_checkout_that_leads_out_of_it_or_nowhere_exits_2_before_it_is_read(
+    action: CIAction,
+    repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog,
+    links: dict[str, str],
+    argv: list[str],
+    path: str,
+    via: str | None,
+    leads: str,
+):
+    other = tmp_path / "other-job"
+    (other / "rtl").mkdir(parents=True)
+    (other / manifest.MANIFEST_NAME).write_text(MANIFEST)
+    _commit_links(repo, {name: target.format(other=other) for name, target in links.items()})
+    monkeypatch.chdir(repo)
+    link = repo.resolve() / (via or "aristotle.toml")
+
+    with caplog.at_level(logging.INFO, logger="aristotle"):
+        assert action.preflight(action.parser.parse_args(argv)) == EXIT_USAGE_ERROR
+
+    assert caplog.messages[-1] == _manifest_link_error(
+        Path(path.format(repo=repo.resolve())), os.readlink(link), leads, link if via else None
+    )
+    assert "Checking" not in caplog.text
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink") or os.name == "nt", reason="POSIX symlinks")
+@pytest.mark.parametrize("value", NEVER_READ.values(), ids=NEVER_READ.keys())
+async def test_a_manifest_link_to_a_path_that_never_read_refuses_is_refused_unread(
+    action: CIAction, repo: Path, monkeypatch: pytest.MonkeyPatch, no_lookup_of, caplog, value: str
+):
+    """On a Windows runner, a lookup would reach the computer it names."""
+    _commit_links(repo, {manifest.MANIFEST_NAME: value})
+    monkeypatch.chdir(repo)
+    no_lookup_of(UNREACHABLE_HOST)
+
+    with caplog.at_level(logging.INFO, logger="aristotle"):
+        assert action.preflight(action.parser.parse_args([])) == EXIT_USAGE_ERROR
+
+    assert caplog.messages[-1] == _manifest_link_error(
+        repo.resolve() / manifest.MANIFEST_NAME, Path(value), "out of it"
+    )
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink") or os.name == "nt", reason="POSIX symlinks")
+@pytest.mark.parametrize("there", [False, True], ids=["missing", "there"])
+async def test_a_manifest_link_through_a_folder_outside_the_checkout_is_refused_there_or_not(
+    action: CIAction, repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog, there: bool
+):
+    """Even where it would lead back in, so that what happens says nothing of what is outside the checkout."""
+    if there:
+        (tmp_path / "probe").mkdir()
+    (repo / "hw").mkdir()
+    (repo / "hw" / manifest.MANIFEST_NAME).write_text(MANIFEST)
+    target = f"{tmp_path}/probe/../repo/hw/aristotle.toml"
+    _commit_links(repo, {manifest.MANIFEST_NAME: target})
+    monkeypatch.chdir(repo)
+
+    with caplog.at_level(logging.INFO, logger="aristotle"):
+        assert action.preflight(action.parser.parse_args([])) == EXIT_USAGE_ERROR
+
+    assert caplog.messages[-1] == _manifest_link_error(repo.resolve() / manifest.MANIFEST_NAME, target, "out of it")
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink") or os.name == "nt", reason="POSIX symlinks")
+async def test_a_manifest_link_into_the_checkout_through_a_link_outside_it_is_refused_before_anything_looks_there(
+    action: CIAction, repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_lookup_of, caplog
+):
+    """It leads into the checkout, but the walk judges a target by its names, and ``mnt`` is neither in the checkout nor
+    above it."""
+    (repo / "hw").mkdir()
+    (repo / "hw" / manifest.MANIFEST_NAME).write_text(MANIFEST)
+    (tmp_path / "mnt").symlink_to(repo.resolve(), target_is_directory=True)
+    target = f"{tmp_path}/mnt/hw/aristotle.toml"
+    _commit_links(repo, {manifest.MANIFEST_NAME: target})
+    monkeypatch.chdir(repo)
+    no_lookup_of(str(tmp_path / "mnt"))
+
+    with caplog.at_level(logging.INFO, logger="aristotle"):
+        assert action.preflight(action.parser.parse_args([])) == EXIT_USAGE_ERROR
+
+    assert caplog.messages[-1] == _manifest_link_error(repo.resolve() / manifest.MANIFEST_NAME, target, "out of it")
+
+
+async def test_a_manifest_link_back_into_the_checkout_by_its_name_in_another_case_is_refused(
+    action: CIAction, repo: Path, monkeypatch: pytest.MonkeyPatch, no_lookup_of, caplog
+):
+    """Where a folder is case-sensitive, as on Linux or in one WSL makes on Windows, that name is another folder beside
+    the checkout, such as another job's, so it is refused before anything looks there, wherever it leads here."""
+    other = repo.with_name(repo.name.upper())
+    (repo / "common").mkdir()
+    (repo / "common" / manifest.MANIFEST_NAME).write_text(MANIFEST)
+    target = os.path.join(os.pardir, other.name, "common", manifest.MANIFEST_NAME)
+    (repo / manifest.MANIFEST_NAME).unlink()
+    try:
+        (repo / manifest.MANIFEST_NAME).symlink_to(target)
+    except (OSError, NotImplementedError):
+        pytest.skip("needs the right to make symbolic links")
+    monkeypatch.chdir(repo)
+    no_lookup_of(str(other))
+
+    with caplog.at_level(logging.INFO, logger="aristotle"):
+        assert action.preflight(action.parser.parse_args([])) == EXIT_USAGE_ERROR
+
+    assert caplog.messages[-1] == _manifest_link_error(repo.resolve() / manifest.MANIFEST_NAME, target, "out of it")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="directory junctions are Windows'")
+async def test_in_ci_on_windows_a_manifest_link_through_a_junction_naming_its_folder_in_another_case_is_followed(
+    action: CIAction, repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog
+):
+    """As a link a build step writes with $WORKSPACE, where the CI system names the checkout through a junction whose
+    target spells its folder in another case than the disk does: the walk spells the checkout as it follows that."""
+    import _winapi
+
+    (repo / "hw" / "common").mkdir(parents=True)
+    (repo / "hw" / "common" / manifest.MANIFEST_NAME).write_text(MANIFEST)
+    _winapi.CreateJunction(str(tmp_path).upper(), str(tmp_path / "J"))
+    target = tmp_path / "J" / repo.name / "hw" / "common" / manifest.MANIFEST_NAME
+    (repo / manifest.MANIFEST_NAME).unlink()
+    try:
+        (repo / manifest.MANIFEST_NAME).symlink_to(target)
+    except OSError:
+        pytest.skip("needs the right to make symbolic links")
+    monkeypatch.setenv("JENKINS_URL", "http://jenkins.invalid/")
+    monkeypatch.setenv("WORKSPACE", str(tmp_path / "J" / repo.name))
+    monkeypatch.chdir(repo)
+
+    with caplog.at_level(logging.INFO, logger="aristotle"):
+        assert action.preflight(action.parser.parse_args(["--directory", "."])) is None
+
+    assert f"Checking 2 properties from {repo.resolve() / manifest.MANIFEST_NAME}:" in caplog.messages
+
+
+VOLUME = "\\\\?\\Volume{6c0a5b1e-1d2c-4e3f-8a9b-0c1d2e3f4a5b}\\"
+"""A volume's root as Windows names it, as a volume mounted at a folder is a link to."""
+
+
+@pytest.mark.parametrize(
+    ("path", "anchor", "names"),
+    [
+        (f"{VOLUME}job\\x", VOLUME, ["job", "x"]),
+        (VOLUME, VOLUME, []),
+        ("\\\\?\\C:\\job", "\\\\?\\C:\\", ["job"]),
+        ("\\\\?\\UNC\\host\\share\\x", "\\\\?\\UNC\\host\\share\\", ["x"]),
+        ("\\\\?\\unc\\host\\share\\x", "\\\\?\\unc\\host\\share\\", ["x"]),
+        ("C:\\job\\x", "C:\\", ["job", "x"]),
+        ("job\\x", "", ["job", "x"]),
+    ],
+    ids=[
+        "in a volume",
+        "a volume's root",
+        "on a drive",
+        "on a share",
+        "on a share, in lower case",
+        "plain",
+        "relative",
+    ],
+)
+def test_the_walk_takes_a_volumes_path_from_its_root_as_python_312_does_on_every_version(
+    path: str, anchor: str, names: list[str]
+):
+    """Before 3.12, pathlib splits a volume's root into a bare \\\\?\\ and a name, which joined back is no path: under a
+    volume mounted at a folder, the walk would stop before any link in the checkout, and the read follow them all."""
+    from pathlib import PureWindowsPath
+
+    from aristotlelib.cli.command.ci import _anchored
+
+    assert _anchored(PureWindowsPath(path)) == (anchor, names)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows' rooted paths")
+async def test_on_windows_a_manifest_link_in_the_checkout_to_a_path_rooted_with_no_drive_is_refused(
+    action: CIAction, repo: Path, monkeypatch: pytest.MonkeyPatch, caplog
+):
+    """Windows starts such a target at the root of the link's volume, for which a drive's letter, as a subst drive's,
+    can stand in, so even one that leads into the checkout here is refused."""
+    (repo / "common").mkdir()
+    (repo / "common" / manifest.MANIFEST_NAME).write_text(MANIFEST)
+    _, rooted = os.path.splitdrive(repo.resolve() / "common" / manifest.MANIFEST_NAME)
+    (repo / manifest.MANIFEST_NAME).unlink()
+    try:
+        (repo / manifest.MANIFEST_NAME).symlink_to(rooted)
+    except OSError:
+        pytest.skip("needs the right to make symbolic links")
+    monkeypatch.chdir(repo)
+
+    with caplog.at_level(logging.INFO, logger="aristotle"):
+        assert action.preflight(action.parser.parse_args([])) == EXIT_USAGE_ERROR
+
+    assert caplog.messages[-1] == _manifest_link_error(repo.resolve() / manifest.MANIFEST_NAME, rooted, "out of it")
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink") or os.name == "nt", reason="POSIX symlinks")
+async def test_a_manifest_link_through_folders_too_deep_to_name_whole_is_refused_rather_than_misread(
+    action: CIAction, repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog
+):
+    """The system follows a relative link however deep its folder, though a path that long can't be looked up: taken
+    as text, the .. after it would end at a decoy in the checkout, while the system ends outside it."""
+    monkeypatch.chdir(repo)
+    # Folders whose path from the checkout keeps within the system's limit, and from the root passes it.
+    count, rest = divmod(os.pathconf(repo, "PC_PATH_MAX") - 8, 251)
+    names = ["d" * 250] * count + (["e" * (rest - 1)] if rest > 1 else [])
+    deep = "/".join(names)
+    os.makedirs(deep)
+    climbs = len(names) + 1
+    pads = tmp_path.joinpath("out", *["p"] * climbs)
+    pads.mkdir(parents=True)
+    (tmp_path / "out" / "decoy.toml").write_text(MANIFEST)
+    (repo / "decoy.toml").write_text(MANIFEST)
+    os.symlink(pads, f"{deep}/L")
+    os.symlink(deep, "h")
+    (repo / manifest.MANIFEST_NAME).unlink()
+    os.symlink("h/L/" + "../" * climbs + "decoy.toml", manifest.MANIFEST_NAME)
+
+    with caplog.at_level(logging.INFO, logger="aristotle"):
+        assert action.preflight(action.parser.parse_args([])) == EXIT_USAGE_ERROR
+
+    assert caplog.messages[-1].startswith(f"Cannot look up {repo.resolve()}/d")
+    assert caplog.messages[-1].endswith(
+        f" on the way to {repo.resolve() / manifest.MANIFEST_NAME}: {os.strerror(errno.ENAMETOOLONG)}"
+    )
+    assert "Checking" not in caplog.text
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink") or os.name == "nt", reason="POSIX symlinks")
+async def test_a_manifest_missing_behind_a_folder_link_that_leads_somewhere_is_reported_missing(
+    action: CIAction, repo: Path, monkeypatch: pytest.MonkeyPatch, caplog
+):
+    """The link isn't what's wrong."""
+    (repo / "ci" / "config").mkdir(parents=True)
+    _commit_links(repo, {"config": "ci/config"})
+    monkeypatch.chdir(repo)
+
+    with caplog.at_level(logging.ERROR, logger="aristotle"):
+        assert action.preflight(action.parser.parse_args(["--manifest", "config/aristotle.toml"])) == EXIT_USAGE_ERROR
+
+    assert caplog.messages == [f"Manifest {Path('config', manifest.MANIFEST_NAME)} not found."]
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink") or os.name == "nt", reason="POSIX symlinks")
+async def test_on_a_ci_system_naming_no_workspace_a_step_run_from_the_root_still_judges_a_manifest_link(
+    action: CIAction, repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog
+):
+    """CircleCI's workspace is the current folder, and the file system's root never counts as the checkout."""
+    (tmp_path / "other-job").mkdir()
+    (tmp_path / "other-job" / manifest.MANIFEST_NAME).write_text(MANIFEST)
+    target = tmp_path / "other-job" / manifest.MANIFEST_NAME
+    _commit_links(repo, {manifest.MANIFEST_NAME: str(target)})
+    monkeypatch.setenv("CIRCLECI", "true")
+    monkeypatch.chdir(os.path.abspath(os.sep))
+
+    with caplog.at_level(logging.INFO, logger="aristotle"):
+        assert action.preflight(action.parser.parse_args(["--directory", str(repo)])) == EXIT_USAGE_ERROR
+
+    assert caplog.messages[-1] == _manifest_link_error(repo.resolve() / manifest.MANIFEST_NAME, target, "out of it")
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink") or os.name == "nt", reason="POSIX symlinks")
+@pytest.mark.parametrize(
+    ("links", "start", "argv", "read"),
+    [
+        (
+            {"hw/a/aristotle.toml": "../common/aristotle.toml"},
+            ".",
+            ["--directory", "hw/a"],
+            "{repo}/hw/a/aristotle.toml",
+        ),
+        ({"hw/a/aristotle.toml": "../common/aristotle.toml"}, "hw/a", [], "{repo}/hw/a/aristotle.toml"),
+        ({"hw/a": "common"}, ".", ["--manifest", "hw/a/aristotle.toml"], "hw/a/aristotle.toml"),
+        ({"hw/a": "{repo}/hw/common"}, ".", ["--manifest", "hw/a/aristotle.toml"], "hw/a/aristotle.toml"),
+        (
+            {"aristotle.toml": "hw/next.toml", "hw/next.toml": "common/aristotle.toml"},
+            ".",
+            [],
+            "{repo}/aristotle.toml",
+        ),
+        (
+            {"hw/a/aristotle.toml": "../common/aristotle.toml"},
+            ".",
+            ["--manifest", "/{repo}/hw/a/aristotle.toml"],
+            "/{repo}/hw/a/aristotle.toml",
+        ),
+    ],
+    ids=[
+        "a shared manifest",
+        "found from its folder",
+        "a folder on the way",
+        "absolute",
+        "through another link",
+        "named from //, which the system takes as /",
+    ],
+)
+async def test_a_manifest_link_that_stays_in_the_checkout_is_followed(
+    action: CIAction,
+    repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog,
+    links: dict[str, str],
+    start: str,
+    argv: list[str],
+    read: str,
+):
+    (repo / "hw" / "common").mkdir(parents=True)
+    (repo / "hw" / "common" / manifest.MANIFEST_NAME).write_text(MANIFEST)
+    _commit_links(repo, {name: target.format(repo=repo.resolve()) for name, target in links.items()})
+    monkeypatch.chdir(repo / start)
+
+    with caplog.at_level(logging.INFO, logger="aristotle"):
+        assert action.preflight(action.parser.parse_args([arg.format(repo=repo.resolve()) for arg in argv])) is None
+
+    assert f"Checking 2 properties from {Path(read.format(repo=repo.resolve()))}:" in caplog.messages
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink") or os.name == "nt", reason="POSIX symlinks")
+@pytest.mark.parametrize("linked", [False, True], ids=["a file", "a link out of the checkout"])
+async def test_a_link_above_the_checkout_leads_to_its_manifest_which_is_then_judged_as_in_it(
+    action: CIAction, repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog, linked: bool
+):
+    """As a mount or macOS's /tmp, a link above the checkout belongs to the machine."""
+    (tmp_path / "other-job").mkdir()
+    (tmp_path / "other-job" / manifest.MANIFEST_NAME).write_text(MANIFEST)
+    if linked:
+        _commit_links(repo, {manifest.MANIFEST_NAME: str(tmp_path / "other-job" / manifest.MANIFEST_NAME)})
+    (tmp_path / "mnt").symlink_to(repo, target_is_directory=True)
+    monkeypatch.chdir(repo)
+    given = tmp_path / "mnt" / manifest.MANIFEST_NAME
+
+    with caplog.at_level(logging.INFO, logger="aristotle"):
+        code = action.preflight(action.parser.parse_args(["--manifest", str(given)]))
+
+    if linked:
+        assert code == EXIT_USAGE_ERROR
+        assert caplog.messages[-1] == _manifest_link_error(
+            given, tmp_path / "other-job" / manifest.MANIFEST_NAME, "out of it", repo / manifest.MANIFEST_NAME, own=True
+        )
+    else:
+        assert code is None
+        assert f"Checking 2 properties from {given}:" in caplog.messages
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink") or os.name == "nt", reason="POSIX symlinks")
+@pytest.mark.parametrize(
+    ("system", "workspace", "followed"),
+    [("JENKINS_URL", "WORKSPACE", True), ("GITHUB_ACTIONS", "GITHUB_WORKSPACE", False)],
+    ids=["a workspace holding both", "a workspace that is the checkout"],
+)
+async def test_in_ci_a_manifest_link_may_lead_anywhere_in_the_workspace(
+    action: CIAction,
+    repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog,
+    system: str,
+    workspace: str,
+    followed: bool,
+):
+    (tmp_path / "shared").mkdir()
+    (tmp_path / "shared" / manifest.MANIFEST_NAME).write_text(MANIFEST)
+    _commit_links(repo, {manifest.MANIFEST_NAME: "../shared/aristotle.toml"})
+    monkeypatch.setenv(system, "true")
+    monkeypatch.setenv(workspace, str(tmp_path if followed else repo))
+    monkeypatch.chdir(repo)
+
+    with caplog.at_level(logging.INFO, logger="aristotle"):
+        code = action.preflight(action.parser.parse_args(["--directory", "."]))
+
+    shown = repo.resolve() / manifest.MANIFEST_NAME
+    if followed:
+        assert code is None
+        assert f"Checking 2 properties from {shown}:" in caplog.messages
+    else:
+        assert code == EXIT_USAGE_ERROR
+        assert caplog.messages[-1] == _manifest_link_error(shown, "../shared/aristotle.toml", "out of it")
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink") or os.name == "nt", reason="POSIX symlinks")
+@pytest.mark.parametrize(
+    ("target", "followed"),
+    [("{tmp}/mnt-job/hw/common/aristotle.toml", True), ("{tmp}/mnt-job/../other-job/aristotle.toml", False)],
+    ids=["into the checkout", "then out of it"],
+)
+async def test_in_ci_a_manifest_link_through_the_workspaces_own_name_for_the_checkout_is_judged_by_where_it_ends(
+    action: CIAction, repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog, target: str, followed: bool
+):
+    """As a link a build step writes with $WORKSPACE, where the CI system names the checkout through a link."""
+    (repo / "hw" / "common").mkdir(parents=True)
+    (repo / "hw" / "common" / manifest.MANIFEST_NAME).write_text(MANIFEST)
+    (tmp_path / "other-job").mkdir()
+    (tmp_path / "other-job" / manifest.MANIFEST_NAME).write_text(MANIFEST)
+    (tmp_path / "mnt-job").symlink_to(repo, target_is_directory=True)
+    target = target.format(tmp=tmp_path)
+    _commit_links(repo, {manifest.MANIFEST_NAME: target})
+    monkeypatch.setenv("JENKINS_URL", "http://jenkins.invalid/")
+    monkeypatch.setenv("WORKSPACE", str(tmp_path / "mnt-job"))
+    monkeypatch.chdir(repo)
+
+    with caplog.at_level(logging.INFO, logger="aristotle"):
+        code = action.preflight(action.parser.parse_args(["--directory", "."]))
+
+    shown = repo.resolve() / manifest.MANIFEST_NAME
+    if followed:
+        assert code is None
+        assert f"Checking 2 properties from {shown}:" in caplog.messages
+    else:
+        assert code == EXIT_USAGE_ERROR
+        assert caplog.messages[-1] == _manifest_link_error(shown, target, "out of it")
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink") or os.name == "nt", reason="POSIX symlinks")
+@pytest.mark.parametrize(("target", "climbs"), [("common", 3), (".", 2)], ids=["a folder in it", "its own folder"])
+async def test_a_manifest_path_whose_own_dot_dots_leave_the_checkout_after_a_link_says_so_not_that_the_link_does(
+    action: CIAction, repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog, target: str, climbs: int
+):
+    """The link stays in the checkout, but decides where each .. after it leads."""
+    (repo / "hw" / "common").mkdir(parents=True)
+    (tmp_path / "other-job").mkdir()
+    (tmp_path / "other-job" / manifest.MANIFEST_NAME).write_text(MANIFEST)
+    _commit_links(repo, {"hw/x": target})
+    monkeypatch.chdir(repo)
+    given = Path("hw", "x", *[".."] * climbs, "other-job", manifest.MANIFEST_NAME)
+
+    with caplog.at_level(logging.INFO, logger="aristotle"):
+        assert action.preflight(action.parser.parse_args(["--manifest", str(given)])) == EXIT_USAGE_ERROR
+
+    assert caplog.messages[-1] == (
+        f"After {repo.resolve() / 'hw' / 'x'}, a link in the checkout to {target}, {given} climbs out of the checkout. "
+        "Pass --manifest a path that stays in it."
+    )
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink") or os.name == "nt", reason="POSIX symlinks")
+async def test_a_manifest_link_named_through_a_dot_dot_is_still_told_to_be_committed_in_its_place(
+    action: CIAction, repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog
+):
+    """The path spells the link otherwise, but the manifest's path still ends at it."""
+    target = tmp_path / "other-job" / manifest.MANIFEST_NAME
+    target.parent.mkdir()
+    target.write_text(MANIFEST)
+    (repo / "hw").mkdir()
+    _commit_links(repo, {manifest.MANIFEST_NAME: str(target)})
+    monkeypatch.chdir(repo)
+    given = Path("hw", "..", manifest.MANIFEST_NAME)
+
+    with caplog.at_level(logging.INFO, logger="aristotle"):
+        assert action.preflight(action.parser.parse_args(["--manifest", str(given)])) == EXIT_USAGE_ERROR
+
+    assert caplog.messages[-1] == _manifest_link_error(
+        given, target, "out of it", repo.resolve() / manifest.MANIFEST_NAME, own=True
+    )
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="POSIX permissions, which root passes")
+@pytest.mark.parametrize("given", ["build/aristotle.toml", "build/sub/aristotle.toml"], ids=["in it", "below it"])
+async def test_a_manifest_in_or_below_a_folder_that_cant_be_searched_is_reported_unreadable_as_on_main(
+    action: CIAction, repo: Path, monkeypatch: pytest.MonkeyPatch, caplog, given: str
+):
+    (repo / given).parent.mkdir(parents=True)
+    (repo / given).write_text(MANIFEST)
+    (repo / "build").chmod(0)
+    monkeypatch.chdir(repo)
+    try:
+        with caplog.at_level(logging.ERROR, logger="aristotle"):
+            code = action.preflight(action.parser.parse_args(["--manifest", given]))
+    finally:
+        (repo / "build").chmod(0o755)
+
+    assert code == EXIT_USAGE_ERROR
+    assert caplog.messages == [f"Cannot read {Path(given)}: {os.strerror(errno.EACCES)}"]
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink") or os.name == "nt", reason="POSIX symlinks")
+async def test_from_a_subfolder_a_dangling_manifest_link_on_the_way_up_is_named_not_passed_over(
+    action: CIAction, repo: Path, monkeypatch: pytest.MonkeyPatch, caplog
+):
+    """Rather than the manifest at the top of the repository being read in its place."""
+    _commit_links(repo, {"hw/aristotle.toml": "../common/aristotle.toml"})
+    (repo / "hw" / "rtl").mkdir()
+    monkeypatch.chdir(repo / "hw" / "rtl")
+
+    with caplog.at_level(logging.INFO, logger="aristotle"):
+        assert action.preflight(action.parser.parse_args([])) == EXIT_USAGE_ERROR
+
+    assert caplog.messages[-1] == _manifest_link_error(
+        repo.resolve() / "hw" / manifest.MANIFEST_NAME, "../common/aristotle.toml", "nowhere"
+    )
+    assert "Checking" not in caplog.text
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="directory junctions are Windows'")
+@pytest.mark.parametrize("inside", [False, True], ids=["out of the checkout", "in it"])
+async def test_a_manifest_reached_through_a_junction_is_read_only_when_the_junction_stays_in_the_checkout(
+    action: CIAction, repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog, inside: bool
+):
+    import _winapi
+
+    target = repo / "common" if inside else tmp_path / "other-job"
+    target.mkdir()
+    (target / manifest.MANIFEST_NAME).write_text(MANIFEST)
+    _winapi.CreateJunction(str(target), str(repo / "hw"))
+    monkeypatch.chdir(repo)
+
+    with caplog.at_level(logging.INFO, logger="aristotle"):
+        code = action.preflight(action.parser.parse_args(["--manifest", "hw\\aristotle.toml"]))
+
+    given = Path("hw", manifest.MANIFEST_NAME)
+    if inside:
+        assert code is None
+        assert f"Checking 2 properties from {given}:" in caplog.messages
+    else:
+        assert code == EXIT_USAGE_ERROR
+        assert caplog.messages[-1] == _manifest_link_error(given, target, "out of it", Path.cwd() / "hw")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="directory junctions are Windows'")
+async def test_a_dot_dot_after_a_junction_out_of_the_checkout_drops_it_unfollowed(
+    action: CIAction, repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog
+):
+    """As Windows takes the path, where the folder before ``..`` drops out unfollowed."""
+    import _winapi
+
+    (tmp_path / "other-job" / "rtl").mkdir(parents=True)
+    _winapi.CreateJunction(str(tmp_path / "other-job" / "rtl"), str(repo / "hw"))
+    monkeypatch.chdir(repo)
+
+    with caplog.at_level(logging.INFO, logger="aristotle"):
+        assert action.preflight(action.parser.parse_args(["--manifest", "hw\\..\\aristotle.toml"])) is None
+
+    assert f"Checking 2 properties from {Path('hw', '..', manifest.MANIFEST_NAME)}:" in caplog.messages
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows takes a link target's .. as text")
+async def test_on_windows_a_dot_dot_in_a_manifest_links_target_drops_the_name_before_it_unfollowed(
+    action: CIAction, repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog
+):
+    """Followed, ``sub`` would lead the .. to a decoy in the checkout, while Windows ends outside it."""
+    (repo / "x" / "y").mkdir(parents=True)
+    (repo / "other-job").mkdir()
+    (repo / "other-job" / manifest.MANIFEST_NAME).write_text("# a decoy in the checkout\n")
+    (tmp_path / "other-job").mkdir()
+    (tmp_path / "other-job" / manifest.MANIFEST_NAME).write_text("# the other job's\n")
+    try:
+        (repo / "sub").symlink_to(Path("x", "y"), target_is_directory=True)
+    except OSError:
+        pytest.skip("needs the right to make symbolic links")
+    (repo / manifest.MANIFEST_NAME).unlink()
+    (repo / manifest.MANIFEST_NAME).symlink_to(Path("sub", "..", "..", "other-job", manifest.MANIFEST_NAME))
+    monkeypatch.chdir(repo)
+    assert (repo / manifest.MANIFEST_NAME).read_text() == "# the other job's\n"
+
+    with caplog.at_level(logging.INFO, logger="aristotle"):
+        assert action.preflight(action.parser.parse_args([])) == EXIT_USAGE_ERROR
+
+    link = repo.resolve() / manifest.MANIFEST_NAME
+    assert caplog.messages[-1] == _manifest_link_error(link, Path(os.readlink(link)), "out of it")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows drives")
+@pytest.mark.parametrize(
+    "target",
+    ["sub\\Z:probe", "sub\\..\\Z:probe", ".\\Z:probe", "Z:\\probe\\aristotle.toml"],
+    ids=["in a later name", "after a ..", "after a .", "at the start of a full path"],
+)
+async def test_on_windows_a_drive_in_a_manifest_links_target_is_refused_before_anything_looks_there(
+    action: CIAction, repo: Path, monkeypatch: pytest.MonkeyPatch, no_lookup_of, caplog, target: str
+):
+    """A name with a drive, joined to the folder, would put that drive's current folder in its place, as would the
+    whole target once a .. or a . before it is taken; and that drive's root is above no folder of the checkout."""
+    (repo / "sub").mkdir()
+    (repo / manifest.MANIFEST_NAME).unlink()
+    try:
+        (repo / manifest.MANIFEST_NAME).symlink_to(target)
+    except OSError:
+        pytest.skip("needs the right to make symbolic links")
+    monkeypatch.chdir(repo)
+    no_lookup_of("Z:")
+
+    with caplog.at_level(logging.INFO, logger="aristotle"):
+        assert action.preflight(action.parser.parse_args([])) == EXIT_USAGE_ERROR
+
+    link = repo.resolve() / manifest.MANIFEST_NAME
+    # Windows reads a full target back with its \\?\ prefix, which the message leaves out.
+    assert caplog.messages[-1] == _manifest_link_error(link, local_file_utils.link_target(str(link)), "out of it")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows' device names")
+@pytest.mark.parametrize("target", ["NUL", "sub\\NUL", "COM1", "sub\\LPT1"])
+async def test_on_windows_a_manifest_link_to_a_devices_name_is_refused_before_anything_opens_the_device(
+    action: CIAction, repo: Path, monkeypatch: pytest.MonkeyPatch, no_lookup_of, caplog, target: str
+):
+    """Windows takes such a name in a folder of a drive as the device, which a lookup would open, where following the
+    link takes it as a name in the folder."""
+    device = target.rpartition("\\")[2]
+    if not os.path.abspath(repo / target).startswith("\\\\.\\"):
+        pytest.skip(f"this Windows takes {device} in a folder as a name")
+    (repo / "sub").mkdir()
+    (repo / manifest.MANIFEST_NAME).unlink()
+    try:
+        (repo / manifest.MANIFEST_NAME).symlink_to(target)
+    except OSError:
+        pytest.skip("needs the right to make symbolic links")
+    monkeypatch.chdir(repo)
+    no_lookup_of(device)
+
+    with caplog.at_level(logging.INFO, logger="aristotle"):
+        assert action.preflight(action.parser.parse_args([])) == EXIT_USAGE_ERROR
+
+    link = repo.resolve() / manifest.MANIFEST_NAME
+    assert caplog.messages[-1] == _manifest_link_error(link, local_file_utils.link_target(str(link)), "out of it")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows' \\\\?\\ paths")
+async def test_on_windows_a_shared_manifest_link_named_through_a_path_windows_reads_as_given_is_followed(
+    action: CIAction, repo: Path, monkeypatch: pytest.MonkeyPatch, caplog
+):
+    """Windows takes no name in a \\\\?\\ path as a device, nor in a network path, as the walk is on for a checkout on a
+    share, so the check for one leaves such a path be."""
+    (repo / "hw" / "a").mkdir(parents=True)
+    (repo / "hw" / "common").mkdir()
+    (repo / "hw" / "common" / manifest.MANIFEST_NAME).write_text(MANIFEST)
+    try:
+        (repo / "hw" / "a" / manifest.MANIFEST_NAME).symlink_to("..\\common\\aristotle.toml")
+    except OSError:
+        pytest.skip("needs the right to make symbolic links")
+    monkeypatch.chdir(repo)
+    given = Path("\\\\?\\" + str(repo.resolve() / "hw" / "a" / manifest.MANIFEST_NAME))
+
+    with caplog.at_level(logging.INFO, logger="aristotle"):
+        assert action.preflight(action.parser.parse_args(["--manifest", str(given)])) is None
+
+    assert f"Checking 2 properties from {given}:" in caplog.messages
+
+
+@contextlib.contextmanager
+def _subst_drive(folder: Path) -> Iterator[str]:
+    """A drive that stands for ``folder`` while held, as Windows' subst makes one, on the last letter it takes: a letter
+    that looks free can still be held, as by a network drive that isn't connected."""
+    for letter in "ZYXWVUTSRQPONMLKJIHGFE":
+        if os.path.exists(f"{letter}:\\"):
+            continue
+        try:
+            if subprocess.run(["subst", f"{letter}:", str(folder)], capture_output=True).returncode == 0:
+                break
+        except OSError:
+            pytest.skip("subst can't run here")
+    else:
+        pytest.skip("no drive letter is free for subst")
+    try:
+        yield f"{letter}:"
+    finally:
+        subprocess.run(["subst", f"{letter}:", "/D"], capture_output=True)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows' subst drives")
+async def test_on_windows_a_dot_dot_past_a_subst_drives_root_leaves_the_folder_it_stands_for(
+    action: CIAction, repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog
+):
+    """Windows takes a link's .. from its folder on the volume, so from the root of a drive that stands for the
+    checkout, it leads out of it, to the other job's manifest rather than the decoy beside the link."""
+    (tmp_path / "other-job").mkdir()
+    (tmp_path / "other-job" / manifest.MANIFEST_NAME).write_text("# the other job's\n")
+    (repo / "other-job").mkdir()
+    (repo / "other-job" / manifest.MANIFEST_NAME).write_text("# a decoy in the checkout\n")
+    (repo / manifest.MANIFEST_NAME).unlink()
+    target = "..\\other-job\\aristotle.toml"
+    try:
+        (repo / manifest.MANIFEST_NAME).symlink_to(target)
+    except OSError:
+        pytest.skip("needs the right to make symbolic links")
+
+    with _subst_drive(repo) as drive:
+        monkeypatch.chdir(drive + "\\")
+        try:
+            assert os.path.samefile(drive + "\\", repo)
+            assert Path(manifest.MANIFEST_NAME).read_text() == "# the other job's\n"
+            with caplog.at_level(logging.INFO, logger="aristotle"):
+                code = action.preflight(action.parser.parse_args(["--manifest", manifest.MANIFEST_NAME]))
+        finally:
+            # Off the drive before it goes.
+            monkeypatch.chdir(tmp_path)
+
+    assert code == EXIT_USAGE_ERROR
+    assert caplog.messages[-1] == _manifest_link_error(Path(manifest.MANIFEST_NAME), Path(target), "out of it")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows' subst drives")
+async def test_in_ci_a_workspace_named_through_a_dot_dot_past_a_subst_drives_root_admits_no_other_folder(
+    action: CIAction, repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_lookup_of, caplog
+):
+    """The walk spells the workspace as Windows takes a link's .. from its folder on the volume, past the drive's root,
+    so the folder of that name on the drive, another one, gives no spelling of the checkout to a link that names it."""
+    other = tmp_path / "b" / repo.name
+    other.mkdir(parents=True)
+    (other / manifest.MANIFEST_NAME).write_text("# another folder's\n")
+    try:
+        (tmp_path / "b" / "up").symlink_to("..", target_is_directory=True)
+    except OSError:
+        pytest.skip("needs the right to make symbolic links")
+    monkeypatch.setenv("JENKINS_URL", "http://jenkins.invalid/")
+    monkeypatch.chdir(repo)
+
+    with _subst_drive(tmp_path / "b") as drive:
+        target = f"{drive}\\{repo.name}\\{manifest.MANIFEST_NAME}"
+        (repo / manifest.MANIFEST_NAME).unlink()
+        (repo / manifest.MANIFEST_NAME).symlink_to(target)
+        monkeypatch.setenv("WORKSPACE", f"{drive}\\up\\{repo.name}")
+        assert os.path.samefile(f"{drive}\\up\\{repo.name}", repo)
+        no_lookup_of(f"{drive}\\{repo.name}")
+        with caplog.at_level(logging.INFO, logger="aristotle"):
+            code = action.preflight(action.parser.parse_args(["--directory", "."]))
+
+    assert code == EXIT_USAGE_ERROR
+    assert caplog.messages[-1] == _manifest_link_error(repo.resolve() / manifest.MANIFEST_NAME, target, "out of it")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows' subst drives")
+async def test_on_windows_a_machines_link_rooted_with_no_drive_starts_at_its_volumes_root_past_a_subst_drive(
+    action: CIAction, repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog
+):
+    """As Windows takes it, past the drive's letter and whatever drive is current, so the walk goes on to the link in
+    the checkout and judges it, where it would have found nothing there and left the read to follow that link."""
+    target = tmp_path / "other-job" / manifest.MANIFEST_NAME
+    target.parent.mkdir()
+    target.write_text(MANIFEST)
+    (tmp_path / "b").mkdir()
+    (repo / manifest.MANIFEST_NAME).unlink()
+    try:
+        (repo / manifest.MANIFEST_NAME).symlink_to(target)
+        (tmp_path / "b" / "up").symlink_to(os.path.splitdrive(tmp_path)[1], target_is_directory=True)
+    except OSError:
+        pytest.skip("needs the right to make symbolic links")
+
+    with _subst_drive(tmp_path / "b") as drive:
+        given = Path(f"{drive}\\up\\{repo.name}\\{manifest.MANIFEST_NAME}")
+        monkeypatch.chdir(f"{drive}\\")
+        try:
+            assert given.read_text() == MANIFEST
+            with caplog.at_level(logging.INFO, logger="aristotle"):
+                code = action.preflight(action.parser.parse_args(["--directory", str(repo), "--manifest", str(given)]))
+        finally:
+            # Off the drive before it goes.
+            monkeypatch.chdir(tmp_path)
+
+    assert code == EXIT_USAGE_ERROR
+    assert caplog.messages[-1] == _manifest_link_error(
+        given, target, "out of it", repo.resolve() / manifest.MANIFEST_NAME, own=True
+    )
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows' long paths")
+def test_on_windows_long_paths_are_on_exactly_when_a_path_past_max_path_can_be_looked_up(tmp_path: Path):
+    """The \\\\?\\ prefix lifts MAX_PATH whatever the setting, so a folder made with it shows what a plain lookup does."""
+    from aristotlelib.cli.command.ci import _long_paths_on
+
+    deep = tmp_path / ("x" * 250)
+    os.mkdir("\\\\?\\" + str(deep))
+    try:
+        assert _long_paths_on() is os.path.isdir(deep)
+    finally:
+        # Without the prefix nothing can remove it while long paths are off, pytest's own clean-up included.
+        os.rmdir("\\\\?\\" + str(deep))
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows' MAX_PATH")
+@pytest.mark.parametrize(
+    ("linked", "long_paths", "refused"),
+    [(True, False, True), (True, True, False), (False, False, False)],
+    ids=["after a junction, long paths off", "after a junction, long paths on", "with no link before it"],
+)
+async def test_on_windows_a_name_past_max_path_that_isnt_there_is_refused_only_after_a_link_with_long_paths_off(
+    action: CIAction,
+    repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog,
+    linked: bool,
+    long_paths: bool,
+    refused: bool,
+):
+    """With long paths off, Windows says such a name isn't there, though it follows a link along it; with no link
+    before it, reading the manifest meets the same limit, so a missing one is reported as on main."""
+    import _winapi
+
+    _winapi.CreateJunction(str(repo), str(tmp_path / "mnt"))
+    monkeypatch.setattr("aristotlelib.cli.command.ci._long_paths_on", lambda: long_paths)
+    monkeypatch.chdir(repo)
+    given = Path(tmp_path / "mnt" if linked else repo, "x" * 250, manifest.MANIFEST_NAME)
+
+    with caplog.at_level(logging.ERROR, logger="aristotle"):
+        assert action.preflight(action.parser.parse_args(["--manifest", str(given)])) == EXIT_USAGE_ERROR
+
+    if refused:
+        assert caplog.messages == [
+            f"Cannot look up {repo / ('x' * 250)} on the way to {given}: Windows looks up no path that long while long "
+            "paths are off."
+        ]
+    else:
+        assert caplog.messages == [f"Manifest {given} not found."]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows' MAX_PATH")
+async def test_on_windows_a_name_past_max_path_in_a_path_windows_reads_as_given_is_reported_missing_as_on_main(
+    action: CIAction, repo: Path, monkeypatch: pytest.MonkeyPatch, caplog
+):
+    """The \\\\?\\ prefix lifts MAX_PATH, so a name Windows says isn't there after a link, with long paths off, is
+    missing indeed. A relative link keeps the walk on that spelling, where a junction's target leaves it."""
+    (repo / "common").mkdir()
+    try:
+        (repo / "hw").symlink_to("common", target_is_directory=True)
+    except OSError:
+        pytest.skip("needs the right to make symbolic links")
+    monkeypatch.setattr("aristotlelib.cli.command.ci._long_paths_on", lambda: False)
+    monkeypatch.chdir(repo)
+    given = Path("\\\\?\\" + str(repo.resolve() / "hw" / ("x" * 250) / manifest.MANIFEST_NAME))
+
+    with caplog.at_level(logging.ERROR, logger="aristotle"):
+        assert action.preflight(action.parser.parse_args(["--manifest", str(given)])) == EXIT_USAGE_ERROR
+
+    assert caplog.messages == [f"Manifest {given} not found."]
+
+
 @pytest.mark.parametrize(
     ("filelist", "announced", "not_announced"),
     [
@@ -2568,12 +3509,12 @@ def test_review_options_are_not_in_cis_help():
     assert not any(option in help_text for option in ("--scope", "--path", "--base-ref", "--instructions"))
 
 
-def test_on_timeouts_help_says_project_leaves_the_run_going(monkeypatch: pytest.MonkeyPatch):
+def test_on_timeouts_help_gives_no_default_as_project_leaves_the_run_going(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("COLUMNS", "2000")
 
     help_text = " ".join(_action().parser.format_help().split())
 
-    assert "or the job is cancelled (default: cancel, or leave with --project)." in help_text
+    assert "--on-timeout {cancel,leave} Cancel or leave a run cut short. --fail-on" in help_text
 
 
 def test_an_empty_environment_variable_is_treated_as_unset(monkeypatch: pytest.MonkeyPatch):

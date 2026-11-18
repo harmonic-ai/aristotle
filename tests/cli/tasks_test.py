@@ -240,6 +240,35 @@ async def test_json_prints_the_records_and_keeps_the_pagination_key_on_stderr(ca
     assert caplog.messages == ["\nPagination key for next page: next-page"]
 
 
+async def test_the_table_shows_a_run_that_ended_complete_with_errors_as_the_web_app_does(capsys):
+    parser = argparse.ArgumentParser()
+    action = TasksAction(parser.add_subparsers())
+    action.add_action_arguments()
+    tasks = [
+        AgentTask(
+            project_id="project-123",
+            agent_task_id=f"task-{number}",
+            status=status,
+            created_at=datetime(2026, 9, 1, 12, 0),
+            last_updated_at=datetime(2026, 9, 1, 13, 0),
+            file_name=None,
+            description="Prove it",
+            output_summary=None,
+        )
+        for number, status in enumerate([TaskStatus.COMPLETE_WITH_ERRORS, TaskStatus.COMPLETE, TaskStatus.FAILED])
+    ]
+    mock_project = Mock(spec=Project)
+    mock_project.project_id = "project-123"
+    mock_project.get_tasks = AsyncMock(return_value=(tasks, None))
+
+    with patch("aristotlelib.project.Project.from_id", return_value=mock_project):
+        await action.run_action(action.parser.parse_args(["project-123"]))
+
+    lines = capsys.readouterr().out.splitlines()
+    status_column = lines[0].index("STATUS")
+    assert [line[status_column:].rstrip() for line in lines[2:]] == ["REVIEW SUGGESTED", "COMPLETE", "FAILED"]
+
+
 async def test_json_with_no_tasks_is_an_empty_page(capsys):
     parser = argparse.ArgumentParser()
     action = TasksAction(parser.add_subparsers())

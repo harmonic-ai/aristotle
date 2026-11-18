@@ -9,7 +9,8 @@ there is no `mktemp` and no `timeout -s INT`. Use these instead:
 - Capture the JSON and the exit code like this:
   `aristotle show <project-id> --json | Out-File -Encoding ascii "<out>\run.json"; "exit $LASTEXITCODE"`.
   `Out-File` empties the file even when the command prints nothing, as it does on an error. The JSON is ASCII, so
-  nothing is lost.
+  nothing is lost. Progress and errors stay on the console, apart from the JSON: read them there, and add neither
+  `2>` nor `2>&1`.
 - Wait for a run the way [Long waits](../SKILL.md#long-waits) describes for a shell without `timeout`, with
   `Start-Sleep -Seconds 100` in place of `sleep 100`, and save the archive with
   `aristotle download <project-id> --destination "<out>\result.tar.gz"`.

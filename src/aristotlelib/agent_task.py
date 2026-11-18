@@ -101,6 +101,30 @@ def _prompt_line(text: str) -> None:
     print(printable(text), file=sys.stderr)
 
 
+def _shown_at(level: int) -> bool:
+    """Whether a record logged at ``level`` reaches a handler that isn't a NullHandler, as the logging module passes it
+    up the loggers."""
+    if not logger.isEnabledFor(level):
+        return False
+    current: logging.Logger | None = logger
+    while current is not None:
+        for handler in current.handlers:
+            if not isinstance(handler, logging.NullHandler) and level >= handler.level:
+                return True
+        current = current.parent if current.propagate else None
+    return False
+
+
+def _told(lines: list[str], display: progress_utils.ProgressDisplay | None, level: int = logging.INFO) -> list[str]:
+    """Log ``lines`` at ``level``, or, where no handler shows them, as before a program configures logging, return them
+    as one entry for ``display`` to show."""
+    if display is not None and not _shown_at(level):
+        return ["\n".join(lines)]
+    for line in lines:
+        logger.log(level, line)
+    return []
+
+
 def follow_hint(project_id: str, read_only: bool = False, carry_on: str | None = None) -> str:
     """How to follow a run you stopped waiting for, by ``carry_on`` where given, and, if it is yours, cancel it."""
     hint = carry_on if carry_on is not None else f"Follow it with: aristotle show {project_id}"
@@ -124,7 +148,14 @@ _BAD_ENDINGS = {
 ENDED_BADLY = frozenset(_BAD_ENDINGS)
 """The statuses ending_notice() explains."""
 
-INCOMPLETE_ENDING = "Aristotle made progress but did not fully complete the request. Its summary says what is left."
+INCOMPLETE_ENDING = (
+    "Aristotle finished, but the results might not match what you asked for. Its summary says what to review."
+)
+
+
+def task_status_label(status: TaskStatus) -> str:
+    """``status`` for human-readable output: the web app's label for COMPLETE_WITH_ERRORS, else its name."""
+    return "REVIEW SUGGESTED" if status == TaskStatus.COMPLETE_WITH_ERRORS else status.name
 
 
 _BILLING_STOPS = {
@@ -239,7 +270,7 @@ class AgentTask(AristotleObject):
         )
         elapsed_str = format_elapsed_time(elapsed_seconds, "submitted" if never_started else "started")
 
-        lines = [f"{self.status.name} ({elapsed_str})"]
+        lines = [f"{task_status_label(self.status)} ({elapsed_str})"]
         if heading := (title or self.description or "").strip().split("\n", 1)[0].rstrip():
             lines.append(heading if len(heading) <= HEADING_LENGTH else heading[: HEADING_LENGTH - 1].rstrip() + "…")
         lines.extend([f"Task: {self.agent_task_id}", f"Project: {self.project_id}"])
@@ -341,14 +372,14 @@ class AgentTask(AristotleObject):
                 notices[event.event_id] = f"Aristotle asked: {event.content}"
         return notices
 
-    async def _prompt_for_answer(self, event: Event, interactive: bool = True) -> bool:
-        """Prompt user to answer an agent question with a timeout (the per-event fallback path); False if not prompted."""
-        if interactive:
-            progress_utils.clear_progress_lines()
-        if not interactive or not can_prompt() or self.read_only:
-            # Non-interactive, not at a terminal, or not the owner: log the question and do not read stdin.
-            logger.info(str(event))
-            return False
+    async def _prompt_for_answer(self, event: Event, display: progress_utils.ProgressDisplay | None) -> list[str]:
+        """Prompt user to answer an agent question with a timeout (the per-event fallback path), taking ``display``'s
+        frame off the terminal for the prompt; where it can't prompt, tell the question, and return any entry for
+        ``display``."""
+        if display is None or not can_prompt() or self.read_only:
+            # Non-interactive, not at a terminal, or not the owner: tell the question and do not read stdin.
+            return _told([str(event)], display)
+        display.clear()
         _prompt_line(str(event))
 
         start_time = datetime.now()
@@ -359,7 +390,7 @@ class AgentTask(AristotleObject):
             remaining = timeout_seconds - elapsed
             if remaining <= 0:
                 logger.info("No answer provided in time, continuing...")
-                return True
+                return []
 
             _prompt_line("Type your answer:")
             try:
@@ -369,20 +400,20 @@ class AgentTask(AristotleObject):
                     continue
 
                 await event.answer(answer)
-                return True
+                return []
             except asyncio.TimeoutError:
                 logger.info("No answer provided in time, continuing...")
-                return True
+                return []
             except api_request.AristotleAPIError as e:
                 if e.status_code in (400, 409):
                     # The event route refuses a closed question with 400, and with 409 once its task has ended.
                     logger.info("This question is already closed; the answer was not sent.")
                 else:
                     logger.error(f"Error answering question: {e}")
-                return True
+                return []
             except Exception as e:
                 logger.error(f"Error answering question: {e}")
-                return True
+                return []
 
     async def _refreshed_within(self, seconds: float) -> bool:
         """Refresh the task within ``seconds``; False on any failure, a timeout or a second interrupt."""
@@ -453,10 +484,17 @@ class AgentTask(AristotleObject):
 
         # Rendered events and question-flow outcomes, newest last, capped at num_events.
         recent: list[str] = []
+        # Those kept since the last frame, which the display prints off a terminal, or above its frame at one when the
+        # frame can't show them whole, and that frame's status and counts, new to it only when they change, and the
+        # counts only off a terminal.
+        arrived: list[str] = []
+        shown_status: TaskStatus | None = None
+        shown_counts: list[str] = []
         last_refresh = datetime.min
         started = datetime.now()
         refresh_interval = QUESTION_REFRESH_SECONDS
-        watcher = _QuestionWatcher(self, interactive=interactive)
+        display = progress_utils.ProgressDisplay() if interactive else None
+        watcher = _QuestionWatcher(self, display)
         # While the stream rides out an outage, the line saying so; the refreshes stay quiet meanwhile.
         outage: str | None = None
         # The project's properties as last counted for the display; None while none are listed.
@@ -473,6 +511,8 @@ class AgentTask(AristotleObject):
                 for entry in entries:
                     if not (collapse and recent and recent[-1] == entry):
                         recent.append(entry)
+                        if display is not None:
+                            arrived.append(entry)
                 del recent[:-num_events]
 
         async def count_properties() -> None:
@@ -511,20 +551,28 @@ class AgentTask(AristotleObject):
             recount()
 
         def show_progress() -> None:
-            if not interactive:
+            nonlocal shown_status, shown_counts
+            if display is None:
                 return
             lines = self._status_lines(title)
-            if counts is not None and self.live:
-                # Only while the run goes on: the counts that stand once it ends are the caller's to report.
-                lines.append(counts)
-            lines += recent
-            if outage is not None:
-                # Each frame clears the terminal, the logged line included.
-                lines.append(outage)
+            # Only while the run goes on: the counts that stand once it ends are the caller's to report.
+            counted = [counts] if counts is not None and self.live else []
+            new = [lines[0]] if self.status != shown_status else []
+            new += arrived
+            if not display.redraws:
+                # A frame redrawn at a terminal shows the counts wherever they fit; anywhere else, they print on change.
+                new += [line for line in counted if line not in shown_counts]
+            shown_status, shown_counts = self.status, counted
+            arrived.clear()
+            lines += counted + recent
             if watcher.pending_count and self.live:
                 # Pinned last, so it stays put while the events above it scroll.
                 lines.append(pending_footer(watcher.pending_count, self.project_id, read_only=self.read_only))
-            progress_utils.print_progress_lines(lines)
+            display.draw(lines, new)
+
+        def close_display() -> None:
+            if display is not None:
+                display.close()
 
         def questions_to_hand_back() -> list[Question]:
             return list(watcher.pending) if stop_on_questions and not self.read_only else []
@@ -545,11 +593,11 @@ class AgentTask(AristotleObject):
                 nonlocal outage
                 if outage is not None:
                     outage = None
-                    logger.info("The connection to Aristotle is back.")
+                    remember(_told(["The connection to Aristotle is back."], display))
 
             def on_outage(error: Exception | None) -> None:
-                """Log an outage's start and end. It runs in the stream's read, during a prompt too, so it draws no
-                frame."""
+                """Tell an outage's start and end, logged or kept for the next frame. It runs in the stream's read,
+                during a prompt too, so it draws no frame."""
                 nonlocal outage
                 if error is None:
                     end_outage()
@@ -559,7 +607,7 @@ class AgentTask(AristotleObject):
                     f"The connection to Aristotle failed: {_failure(error)}. Trying again for up to {minutes} minutes "
                     "while the task goes on."
                 )
-                logger.warning(outage)
+                remember(_told([outage], display, logging.WARNING))
 
             def riding_out() -> bool:
                 return outage is not None
@@ -610,6 +658,7 @@ class AgentTask(AristotleObject):
                         next_event.exception()
 
             if not await self._refresh_quietly():
+                close_display()
                 if self.live:
                     logger.error(
                         f"The event stream ended, and the task's status could not be checked.{next_step('follow it')}"
@@ -619,6 +668,7 @@ class AgentTask(AristotleObject):
             end_outage()
             # The last frame, redrawn with the status the task ended on, stays above the outcome.
             show_progress()
+            close_display()
 
             if self.status in ENDED_BADLY:
                 if self.budget_failure_reason is not None and self.output_summary:
@@ -641,19 +691,29 @@ class AgentTask(AristotleObject):
             elif self.live:
                 logger.error(f"The event stream ended before the task finished.{next_step('follow it')}")
 
+        except httpx.LocalProtocolError:
+            close_display()
+            # The stream raises one at once.
+            logger.error(
+                "The request for the task's events couldn't be sent (LocalProtocolError), so the wait stopped. The "
+                f"task goes on.\n{follow_hint(self.project_id, self.read_only, carry_on)}"
+            )
         except httpx.TransportError:
-            # The stream raises one only once its connections have failed for STREAM_OUTAGE_SECONDS.
+            close_display()
+            # The stream raises any other only once its connections have failed for STREAM_OUTAGE_SECONDS.
             minutes = api_request.STREAM_OUTAGE_SECONDS // 60
             logger.error(
                 f"The connection to Aristotle kept failing for {minutes} minutes, so the wait stopped. The task goes "
                 f"on.\n{follow_hint(self.project_id, self.read_only, carry_on)}"
             )
         except api_request.AristotleAPIError as e:
+            close_display()
             # The stream raises a 429 or 5xx only once it has given up on it; any other status is final.
             if e.status_code is None or (e.status_code != 429 and e.status_code < 500):
                 raise
             logger.error(f"The task could not be followed: {str(e).rstrip('.')}.{next_step('try again')}")
         except (KeyboardInterrupt, asyncio.CancelledError):
+            close_display()
             # Ctrl-C arrives as a cancellation on Python 3.11+; either way the run carries on server-side.
             if self.status != TaskStatus.QUEUED:
                 logger.info(
@@ -674,6 +734,7 @@ class AgentTask(AristotleObject):
                 )
             raise
         finally:
+            close_display()
             if counting is not None:
                 # Its count would fill a display that is done.
                 counting.cancel()
@@ -683,10 +744,10 @@ class AgentTask(AristotleObject):
 class _QuestionWatcher:
     """Question state kept across a wait; questions are listed at start, on question events and on refreshes."""
 
-    def __init__(self, task: AgentTask, interactive: bool = True) -> None:
+    def __init__(self, task: AgentTask, display: progress_utils.ProgressDisplay | None) -> None:
         self.task = task
-        # False: log questions instead of prompting, and never clear the terminal.
-        self.interactive = interactive
+        # None: log questions instead of prompting.
+        self.display = display
         # The pending questions while the run is live, as of the last listing.
         self.pending: list[Question] = []
         # Cleared on the first 404/405, after which only the per-event path is used.
@@ -791,9 +852,7 @@ class _QuestionWatcher:
             self._handled_events.add(event.event_id)
             if event.status == EventStatus.SENT:
                 self._sent_events.add(event.event_id)
-                if not await self.task._prompt_for_answer(event, interactive=self.interactive):
-                    # Not prompted: keep the question on the display (interactive only), which clears on every redraw.
-                    entries.append(str(event))
+                entries += await self.task._prompt_for_answer(event, self.display)
             else:
                 entries.append(str(event))
         return entries
@@ -817,16 +876,12 @@ class _QuestionWatcher:
             # An ended run: show what was asked, with no flow and no footer.
             self.pending = []
             return ["\n".join([*asked, "The run has ended, so no answer can reach Aristotle now."])]
-        if not self.interactive or not can_prompt() or self.task.read_only:
-            # Non-interactive, not at a terminal, or not the owner: show the questions and the footer, not a prompt.
-            for line in asked:
-                logger.info(line)
+        if self.display is None or not can_prompt() or self.task.read_only:
+            # Non-interactive, not at a terminal, or not the owner: tell the questions, not a prompt, and the footer.
             self.pending = pending
-            logger.info(pending_footer(self.pending_count, self.task.project_id, read_only=self.task.read_only))
-            # Also in the display (interactive only), which clears the terminal on every redraw.
-            return ["\n".join(asked)]
+            return _told(asked, self.display) + self._footer()
 
-        progress_utils.clear_progress_lines()
+        self.display.clear()
         result = await run_question_flow(
             pending,
             read_line=read_stdin_line,
@@ -836,8 +891,17 @@ class _QuestionWatcher:
         )
         # No answer can reach a run that ended during the flow, so nothing counts as pending.
         self.pending = [] if result.run_ended else result.unanswered
-        # One display entry, so the outcome scrolls off together.
-        return ["\n".join(result.summary)] if result.summary else []
+        # The flow printed its outcome above the display.
+        return self._footer() if self.pending else []
+
+    def _footer(self) -> list[str]:
+        """Tell the pending-questions footer, unless a display redraws a frame that pins it; return any entry for the
+        display."""
+        if self.display is None or not self.display.redraws:
+            return _told(
+                [pending_footer(self.pending_count, self.task.project_id, read_only=self.task.read_only)], self.display
+            )
+        return []
 
 
 class _EventPage(pydantic.BaseModel):

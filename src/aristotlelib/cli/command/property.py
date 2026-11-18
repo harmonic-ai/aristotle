@@ -105,18 +105,17 @@ class PropertyAction(APIAction):
         self.parser.add_argument(
             "project_id",
             type=str,
-            help=f"The project the property belongs to: {PROJECT_REFERENCE_HELP}",
+            help=f"The project: {PROJECT_REFERENCE_HELP}",
         )
         self.parser.add_argument(
             "name",
             type=str,
-            help="The property's name, or its declaration id. A name `aristotle properties` shortened with ... can "
-            "be given as shown, and case and any leading namespace can be left out when that is unambiguous.",
+            help="The property's name, or its declaration id",
         )
         self.parser.add_argument(
             "--kind",
             choices=list(KINDS),
-            help="Look only at properties, or only at definitions. Needed when one of each shares the name.",
+            help="Look only at properties, or only at definitions.",
         )
         self.parser.add_argument(
             "--json",

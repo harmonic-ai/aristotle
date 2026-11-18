@@ -962,6 +962,29 @@ def is_junction(path: Path) -> bool:
         return False
 
 
+def is_link(file_stat: os.stat_result) -> bool:
+    """Whether ``file_stat``, from os.lstat(), is a symbolic link's or a Windows directory junction's."""
+    if stat.S_ISLNK(file_stat.st_mode):
+        return True
+    if sys.platform != "win32":
+        return False
+    return file_stat.st_reparse_tag == stat.IO_REPARSE_TAG_MOUNT_POINT
+
+
+MAX_LINKS = 40
+"""The most links a walk of a path follows, as Linux's MAXSYMLINKS."""
+
+
+def link_target(link: str) -> Path:
+    """Where the link at ``link`` points, without the \\\\?\\ prefix Windows gives a target on a drive or a share."""
+    target = os.readlink(link)
+    if os.name == "nt" and target.startswith("\\\\?\\UNC\\"):
+        return Path("\\\\" + target[8:])
+    if os.name == "nt" and target.startswith("\\\\?\\") and target[5:7] == ":\\":
+        return Path(target[4:])
+    return Path(target)
+
+
 def upload_too_large(size: int) -> str | None:
     """The sentence saying that an upload archive of ``size`` bytes is over MAX_FILE_SIZE_BYTES; None if it isn't."""
     if size <= MAX_FILE_SIZE_BYTES:

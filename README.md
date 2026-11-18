@@ -1,8 +1,8 @@
 # Aristotle
 
 Aristotle formally verifies your code. Point it at a project, state the property that must hold, and it returns a proof
-or a counterexample. It verifies Verilog and C. Send your code as it is: Aristotle writes the Lean itself. It doesn't
-verify pure mathematics or Lean: a project with only Lean files runs and verifies nothing.
+or a counterexample. It verifies Verilog, C, and Rust. Send your code as it is: Aristotle writes the Lean itself. It
+doesn't verify pure mathematics or Lean: a project with only Lean files runs and verifies nothing.
 
 This package is the `aristotle` command-line tool and the Python library for the Aristotle API. To sign up and read
 the full documentation, go to [aristotle.harmonic.fun](https://aristotle.harmonic.fun).
@@ -68,6 +68,9 @@ In CI and scripts, set `ARISTOTLE_API_KEY` instead. It takes precedence over a s
 give a key, see [Logging in](https://github.com/harmonic-ai/aristotle/blob/main/docs/cli-reference.md#logging-in) in
 the CLI reference.
 
+After logging in, `aristotle balance` checks your organization's credits without starting a run. Admins see the
+balance in Credits; members see credit status. See [Checking your balance](https://github.com/harmonic-ai/aristotle/blob/main/docs/cli-reference.md#checking-your-balance).
+
 ## Verify a project
 
 Pass the folder that holds the code with `--project-dir`, as it is, with its headers and build files. Aristotle writes
@@ -105,6 +108,8 @@ Wherever a command takes a project, you can give its id, the first 8 or more cha
 | `aristotle cancel <project>` | Cancels the run in progress. |
 | `aristotle rename <project> "<name>"` | Renames a project. |
 | `aristotle delete <project>` | Deletes a project for good, after asking. Its runs and results go with it, and its shared link stops working. |
+| `aristotle archive <project>` | Archives a project: `aristotle list` leaves it out, and `aristotle list --archived` lists it. Until it's unarchived, commands other than `unarchive` take it only by its full id. |
+| `aristotle unarchive <project>` | Brings an archived project back. |
 
 During a run, Aristotle may ask how you want your code verified, such as which reset polarity or input ranges to
 assume, and it waits up to 15 minutes for each answer. With `--wait`, the CLI shows each question as it comes, with
@@ -258,7 +263,7 @@ shape and field, each exit code in full, and a script that answers questions.
 
 `aristotle ci` checks the properties listed in `aristotle.toml`, and reports each one the way your CI already reports
 tests: as a JUnit report, and on GitHub as annotations and a job summary. It detects GitHub Actions, GitLab CI,
-Jenkins, Buildkite, CircleCI, and Azure Pipelines on its own. It verifies Verilog and C sources.
+Jenkins, Buildkite, CircleCI, and Azure Pipelines on its own. It verifies Verilog, C, and Rust sources.
 
 Each property has an id, and is either stated in plain language or names an assertion or a C function in your code:
 
@@ -352,8 +357,10 @@ request's `User-Agent` header carries.
 
 ## Help
 
-`aristotle --help` lists the commands, and each command has its own `--help`. For guides and the full
-documentation, go to [aristotle.harmonic.fun](https://aristotle.harmonic.fun).
+`aristotle --help` lists the commands, and each command's `--help` gives a line for each option. The
+[CLI reference](https://github.com/harmonic-ai/aristotle/blob/main/docs/cli-reference.md) and the
+[CI guide](https://github.com/harmonic-ai/aristotle/blob/main/docs/aristotle-in-ci.md) have the detail. For guides and
+the full documentation, go to [aristotle.harmonic.fun](https://aristotle.harmonic.fun).
 
 ## Glossary
 

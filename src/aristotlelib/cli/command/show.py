@@ -6,9 +6,17 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from aristotlelib import progress_utils
-from aristotlelib.agent_task import ENDED_BADLY, TERMINAL_STATUSES, AgentTask, TaskStatus, ending_notice
+from aristotlelib.agent_task import (
+    ENDED_BADLY,
+    INCOMPLETE_ENDING,
+    TERMINAL_STATUSES,
+    AgentTask,
+    TaskStatus,
+    ending_notice,
+)
 from aristotlelib.api_request import AristotleAPIError
 from aristotlelib.cli.api_action import (
+    NON_INTERACTIVE_HELP,
     PROJECT_REFERENCE_HELP,
     APIAction,
     carry_on_hint,
@@ -19,6 +27,7 @@ from aristotlelib.cli.api_action import (
     interrupted_save_hint,
     judge_properties,
     log_download_hint,
+    log_next_steps,
     log_unjudged,
     print_json,
     print_questions_pending,
@@ -142,7 +151,7 @@ class ShowAction(APIAction):
         self.parser.add_argument(
             "project_id",
             type=str,
-            help=f"The project to show: {PROJECT_REFERENCE_HELP}",
+            help=f"The project: {PROJECT_REFERENCE_HELP}",
         )
         self.parser.add_argument(
             "--task",
@@ -153,7 +162,7 @@ class ShowAction(APIAction):
         self.parser.add_argument(
             "--limit",
             type=int,
-            help="Number of events to show (default: 3 while running, 0 while idle)",
+            help="Events to show (default: 3 while running, else 0).",
         )
         self.parser.add_argument(
             "--pagination-key",
@@ -163,38 +172,23 @@ class ShowAction(APIAction):
         self.parser.add_argument(
             "--json",
             action="store_true",
-            help=(
-                "Print the task, its recent events and the project's properties as one JSON object. "
-                "Never waits, even for a running task, unless --wait is given."
-            ),
+            help="Print the task, its events and properties as JSON.",
         )
         self.parser.add_argument(
             "--non-interactive",
             action="store_true",
-            help=(
-                "For scripts and agents: --wait and --json, but stop as soon as Aristotle asks something, printing the "
-                "questions as JSON and exiting with code 10. Otherwise print the task as --json does once it has "
-                "finished, and exit on how it ended, as `submit --wait` does."
-            ),
+            help=NON_INTERACTIVE_HELP,
         )
         self.parser.add_argument(
             "--wait",
             action="store_true",
-            help=(
-                "Wait for a running task to finish as `submit --wait` does, through any questions Aristotle asks, and "
-                "exit on how it ended. With --json, print the task once it has finished, with no progress display "
-                "and no prompts. A `submit --wait` or `continue --wait` that broke off names this to carry on."
-            ),
+            help="Wait for a running task to finish.",
         )
         self.parser.add_argument(
             "--destination",
             # Expanded here, as a shell would: --destination=~/out reaches argparse with the ~ unexpanded.
             type=os.path.expanduser,
-            help=(
-                "With --wait or --non-interactive: where to save the result archive once the task has finished, as "
-                "`submit --wait` does, checked before anything is sent. Without it, the command that downloads the "
-                "archive is printed instead."
-            ),
+            help="Where --wait saves the result archive.",
         )
 
     def preflight(self, args: argparse.Namespace) -> int | None:
@@ -355,7 +349,8 @@ class ShowAction(APIAction):
                 resume=resume_commands(task, args.destination, non_interactive=False, json=False),
             )
             try:
-                log_property_counts(*await fetch_properties_and_tasks(args.project_id, task))
+                properties, judged_by = await fetch_properties_and_tasks(args.project_id, task)
+                log_property_counts(properties, judged_by)
             except (KeyboardInterrupt, asyncio.CancelledError):
                 # The finished task's files are due at --destination: say they weren't saved.
                 if args.destination is not None and not task.live:
@@ -365,10 +360,13 @@ class ShowAction(APIAction):
             if task.live:
                 return EXIT_INFRASTRUCTURE_ERROR
             if args.wait:
-                return await self._wait_result(task, args.destination)
-            await log_download_hint(task.project_id)
-            # Followed to its end, it exits as --wait does.
-            return task_exit_code(task.status)
+                code = await self._wait_result(task, args.destination)
+            else:
+                await log_download_hint(task.project_id)
+                # Followed to its end, it exits as --wait does.
+                code = task_exit_code(task.status)
+            log_next_steps(task, bool(properties))
+            return code
         properties = await fetch_properties(args.project_id)
         # A task asked for by id may predate the latest: the properties stand as the latest left them, and a follow-up
         # continues it. Fetched once, and only when one of them needs it.
@@ -411,7 +409,14 @@ class ShowAction(APIAction):
                 task.status, task.project_id, task.read_only or not_latest, resume, task.budget_failure_reason
             )
             (logging.error if task.status == TaskStatus.FAILED else logging.info)(notice)
-        return await self._wait_result(task, args.destination) if args.wait else None
+        elif args.wait and task.status == TaskStatus.COMPLETE_WITH_ERRORS:
+            # As a wait that follows the run to its end says, before the exit code it shares.
+            logging.info(INCOMPLETE_ENDING)
+        if not args.wait:
+            return None
+        code = await self._wait_result(task, args.destination)
+        log_next_steps(task, bool(properties))
+        return code
 
     async def _wait_result(self, task: AgentTask, destination: str | None) -> int:
         """After --wait without --json, as after `submit --wait`: the files saved, or how to get them, and the exit code

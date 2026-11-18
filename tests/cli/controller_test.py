@@ -5,6 +5,7 @@ import contextlib
 import io
 import logging
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -13,11 +14,13 @@ from unittest.mock import AsyncMock, Mock, patch
 import httpx
 import pytest
 
-from aristotlelib import api_request
+from aristotlelib import api_request, progress_utils
 from aristotlelib.cli import controller
 from aristotlelib.cli.api_action import APIAction
 from aristotlelib.cli.ci_setup import SetupAction
 from aristotlelib.cli.command import ci as ci_command
+from aristotlelib.cli.command.archive import ArchiveAction
+from aristotlelib.cli.command.balance import BalanceAction
 from aristotlelib.cli.command.cancel import CancelAction
 from aristotlelib.cli.command.ci import CIAction
 from aristotlelib.cli.command.continue_ import ContinueAction
@@ -34,6 +37,7 @@ from aristotlelib.cli.command.review import ReviewAction
 from aristotlelib.cli.command.show import ShowAction
 from aristotlelib.cli.command.submit import SubmitAction
 from aristotlelib.cli.command.tasks import TasksAction
+from aristotlelib.cli.command.unarchive import UnarchiveAction
 from aristotlelib.cli.controller import (
     ASK_REPLACED_MESSAGE,
     FORMALIZE_REMOVED_MESSAGE,
@@ -43,7 +47,9 @@ from aristotlelib.cli.controller import (
     main,
 )
 from aristotlelib.cli.login_flow import LoginError
-from tests.conftest import user_agent_of
+from tests.conftest import Terminal, user_agent_of
+
+REPO = Path(__file__).resolve().parents[2]
 
 
 def test_action_classes_returns_all_actions_in_priority_order():
@@ -56,6 +62,7 @@ def test_action_classes_returns_all_actions_in_priority_order():
         ContinueAction,  # 20
         DownloadAction,  # 40
         ListAction,  # 50
+        BalanceAction,  # 52
         ShowAction,  # 60
         PropertiesAction,  # 62
         PropertyAction,  # 64
@@ -64,6 +71,8 @@ def test_action_classes_returns_all_actions_in_priority_order():
         CancelAction,  # 80
         RenameAction,  # 85
         DeleteAction,  # 86
+        ArchiveAction,  # 87
+        UnarchiveAction,  # 88
         LogoutAction,  # 90
     ]
 
@@ -459,6 +468,7 @@ def test_an_underscore_spelling_is_the_option(argv, dest, value, monkeypatch):
         (["review", "--instructions", "--base_ref=main is wrong"], "instructions", "--base_ref=main is wrong"),
         (["submit", "--name", "--project_dir=x y", "Prove it"], "name", "--project_dir=x y"),
         (["list", "--limit", "-5"], "limit", -5),
+        (["--api-key=-k", "list"], "api_key", "-k"),
         (
             ["continue", "abc", "Go on", "--files", "a.lean", "--api_key=a b"],
             "files",
@@ -522,6 +532,7 @@ def test_continue_takes_its_prompt_after_an_option_on_every_python(argv, prompt,
         (["continue", "abc", "--jsn"], "continue", "unknown option --jsn (did you mean --json?)"),
         (["list", "--stauts", "IDLE"], "list", "unknown option --stauts (did you mean --status?)"),
         (["list", "--bogus"], "list", "unknown option --bogus"),
+        (["list", "--api-key", "k", "--bogus"], "list", "unknown option --bogus"),
         (["list", "--projectdir", "a", "--wiat"], "list", "unknown options --projectdir, --wiat"),
         (["review", "--scpoe", "all"], "review", "unknown option --scpoe (did you mean --scope?)"),
         (["ci", "--manifst", "ci.toml"], "ci", "unknown option --manifst (did you mean --manifest?)"),
@@ -580,6 +591,35 @@ def test_the_error_names_only_the_option(argv, monkeypatch, capsys):
     assert not any(text in err for text in ("PROMPT TEXT", "NAME TEXT", "SECRET-KEY", "./x", "a.lean"))
 
 
+MISSING_KEY = "error: argument --api-key: expected one argument"
+
+
+@pytest.mark.parametrize(
+    ("argv", "error"),
+    [
+        (["--api-key", "-SECRET-KEY", "list"], f"aristotle: {MISSING_KEY}"),
+        (["--api_key", "-SECRET-KEY", "list"], f"aristotle: {MISSING_KEY}"),
+        (["--api", "-SECRET-KEY", "list"], f"aristotle: {MISSING_KEY}"),
+        (["list", "--api-key", "-SECRET-KEY"], f"aristotle list: {MISSING_KEY}"),
+        (["login", "--api-key", "--SECRET-KEY"], f"aristotle login: {MISSING_KEY}"),
+        (["logout", "--api-key", "-SECRET-KEY"], "aristotle logout: error: unknown option --api-key"),
+        (["logout", "--api_key", "-SECRET-KEY"], "aristotle logout: error: unknown option --api_key"),
+        (["logout", "--api", "--SECRET-KEY"], "aristotle logout: error: unknown option --api"),
+    ],
+)
+@pytest.mark.parametrize("on_github", [False, True], ids=["terminal", "GitHub"])
+def test_an_api_key_that_looks_like_an_option_is_refused_without_being_named(
+    argv, error, on_github, monkeypatch, capsys
+):
+    if on_github:
+        monkeypatch.setenv("GITHUB_ACTIONS", "true")
+
+    err = _usage_error(argv, monkeypatch, capsys)
+
+    assert err.splitlines()[-1] == error
+    assert "SECRET" not in err
+
+
 @pytest.mark.skipif(sys.version_info >= (3, 14), reason="argparse 3.14 reads -5x as a negative number")
 def test_a_dash_and_digit_that_is_not_a_number_is_an_unknown_option(monkeypatch, capsys):
     err = _usage_error(["submit", "-5x", "./x", "PROMPT TEXT"], monkeypatch, capsys)
@@ -634,6 +674,73 @@ def test_help_is_what_argparse_prints(command, monkeypatch, capsys):
         main()
 
     assert printed == capsys.readouterr().out
+
+
+def _command_parsers() -> dict[str, argparse.ArgumentParser]:
+    """Each command's parser, by the words that name it, `ci setup` included."""
+    subparsers = argparse.ArgumentParser(prog="aristotle").add_subparsers()
+    parsers = {}
+    for cls in action_classes():
+        action = cls(subparsers)
+        action.add_arguments()
+        parsers[action.command_name] = action.parser
+    setup = SetupAction(argparse.ArgumentParser(prog="aristotle ci").add_subparsers())
+    setup.add_arguments()
+    parsers["ci setup"] = setup.parser
+    return parsers
+
+
+def _on_one_line(text: str, lines: list[str]) -> bool:
+    return any(line.endswith(f"  {text}") for line in lines)
+
+
+def test_each_option_has_one_line_of_help_at_80_columns(monkeypatch):
+    monkeypatch.setenv("COLUMNS", "80")
+    wrapped = []
+
+    for command, parser in _command_parsers().items():
+        lines = parser.format_help().splitlines()
+        helps = [action.help for action in parser._actions if action.help not in (None, argparse.SUPPRESS)]
+        wrapped += [f"{command}: {text}" for text in helps if not _on_one_line(text, lines)]
+
+    assert wrapped == []
+
+
+def test_each_commands_help_ends_with_a_link_to_the_doc_that_has_its_detail():
+    epilogs = {command: parser.epilog for command, parser in _command_parsers().items()}
+    public_docs = "https://github.com/harmonic-ai/aristotle/blob/main/docs"
+    in_ci_guide = ("ci", "review", "ci setup")
+
+    assert epilogs == {
+        command: f"See {public_docs}/{'aristotle-in-ci' if command in in_ci_guide else 'cli-reference'}.md"
+        for command in epilogs
+    }
+    assert (REPO / "docs" / "aristotle-in-ci.md").is_file()
+    assert (REPO / "docs" / "cli-reference.md").is_file()
+
+
+@pytest.mark.parametrize("command", ["", "show"])
+def test_help_in_a_narrow_terminal_splits_no_word_at_a_hyphen(command, monkeypatch, capsys):
+    monkeypatch.setenv("COLUMNS", "60")
+    monkeypatch.setattr("sys.argv", ["aristotle", *command.split(), "--help"])
+
+    with pytest.raises(SystemExit):
+        main()
+    lines = capsys.readouterr().out.splitlines()
+
+    assert [line for line in lines if re.search(r"\w-$", line)] == []
+
+
+def test_the_docs_link_stays_whole_in_a_narrow_terminal(monkeypatch, capsys):
+    monkeypatch.setenv("COLUMNS", "60")
+    monkeypatch.setattr("sys.argv", ["aristotle", "logout", "--help"])
+
+    with pytest.raises(SystemExit):
+        main()
+
+    assert capsys.readouterr().out.endswith(
+        "\nhttps://github.com/harmonic-ai/aristotle/blob/main/docs/cli-reference.md\n"
+    )
 
 
 @pytest.mark.parametrize(
@@ -717,6 +824,28 @@ def test_a_note_follows_what_was_printed_before_it_where_stdout_and_stderr_share
     )
 
     assert run.stdout == "table\nPagination key for next page: next-page\n"
+
+
+def test_a_message_logged_while_a_progress_frame_is_on_the_terminal_prints_above_it(monkeypatch):
+    monkeypatch.setenv("COLUMNS", "80")
+    monkeypatch.setenv("LINES", "24")
+    monkeypatch.setattr(progress_utils, "_shown", None)
+    terminal = Terminal()
+    monkeypatch.setattr(sys, "stdout", terminal)
+    handler = _AfterStdoutHandler(terminal)
+    display = progress_utils.ProgressDisplay()
+    display.draw(["IN_PROGRESS (started 1s ago)", "Task: t"], [])
+
+    handler.emit(logging.LogRecord("aristotle", logging.WARNING, __file__, 1, "Retrying in 1.2 s", None, None))
+    display.close()
+    handler.emit(logging.LogRecord("aristotle", logging.INFO, __file__, 1, "Task complete!", None, None))
+
+    assert terminal.getvalue() == (
+        "IN_PROGRESS (started 1s ago)\nTask: t\n"
+        "\r\033[2K\033[A\033[2K\033[A\033[2KRetrying in 1.2 s\n"
+        "IN_PROGRESS (started 1s ago)\nTask: t\n"
+        "Task complete!\n"
+    )
 
 
 def test_a_message_is_logged_even_when_stdout_cannot_be_flushed(monkeypatch):
@@ -880,8 +1009,7 @@ def test_the_top_level_help_says_login_stores_the_api_key(monkeypatch, capsys):
         main()
 
     help_text = " ".join(capsys.readouterr().out.split())
-    assert "--api-key API_KEY Aristotle API key for this command only" in help_text
-    assert "With `login`, the key to check and store." in help_text
+    assert "--api-key API_KEY Aristotle API key for this command; `login` stores it." in help_text
 
 
 def test_logout_takes_no_api_key(monkeypatch, capsys):

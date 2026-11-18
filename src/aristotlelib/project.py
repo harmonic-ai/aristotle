@@ -744,7 +744,7 @@ _OTHER_SOURCES = (".c", ".rs")
 """Suffixes of a C or Rust file."""
 
 LEAN_FILES_WARNING = (
-    "WARNING: The folder holds .lean files. Aristotle verifies Verilog and C code, "
+    "WARNING: The folder holds .lean files. Aristotle verifies Verilog, C, and Rust code, "
     "and writes the Lean itself: it doesn't verify Lean you send, and a project with only Lean files ends without "
     "verifying anything."
 )
@@ -887,16 +887,17 @@ class AmbiguousProjectError(ValueError):
         return type(self), (self.reference, self.matches)
 
 
-def _no_match_message(reference: str, by_prefix: bool, short_hex: bool, searched_all: bool) -> str:
+def _no_match_message(reference: str, by_prefix: bool, short_hex: bool, searched_all: bool, archived: bool) -> str:
     """Why resolve_id found nothing: the kind of lookup made, the window searched, and a prefix that is too short."""
+    kind = "archived project" if archived else "project"
     if by_prefix:
-        message = f"No project has the id prefix or name '{reference}'"
+        message = f"No {kind} has the id prefix or name '{reference}'"
     else:
-        message = f"No project is named '{reference}'"
+        message = f"No {kind} is named '{reference}'"
     if searched_all:
         message += "."
     else:
-        message += f" among your {PROJECT_LOOKUP_LIMIT:,} most recent projects. Use the full id of an older one."
+        message += f" among your {PROJECT_LOOKUP_LIMIT:,} most recent {kind}s. Use the full id of an older one."
     if short_hex:
         message += f" An id prefix needs at least {PROJECT_ID_PREFIX_MIN_LENGTH} characters."
     return message
@@ -941,6 +942,9 @@ class Project(AristotleObject):
     """The status of the project's latest run, as a task's is named; null before its first run."""
     has_input: bool
     has_files: bool
+    archived_at: UTCDatetime | None = None
+    """When the project was archived, which leaves it out of list_projects and resolve_id unless they ask for archived
+    projects; None for one that isn't, and from a server that predates archiving."""
 
     @pydantic.field_validator("latest_run_status", mode="before")
     @classmethod
@@ -1080,7 +1084,7 @@ class Project(AristotleObject):
 
         Args:
             prompt: Tells Aristotle what to do.
-            project_dir: Path to the directory with the code to verify, e.g. a Verilog or C project.
+            project_dir: Path to the directory with the code to verify, e.g. a Verilog, C, or Rust project.
             agent_questions_setting: Whether the agent can ask questions. By default it can, and waits up to 15
                 minutes for each answer; DISABLED turns questions off.
             name: The project's name, as for create().
@@ -1137,6 +1141,7 @@ class Project(AristotleObject):
         limit: int = 30,
         status: ProjectStatus | list[ProjectStatus] | None = None,
         latest_run_status: list[TaskStatus] | None = None,
+        archived: bool = False,
     ) -> tuple[list["Project"], str | None]:
         """List projects, ordered by creation date (most recent first).
 
@@ -1146,6 +1151,7 @@ class Project(AristotleObject):
             status: Optional project status filter. Can be a single ProjectStatus,
                    a list of ProjectStatus values, or None for all projects.
             latest_run_status: Optional filter on the status of each project's newest task.
+            archived: List only archived projects, which are otherwise left out.
 
         Returns:
             Tuple of list of projects and the new pagination key.
@@ -1161,6 +1167,8 @@ class Project(AristotleObject):
                 params["status"] = status.value
         if latest_run_status is not None:
             params["latest_run_status"] = [s.value for s in latest_run_status]
+        if archived:
+            params["archived"] = True
 
         async with api_request.AristotleRequestClient() as client:
             return await cls._list_page(client, params)
@@ -1178,23 +1186,24 @@ class Project(AristotleObject):
         return await client.get(f"/{cls.endpoint_prefix}", params=params, read=read)
 
     @classmethod
-    async def resolve_id(cls, reference: str) -> str:
+    async def resolve_id(cls, reference: str, *, archived: bool = False) -> str:
         """Return the id of the project that a UUID, a unique id prefix or a name refers to.
 
         A UUID, in any case and with or without dashes, is returned in canonical form without a request.
-        Anything else is looked up among the caller's PROJECT_LOOKUP_LIMIT most recent projects: an id prefix
-        of at least PROJECT_ID_PREFIX_MIN_LENGTH hex digits (case and dashes ignored) or an exact name, and
-        failing both, a name in another case. Surrounding whitespace is ignored.
+        Anything else is looked up among the caller's PROJECT_LOOKUP_LIMIT most recent projects, archived ones left
+        out, or with ``archived`` among the most recent archived ones alone: an id prefix of at least
+        PROJECT_ID_PREFIX_MIN_LENGTH hex digits (case and dashes ignored) or an exact name, and failing both, a name in
+        another case. Surrounding whitespace is ignored.
 
         Raises:
             AristotleNotFoundError: If no project matches.
             AmbiguousProjectError: If more than one project matches.
         """
-        project_id, _ = await cls._resolve(reference)
+        project_id, _ = await cls._resolve(reference, archived=archived)
         return project_id
 
     @classmethod
-    async def _resolve(cls, reference: str) -> tuple[str, "Project | None"]:
+    async def _resolve(cls, reference: str, *, archived: bool = False) -> tuple[str, "Project | None"]:
         """resolve_id's id, with the project as the lookup listed it; None for a UUID, which takes no request."""
         reference = reference.strip()
         try:
@@ -1213,8 +1222,10 @@ class Project(AristotleObject):
         other_case: list[Project] = []
         searched_all = False
         pagination_key = None
+        filters = {"archived": True} if archived else {}
+        kind = "archived projects" if archived else "projects"
         note = (
-            f"Searching your {PROJECT_LOOKUP_LIMIT:,} most recent projects for '{reference}'. "
+            f"Searching your {PROJECT_LOOKUP_LIMIT:,} most recent {kind} for '{reference}'. "
             "A full project id needs no search."
         )
         at_terminal = lookup_at_terminal.get()
@@ -1230,7 +1241,7 @@ class Project(AristotleObject):
                 if client.rate_limit_refusals:
                     await asyncio.sleep(max(0.0, started + _LOOKUP_PAGE_INTERVAL - time.monotonic()))
                 started, refusals = time.monotonic(), client.rate_limit_refusals
-                params = {"pagination_key": pagination_key, "limit": _LOOKUP_PAGE_SIZE}
+                params = {**filters, "pagination_key": pagination_key, "limit": _LOOKUP_PAGE_SIZE}
                 projects, pagination_key = await cls._list_page(client, params)
                 if client.rate_limit_refusals > refusals:
                     started = time.monotonic()
@@ -1253,7 +1264,7 @@ class Project(AristotleObject):
             raise AmbiguousProjectError(reference, matches)
         short_hex = is_hex and 0 < len(digits) < PROJECT_ID_PREFIX_MIN_LENGTH
         raise api_request.AristotleNotFoundError(
-            "project", reference, message=_no_match_message(reference, by_prefix, short_hex, searched_all)
+            "project", reference, message=_no_match_message(reference, by_prefix, short_hex, searched_all, archived)
         )
 
     @classmethod
@@ -1284,6 +1295,58 @@ class Project(AristotleObject):
     async def rename(self, name: str) -> None:
         """Rename this project and update it from the server's reply; see rename_by_id."""
         self._adopt(await self.rename_by_id(self.project_id, name))
+
+    @classmethod
+    async def archive_by_id(cls, project_id: str) -> "Project":
+        """Archive one of your idle projects, or, as an admin of its organization, a member's. list_projects and
+        resolve_id then leave it out unless they ask for archived projects, and its shared link keeps working.
+        Unarchiving it, or sending it a prompt, brings it back.
+
+        Args:
+            project_id: The project's UUID.
+
+        Returns:
+            The archived Project.
+
+        Raises:
+            ValueError: If the id is not a UUID.
+            AristotleAPIError: With status 404 if you can't archive a project with this id, or 409 while one of its runs
+                is still going.
+        """
+        project_id = validate_project_id(project_id)
+        async with api_request.AristotleRequestClient() as client:
+            return await client.post(
+                f"/{cls.endpoint_prefix}/{project_id}/archive", idempotent=True, read=api_request.json_as(cls)
+            )
+
+    async def archive(self) -> None:
+        """Archive this project and update it from the server's reply; see archive_by_id."""
+        self._adopt(await self.archive_by_id(self.project_id))
+
+    @classmethod
+    async def unarchive_by_id(cls, project_id: str) -> "Project":
+        """Unarchive one of your projects, or, as an admin of its organization, a member's, which brings it back to
+        list_projects and resolve_id. A project that isn't archived stays as it is.
+
+        Args:
+            project_id: The project's UUID.
+
+        Returns:
+            The unarchived Project.
+
+        Raises:
+            ValueError: If the id is not a UUID.
+            AristotleAPIError: With status 404 if you can't unarchive a project with this id.
+        """
+        project_id = validate_project_id(project_id)
+        async with api_request.AristotleRequestClient() as client:
+            return await client.post(
+                f"/{cls.endpoint_prefix}/{project_id}/unarchive", idempotent=True, read=api_request.json_as(cls)
+            )
+
+    async def unarchive(self) -> None:
+        """Unarchive this project and update it from the server's reply; see unarchive_by_id."""
+        self._adopt(await self.unarchive_by_id(self.project_id))
 
     @classmethod
     async def delete_by_id(cls, project_id: str) -> None:

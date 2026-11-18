@@ -2,7 +2,7 @@
 
 ## Formal verification as a merge gate
 
-Aristotle proves the properties your team lists in `aristotle.toml` about your Verilog and C on
+Aristotle proves the properties your team lists in `aristotle.toml` about your Verilog, C, and Rust on
 every pull request that could affect them, reported the same way your unit tests are.
 
 No new dashboard to check. No specialist to schedule. If a change breaks a property your
@@ -57,7 +57,11 @@ see [`aristotle review`](#aristotle-review).
 `working-directory` (`--directory`) names; run outside CI, it reads the nearest one from the current
 directory up to the repository's top level, and with `--manifest` and no `--directory` it checks the
 repository from its top level. Commit it with the code it describes. To read another file, set the Action's `manifest`
-input, `--manifest` or `ARISTOTLE_MANIFEST`.
+input, `--manifest` or `ARISTOTLE_MANIFEST`. A symbolic link in the checkout, or a junction on Windows, at
+`aristotle.toml` or the file `--manifest` names, or on the way to either, is followed only to a file in the checkout,
+as with one manifest that subprojects share (`hw/a/aristotle.toml` → `../common/aristotle.toml`). One that leads out
+of the checkout, or nowhere, stops the step with exit `2`, naming the link: to read a manifest a build step links to
+outside the checkout, pass `--manifest` the file's own path.
 
 ```toml
 [check]
@@ -154,9 +158,10 @@ and commit it:
 `aristotle ci setup` runs only at a terminal, and never replaces an existing manifest unless you
 pass `--force`. Run from a subfolder, it writes the manifest `aristotle ci` would read there: the nearest
 `aristotle.toml` up to the repository's top level, which it won't replace without `--force`, else a
-new one in that folder; `--directory .` sets up the folder itself. A CI job reads a manifest below
-the top level only with `--directory`, so the command then prints the `aristotle ci` line the job
-needs. Its project is named like a run's, as `rtl: ci setup @ main 1a2b3c4`, unless `--name` says
+new one in that folder; `--directory .` sets up the folder itself, as does `--manifest` without
+`--directory`. A CI job reads a manifest below the top level only with `--directory`, so the command
+then prints the `aristotle ci` line the job needs. Its project is named like a run's, as
+`rtl: ci setup @ main 1a2b3c4`, unless `--name` says
 otherwise. The manifest's time budget, `check.max_wall_time_seconds`, is half as long again as
 the run it is written from took (for `--from`, the run that last updated the properties it
 copies, the longest if several did, which the comment names), and at least an hour; give the CI
@@ -181,7 +186,7 @@ API key.
 
 The GitLab and Jenkins recipes below pull the image `ghcr.io/harmonic-ai/aristotle:3`, which
 each release publishes. The GitHub Action runs the same image at its own release's version, so
-`harmonic-ai/aristotle@v3` runs the newest 3.x release and `@v3.3.0` stays on 3.3.0. The image is
+`harmonic-ai/aristotle@v3` runs the newest 3.x release and `@v3.4.0` stays on 3.4.0. The image is
 built for x86-64 (`linux/amd64`) only, so a runner on Arm needs x86-64 emulation to run it.
 
 Until Aristotle can re-check results it has already established, every `aristotle ci` run is a
@@ -371,7 +376,8 @@ key as `ARISTOTLE_API_KEY` from your CI's secret store, as [GitLab CI](#gitlab-c
 `ARISTOTLE_DIRECTORY`, `ARISTOTLE_NAME`, `ARISTOTLE_PROJECT`), which is how the container is configured,
 except `--allow-untracked`, which only the command line gives (see
 [Generated sources and shared folders](#generated-sources-and-shared-folders)). The switches `--dry-run`
-and `--no-junit` have no variable. `aristotle ci` takes no `--scope`, `--path`, `--base-ref` or
+and `--no-junit` have no variable. The JUnit report goes to `aristotle-results.xml` unless `--junit` names
+another path, and `--no-junit` writes none. `aristotle ci` takes no `--scope`, `--path`, `--base-ref` or
 `--instructions`: those belong to [`aristotle review`](#aristotle-review). Given to `aristotle ci`, they
 exit `2` with a message that says so, and `aristotle ci` warns when `ARISTOTLE_SCOPE`, `ARISTOTLE_PATHS`,
 `ARISTOTLE_BASE_REF` or `ARISTOTLE_INSTRUCTIONS` is set.
@@ -675,7 +681,7 @@ level. Its scope decides what Aristotle spends its budget proving:
 
 | Setting | Behavior |
 |---|---|
-| `--scope changed` (`ARISTOTLE_SCOPE=changed`) | Only the source files touched by this change, plus what they depend on. The default. |
+| `--scope changed` (`ARISTOTLE_SCOPE=changed`) | Only the source files touched by this change, plus what they depend on; with `--path`, only those its globs match. The default. |
 | `--scope paths` | An explicit allowlist, given with `--path` (`ARISTOTLE_PATHS`, newline- or comma-separated; a flag replaces its variable rather than adding to it) — for example, only `rtl/core/**`. |
 | `--scope all` | Every source file in the repository. Suited to a nightly or pre-release job. |
 
@@ -686,7 +692,7 @@ aristotle review --scope paths --path 'rtl/core/**'
 aristotle review --scope all         # every source file — for a nightly job
 ```
 
-Source files are Verilog and SystemVerilog (`.v`, `.sv`, `.svh`, `.vh`) and C (`.c`, `.h`).
+Source files are Verilog and SystemVerilog (`.v`, `.sv`, `.svh`, `.vh`), C (`.c`, `.h`), and Rust (`.rs`).
 Aristotle doesn't verify Lean, so a change to a `.lean` file is never in a run's scope.
 
 `--instructions` (`ARISTOTLE_INSTRUCTIONS`) adds instructions to the run, for example to use the
@@ -697,7 +703,8 @@ On GitLab, a pipeline on a branch other than the default is compared with the de
 Otherwise, for a push it covers every commit in the push, measured from the commit the branch
 pointed at before it, which GitHub and GitLab report; elsewhere, or when the branch is new, it
 falls back to the last commit alone, and the log says which comparison it made. Set
-`ARISTOTLE_BASE_REF` (`--base-ref`) to compare against a branch instead.
+`ARISTOTLE_BASE_REF` (`--base-ref`) to a branch, such as `main` or `origin/main`, to compare
+against it instead.
 
 A CI checkout often holds only the commit being built. When it lacks the history to find where
 the change began, the step fetches the target branch — or the default branch, on a GitLab branch

@@ -1,6 +1,7 @@
 import argparse
 import logging
 
+from aristotlelib.agent_task import task_status_label
 from aristotlelib.api_request import AristotleAPIError
 from aristotlelib.cli.api_action import APIAction, print_json, raise_for_pagination_key
 from aristotlelib.date_utils import format_relative_time
@@ -28,13 +29,18 @@ class ListAction(APIAction):
             nargs="+",
             action="extend",
             choices=[s.name for s in ProjectStatus if s != ProjectStatus.UNKNOWN],
-            help="Filter by project status(es). Can specify multiple values, or repeat it.",
+            help="Only list projects with these statuses.",
+        )
+        self.parser.add_argument(
+            "--archived",
+            action="store_true",
+            help="List archived projects instead.",
         )
         self.parser.add_argument(
             "--limit",
             type=int,
             default=10,
-            help="Maximum number of projects to return (1-100). Default: 10",
+            help="How many projects to list, 1 to 100 (default: 10).",
         )
         self.parser.add_argument(
             "--pagination-key",
@@ -44,11 +50,7 @@ class ListAction(APIAction):
         self.parser.add_argument(
             "--json",
             action="store_true",
-            help=(
-                'Print {"projects", "pagination_key"} as JSON instead of a table. A project\'s `status` is 1 while '
-                "a task runs and 2 when it is idle, and `latest_run_status` is how its latest run stands or ended, "
-                "such as COMPLETE or FAILED."
-            ),
+            help="Print the projects as JSON instead of a table.",
         )
 
     def preflight(self, args: argparse.Namespace) -> int | None:
@@ -70,6 +72,7 @@ class ListAction(APIAction):
                 pagination_key=args.pagination_key,
                 limit=args.limit,
                 status=status_filter,
+                archived=args.archived,
             )
         except AristotleAPIError as e:
             raise_for_pagination_key(self.parser, e, args.pagination_key)
@@ -77,7 +80,7 @@ class ListAction(APIAction):
         if args.json:
             print_json(ProjectPage(projects=projects, pagination_key=pagination_key))
         elif not projects:
-            logging.info("No projects found.")
+            logging.info("No archived projects found." if args.archived else "No projects found.")
             return
         else:
             self._print_table(projects)
@@ -98,6 +101,6 @@ class ListAction(APIAction):
                 name = name[:27] + "..."
             status = project.status.name
             # How the latest run stands or ended, which STATUS, running or idle, doesn't tell.
-            last_run = project.latest_run_status.name if project.latest_run_status else "-"
+            last_run = task_status_label(project.latest_run_status) if project.latest_run_status else "-"
 
             print_line(f"{project_id:<36} {created:<20} {name:<30} {status:<7} {last_run:<20}")

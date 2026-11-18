@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from aristotlelib.api_request import AristotleAPIError
+from aristotlelib.declaration import DeclarationStatus
 from aristotlelib.event import Event, EventStatus, EventType
 from aristotlelib.question import QuestionClosed
 from tests.conftest import patched_client
@@ -129,6 +130,30 @@ def test_event_type_unknown_handling():
     )
 
     assert event.event_type == EventType.UNKNOWN
+
+
+def test_a_property_event_names_its_declaration_and_says_what_changed():
+    event = Event.model_validate(
+        {
+            "event_id": "event-123",
+            "agent_task_id": "task-456",
+            "event_type": 21,
+            "created_at": "2026-11-05T12:00:00",
+            "content": "`Spec.noOverflow`: In progress → Proved",
+            "file_path": None,
+            "explanation": None,
+            "status": 1,
+            "declaration_id": "no-overflow",
+            "declaration_status": 3,
+        }
+    )
+
+    assert (event.event_type, event.declaration_id, event.declaration_status) == (
+        EventType.PROPERTY_STATUS_CHANGED,
+        "no-overflow",
+        DeclarationStatus.PROVED,
+    )
+    assert str(event) == "PROPERTY_STATUS_CHANGED: `Spec.noOverflow`: In progress → Proved"
 
 
 def test_event_status_unknown_handling():

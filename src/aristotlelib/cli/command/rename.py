@@ -30,11 +30,11 @@ class RenameAction(APIAction):
         return 85
 
     def add_action_arguments(self) -> None:
-        self.parser.add_argument("project_id", type=str, help=f"The project to rename: {PROJECT_REFERENCE_HELP}")
+        self.parser.add_argument("project_id", type=str, help=f"The project: {PROJECT_REFERENCE_HELP}")
         self.parser.add_argument(
             "name",
             type=project_name_argument,
-            help="The new name. Quote it if it contains spaces; put -- before it if it starts with -.",
+            help="The new name; put -- before it if it starts with -.",
         )
         self.parser.add_argument(
             "--json",

@@ -7,6 +7,8 @@ import logging
 import math
 import os
 import re
+import stat
+import sys
 import tempfile
 import uuid
 from collections.abc import Callable, Sequence
@@ -18,7 +20,7 @@ from aristotlelib.api_request import AristotleAPIError
 from aristotlelib.ci import context, location, manifest, naming, runner, scope
 from aristotlelib.ci.results import proved, refuted, status_label
 from aristotlelib.cli.api_action import (
-    PROJECT_REFERENCE_HELP,
+    CI_GUIDE_URL,
     APIAction,
     exit_code_for,
     fetch_tasks,
@@ -453,6 +455,10 @@ def _write_file(path: Path, text: str, replace: bool) -> None:
     temporary = path.with_name(f".aristotle-{uuid.uuid4().hex[:8]}.tmp")
     _create(temporary, text)
     try:
+        if sys.platform == "win32" and os.path.islink(path):
+            # Windows replaces no folder, a link to one included, so such a link goes first; one to a file is replaced.
+            if os.lstat(path).st_file_attributes & stat.FILE_ATTRIBUTE_DIRECTORY:
+                os.unlink(path)
         os.replace(temporary, path)
     except BaseException:
         temporary.unlink(missing_ok=True)
@@ -555,6 +561,7 @@ def _shown(path: Path) -> str:
 class SetupAction(APIAction):
     """Have Aristotle propose properties for the repository, asking its questions, and write them to the manifest."""
 
+    docs_url = CI_GUIDE_URL
     _root: Path
     _path: Path
     _target: list[str]
@@ -581,26 +588,19 @@ class SetupAction(APIAction):
             "--manifest",
             type=Path,
             default=argparse.SUPPRESS,
-            help=f"Where to write the manifest (default: {manifest.MANIFEST_NAME} in the directory).",
+            help="Where to write the manifest.",
         )
         self.parser.add_argument(
             "--directory",
             type=Path,
             default=argparse.SUPPRESS,
-            help=(
-                "The repository, or the subproject in it, to propose properties for (default: the nearest folder up "
-                f"to the repository's top level that holds {manifest.MANIFEST_NAME}, as `aristotle ci` reads, else "
-                "this directory; with --manifest, this directory)."
-            ),
+            help="The repository, or the subproject in it, to set up.",
         )
         self.parser.add_argument(
             "--name",
             type=project_name_argument,
             default=argparse.SUPPRESS,
-            help=(
-                "Name for the setup run's project (default: the repository and the directory in it, then "
-                "'ci setup', and the branch and commit)."
-            ),
+            help="Name for the setup run's project.",
         )
         self.parser.add_argument(
             "--force",
@@ -611,10 +611,7 @@ class SetupAction(APIAction):
             "--from",
             dest="from_project",
             metavar="PROJECT",
-            help=(
-                f"Write the manifest from an existing project's properties instead of starting a run: "
-                f"{PROJECT_REFERENCE_HELP}. Needs no terminal."
-            ),
+            help="Write the manifest from a project, without a run.",
         )
 
     def preflight(self, args: argparse.Namespace) -> int | None:
@@ -645,8 +642,12 @@ class SetupAction(APIAction):
         else:
             # The manifest `aristotle ci` reads from here, which one written here would hide.
             nearest = scope.local_root(here, manifest.MANIFEST_NAME)
-            self._root = nearest if os.path.isfile(nearest / manifest.MANIFEST_NAME) else here
+            # A file or a link there, as scope.local_root() counts one, never a folder named so.
+            held = nearest / manifest.MANIFEST_NAME
+            self._root = nearest if os.path.islink(held) or os.path.isfile(held) else here
         self._path = given or self._root / manifest.MANIFEST_NAME
+        # `aristotle ci` finds a link there, but reads through it only to a file in the checkout.
+        reads = "finds" if os.path.islink(self._path) else "reads"
         # A folder found above this one is named, so that a printed command reaches it from here alone.
         found = (
             os.path.relpath(self._root, here) if self._root != here and directory is None and given is None else None
@@ -656,7 +657,8 @@ class SetupAction(APIAction):
             + (["--directory", _path_arg(found)] if found else [])
             + (["--manifest", _path_arg(given)] if given else [])
         )
-        if os.path.isdir(self._path):
+        # A link found where `aristotle ci` looks is replaced as any manifest there is, never looked through.
+        if not (given is None and os.path.islink(self._path)) and os.path.isdir(self._path):
             logger.error(
                 f"{_shown(self._path)} is a directory. Name the manifest file, as {_shown(self._path / manifest.MANIFEST_NAME)}."
             )
@@ -664,7 +666,7 @@ class SetupAction(APIAction):
         if os.path.lexists(self._path) and not args.force:
             if found:
                 logger.error(
-                    f"{_shown(self._path)} already exists, and `aristotle ci` run here reads it. Pass --force to "
+                    f"{_shown(self._path)} already exists, and `aristotle ci` run here {reads} it. Pass --force to "
                     "replace it, or --directory . to set up this folder on its own."
                 )
             else:
@@ -690,7 +692,7 @@ class SetupAction(APIAction):
         # After every refusal, so that it is said only when the manifest will be replaced.
         if found:
             logger.warning(
-                f"Setting up {_shown(self._root)}, whose {manifest.MANIFEST_NAME} `aristotle ci` run here reads, and "
+                f"Setting up {_shown(self._root)}, whose {manifest.MANIFEST_NAME} `aristotle ci` run here {reads}, and "
                 "replacing it. Pass --directory . to set up this folder on its own."
             )
         return None

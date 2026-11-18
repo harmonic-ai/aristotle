@@ -8,6 +8,7 @@ import logging
 import os
 import signal
 import sys
+import traceback
 from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, call, patch
@@ -30,7 +31,7 @@ from tests.cli.conftest import (
     device_started,
     token_error,
 )
-from tests.conftest import REFUSED_KEYS, shown_key_runs
+from tests.conftest import FAKE_KEY, REFUSED_KEYS, shown_key_runs
 
 WEB_URL = "https://aristotle.example"
 
@@ -147,6 +148,87 @@ async def test_a_blank_key_or_one_holding_a_line_break_given_with_api_key_is_ref
         f"The API key given with --api-key {problem}. Nothing was stored.",
         5,
     )
+    assert credentials.read_api_key() is None
+    assert seen == []
+
+
+UNDECODABLE_LINES = [
+    pytest.param(f"{FAKE_KEY}\u00a0".encode("cp1252"), id="cp1252 no-break space after"),
+    pytest.param("fake-Q7zP\u00e93wK9vX2m".encode("latin-1"), id="latin-1 e acute inside"),
+]
+"""A key's line holding a byte UTF-8 can't decode."""
+
+
+@pytest.mark.parametrize("line", UNDECODABLE_LINES)
+@pytest.mark.parametrize("errors", ["strict", "surrogateescape"], ids=["en_US.UTF-8", "C.UTF-8"])
+async def test_a_piped_key_that_isnt_utf8_is_refused_without_its_position_and_not_stored(line, errors, server):
+    _, seen = server
+    # stdin's decoder is strict in a locale such as en_US.UTF-8, and uses surrogateescape in C.UTF-8.
+    stdin = io.TextIOWrapper(io.BytesIO(line + b"\n"), encoding="utf-8", errors=errors)
+    with patch.object(login_flow.sys, "stdin", stdin), pytest.raises(login_flow.LoginError) as raised:
+        await login_flow.login()
+
+    assert (str(raised.value), raised.value.exit_code) == (
+        "The API key from stdin isn't UTF-8 text. Nothing was stored.",
+        5,
+    )
+    assert raised.value.__context__ is None
+    assert credentials.read_api_key() is None
+    assert seen == []
+
+
+async def test_a_piped_key_is_stored_whatever_the_lines_after_it_hold(server):
+    _, seen = server
+    stdin = io.TextIOWrapper(io.BytesIO(f"{FAKE_KEY}\n# caf\u00e9\n".encode("latin-1")), encoding="utf-8")
+    with patch.object(login_flow.sys, "stdin", stdin):
+        await login_flow.login()
+
+    assert credentials.read_api_key() == FAKE_KEY
+    assert seen == [FAKE_KEY, FAKE_KEY]
+
+
+@pytest.mark.parametrize(
+    ("encoding", "ending", "name"),
+    [("euc_jp", b"\xff", "EUC_JP"), ("iso2022_jp", b"\x1b$(", "ISO2022_JP")],
+    ids=["a byte it can't decode", "an escape it can't finish"],
+)
+async def test_a_piped_key_that_stdins_own_encoding_cant_decode_is_refused_naming_it(encoding, ending, name, server):
+    _, seen = server
+    stdin = io.TextIOWrapper(io.BytesIO(FAKE_KEY.encode() + ending + b"\n"), encoding=encoding)
+    with patch.object(login_flow.sys, "stdin", stdin), pytest.raises(login_flow.LoginError) as raised:
+        await login_flow.login()
+
+    assert (str(raised.value), raised.value.exit_code) == (
+        f"The API key from stdin isn't {name} text. Nothing was stored.",
+        5,
+    )
+    assert "position" not in "".join(traceback.format_exception(raised.value))
+    assert seen == []
+
+
+@pytest.mark.parametrize(("encoding", "name"), [("UTF-8", "UTF-8"), ("ISO-8859-7", "ISO8859-7")])
+async def test_a_pasted_key_the_locales_encoding_cant_decode_is_refused_on_a_line_of_its_own_and_not_stored(
+    encoding, name, server, capsys
+):
+    _, seen = server
+    # getpass decodes with the locale's encoding; a single-byte codec names itself "charmap" in the error.
+    with pytest.raises(UnicodeDecodeError) as decoding:
+        (FAKE_KEY.encode() + b"\xae\n").decode(encoding)
+    with (
+        _stdin("", tty=True),
+        patch.object(login_flow.getpass, "getpass", side_effect=decoding.value),
+        patch.object(login_flow.locale, "getpreferredencoding", return_value=encoding),
+        patch.object(login_flow, "_gui_available", return_value=False),
+        pytest.raises(login_flow.LoginError) as raised,
+    ):
+        await login_flow.login()
+
+    assert (str(raised.value), raised.value.exit_code) == (
+        f"The API key you pasted isn't {name} text. Nothing was stored.",
+        5,
+    )
+    assert raised.value.__suppress_context__
+    assert capsys.readouterr().err == "\n"
     assert credentials.read_api_key() is None
     assert seen == []
 
@@ -481,6 +563,23 @@ async def test_a_refusal_rfc_8628_doesnt_name_ends_the_login_and_exits_5(device_
         "Aristotle refused the login (invalid_grant). Nothing was stored. Try again with:\n  aristotle login",
         5,
     )
+
+
+async def test_a_refusal_code_that_quotes_the_device_code_or_a_key_shows_neither(device_server, caplog, capsys):
+    caplog.set_level(logging.DEBUG)
+    device_server(token_error(f"invalid_grant for {DEVICE_CODE} and arstl_KeyAristotleWouldHandOut"))
+    with _stdin(""), pytest.raises(login_flow.LoginError) as raised:
+        await login_flow.login()
+
+    assert (str(raised.value), raised.value.exit_code) == (
+        "Aristotle refused the login (invalid_grant for <the device code> and [redacted]). Nothing was stored. Try "
+        "again with:\n  aristotle login",
+        5,
+    )
+    out, err = capsys.readouterr()
+    shown = str(raised.value) + out + err + caplog.text
+    assert DEVICE_CODE not in shown
+    assert "arstl_KeyAristotle" not in shown
 
 
 @pytest.mark.parametrize(
@@ -1034,7 +1133,7 @@ async def test_a_key_already_on_stdin_is_read_without_a_word(device_server, capl
     assert "Waiting for an API key" not in caplog.text
 
 
-KEY_FROM_BEFORE = "key-a-device-login-stored-before"
+KEY_FROM_BEFORE = "arstl_KeyADeviceLoginStoredBefore"
 
 
 async def test_a_device_login_sends_the_key_a_device_login_stored_before(device_server, caplog, capsys):

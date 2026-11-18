@@ -9,6 +9,7 @@ import logging
 import os
 import signal
 import sys
+import textwrap
 import threading
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Coroutine
@@ -46,11 +47,11 @@ from aristotlelib.exit_codes import (
 )
 from aristotlelib.printable import escape_logged_text
 from aristotlelib.project import (
-    PROJECT_ID_PREFIX_MIN_LENGTH,
     AmbiguousProjectError,
     Project,
     ProjectStatus,
     lookup_at_terminal,
+    project_web_url,
 )
 from aristotlelib.question import Question
 from aristotlelib.results import (
@@ -64,9 +65,12 @@ from aristotlelib.results import (
 )
 from aristotlelib.shell import shell_hint
 
-PROJECT_REFERENCE_HELP = f"its id, the first {PROJECT_ID_PREFIX_MIN_LENGTH} or more characters of it, or its name"
+PROJECT_REFERENCE_HELP = "its id, id prefix or name"
 """How a project argument's help describes what it accepts; Project.resolve_id turns it into an id."""
-VERBOSE_HELP = "Show response headers and a short response excerpt when a request is refused."
+VERBOSE_HELP = "Show response headers when a request is refused."
+NON_INTERACTIVE_HELP = "For scripts: --wait --json, but stop at any question."
+CLI_REFERENCE_URL = "https://github.com/harmonic-ai/aristotle/blob/main/docs/cli-reference.md"
+CI_GUIDE_URL = "https://github.com/harmonic-ai/aristotle/blob/main/docs/aristotle-in-ci.md"
 
 _P = ParamSpec("_P")
 _T = TypeVar("_T")
@@ -83,10 +87,7 @@ def add_prompt_arguments(parser: argparse.ArgumentParser, help: str) -> None:
         "--prompt-file",
         metavar="PATH",
         type=os.path.expanduser,
-        help=(
-            "Read the prompt from PATH, as UTF-8 text, or from a pipe with -. For a prompt too long for the command "
-            "line: Linux takes at most 128 KiB in one argument."
-        ),
+        help="Read the prompt from PATH, or from a pipe with -.",
     )
 
 
@@ -333,6 +334,14 @@ async def log_download_hint(project_id: str) -> None:
         logging.info(f"Get the project's files with:\n  aristotle download {project_id}")
 
 
+def log_next_steps(task: AgentTask, has_properties: bool) -> None:
+    """Log, last after a wait that saw ``task`` end, its project's page in the web app and, once a task completed on a
+    project with properties, the command that lists them."""
+    logging.info(f"Open in Aristotle Web: {project_web_url(task.project_id)}")
+    if has_properties and task.status in (TaskStatus.COMPLETE, TaskStatus.COMPLETE_WITH_ERRORS):
+        logging.info(shell_hint("See each property with", ["aristotle", "properties", task.project_id]))
+
+
 REJECTED_PAGINATION_KEY = "--pagination-key was rejected; pass the key the previous page printed."
 
 
@@ -424,12 +433,31 @@ def _run_loop(main: Callable[_P, Coroutine[Any, Any, _T]], *args: _P.args, **kwa
     return asyncio.run(run())
 
 
+class HelpFormatter(argparse.HelpFormatter):
+    """argparse's help formatter, except that it breaks lines only at spaces, so a link or an option stays whole."""
+
+    def _split_lines(self, text: str, width: int) -> list[str]:
+        text = self._whitespace_matcher.sub(" ", text).strip()
+        return textwrap.wrap(text, width, break_long_words=False, break_on_hyphens=False)
+
+    def _fill_text(self, text: str, width: int, indent: str) -> str:
+        text = self._whitespace_matcher.sub(" ", text).strip()
+        return textwrap.fill(
+            text, width, initial_indent=indent, subsequent_indent=indent, break_long_words=False, break_on_hyphens=False
+        )
+
+
 class APIAction(ABC):
+    docs_url = CLI_REFERENCE_URL
+    """The page with the detail behind the command's one-line option help."""
+
     def __init__(self, subparsers: argparse._SubParsersAction[Any]) -> None:
         self.parser: argparse.ArgumentParser = subparsers.add_parser(
             self.command_name,
             help=self.description,
             description=self.description,
+            epilog=f"See {self.docs_url}",
+            formatter_class=HelpFormatter,
         )
 
     @property

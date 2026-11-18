@@ -6,6 +6,7 @@ import pydantic
 import pytest
 
 from aristotlelib.agent_task import AgentTask
+from aristotlelib.billing import BalanceResult, CreditBalance, CreditDisplayConfig
 from aristotlelib.declaration import Declaration
 from aristotlelib.event import Event
 from aristotlelib.project import Project
@@ -43,6 +44,9 @@ def _json_output_section() -> str:
 @pytest.mark.parametrize(
     "model",
     [
+        BalanceResult,
+        CreditBalance,
+        CreditDisplayConfig,
         Project,
         AgentTask,
         Event,

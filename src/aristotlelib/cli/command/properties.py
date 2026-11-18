@@ -240,7 +240,7 @@ class PropertiesAction(APIAction):
         self.parser.add_argument(
             "project_id",
             type=str,
-            help=f"The project to list properties for: {PROJECT_REFERENCE_HELP}",
+            help=f"The project: {PROJECT_REFERENCE_HELP}",
         )
         # Words left over, such as a property's name, are refused with a pointer at the command that shows one.
         self.parser.set_defaults(
@@ -250,47 +250,37 @@ class PropertiesAction(APIAction):
         self.parser.add_argument(
             "--limit",
             type=int,
-            help=f"Maximum number of rows to show. Default: {DEFAULT_LIMIT}, and every match with --json.",
+            help=f"Rows to show (default: {DEFAULT_LIMIT}, or all with --json).",
         )
         self.parser.add_argument(
             "--status",
             action="append",
             choices=STATUS_CHOICES,
             metavar="{" + ",".join(LISTED_STATUS_CHOICES) + "}",
-            help=(
-                "Only show properties with this status, as the table words it or as Aristotle reports it; repeat it "
-                "for several, to show those with any of them. REFUTED includes counterexample evidence, a formal "
-                "proof of the negation, or both. IN PROGRESS in the table is "
-                "IN_PROGRESS, and UNRESOLVED is FAILED (NOT_VERIFIED, its old name, still works). A verdict Aristotle "
-                "never checked is listed under its word, marked (unchecked), though show counts it as unchecked. "
-                "Default: ALL"
-            ),
+            help="Only show properties with this status; repeatable.",
         )
         self.parser.add_argument(
             "--kind",
             choices=list(KINDS),
             default="property",
-            help=(
-                "Show properties (what Aristotle was asked to establish) or definitions "
-                "(supporting context, never proved or refuted). Default: property"
-            ),
+            help="List properties or definitions (default: property).",
         )
         self.parser.add_argument(
             "--sort",
             choices=list(SORT_KEYS),
             default="updated",
-            help="Order by last update (newest first), creation (newest first) or name. Default: updated",
+            help="Sort by update, creation or name (default: updated).",
         )
         self.parser.add_argument(
             "--created-by",
             choices=list(CREATED_BY),
             default="all",
-            help="Only show properties you wrote (you) or ones Aristotle proposed (aristotle). Default: all",
+            help="Show only yours, or only Aristotle's (default: all).",
         )
         self.parser.add_argument(
             "--json",
             action="store_true",
-            help='Print {"project_id", "declarations", "pagination_key"} as JSON instead of a table.',
+            help="Print the properties as JSON instead of a table.",
         )
 
     def preflight(self, args: argparse.Namespace) -> int | None:

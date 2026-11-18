@@ -40,7 +40,7 @@ VERILOG_EXTENSIONS = verilog_bundle.VERILOG_SUFFIXES
 VERILOG_KEYWORD = re.compile(rb"\bendmodule\b")
 
 #: The language of each extension in SOURCE_EXTENSIONS that Aristotle proves only where the account enables it.
-GATED_EXTENSIONS = {**dict.fromkeys(VERILOG_EXTENSIONS, "Verilog"), ".c": "C", ".h": "C", ".rs": "Rust"}
+GATED_EXTENSIONS = {**dict.fromkeys(VERILOG_EXTENSIONS, "Verilog"), ".c": "C", ".h": "C"}
 
 #: Extensions conventionally used for a Verilog filelist ("dot-f file").
 FILELIST_EXTENSIONS = frozenset({".f", ".flist"})
@@ -218,14 +218,15 @@ def top_level(start: Path) -> Path | None:
 
 def local_root(start: Path, holding: str | None = None) -> Path:
     """Outside CI, the folder a run is rooted at: the nearest from ``start`` up to its repository's top level that holds
-    a file named ``holding``, else the top level; ``start`` itself when it is in no repository."""
+    a file or a symbolic link named ``holding``, else the top level; ``start`` itself when it is in no repository. A
+    symbolic link, as git commits one, is taken unfollowed, for the run to judge."""
     start = start.resolve()
     # A top level found by its .git where git refuses the repository lets a run find its manifest and fail on git's
     # reason, not on a manifest it didn't find.
     top = top_level(start) or start
     if holding is not None and start.is_relative_to(top):
         for folder in (start, *start.parents):
-            if os.path.isfile(folder / holding):
+            if os.path.islink(folder / holding) or os.path.isfile(folder / holding):
                 return folder
             if folder == top:
                 break
@@ -611,13 +612,11 @@ def is_source_file(path: Path) -> bool:
 def gated_languages(root: Path, paths: list[Path], taken: Sequence[Path] = ()) -> list[str]:
     """The languages enabled per account that Aristotle finds in the upload of ``paths`` under ``root``, and of
     ``taken``, files that go up whatever the upload set's rules, as a block's do, sorted, by its own rules: C for a name
-    ending ``.c``, Rust for ``.rs``, and Verilog for ``.v`` or ``.sv`` containing VERILOG_KEYWORD."""
+    ending ``.c`` and Verilog for ``.v`` or ``.sv`` containing VERILOG_KEYWORD."""
     languages: set[str] = set()
     for path in [*uploaded_paths(root, paths, taken), *taken]:
         if path.name.endswith(".c"):
             languages.add("C")
-        elif path.name.endswith(".rs"):
-            languages.add("Rust")
         elif "Verilog" not in languages and path.name.endswith((".v", ".sv")) and _declares_a_module(root / path):
             languages.add("Verilog")
     return sorted(languages)
