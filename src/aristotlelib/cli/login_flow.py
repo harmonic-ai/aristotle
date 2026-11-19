@@ -355,26 +355,28 @@ def _refused(error: AristotleAPIError, code: str | None, redact: Callable[[str],
 def _may_have_made_key(replaces_key: bool) -> str:
     if not replaces_key:
         return (
-            "If you approved the login, Aristotle may have made a key that never arrived. Its identity is unknown; "
-            "do not revoke a key based on its name, creation time or a difference in the key list."
+            f"If you approved the login, Aristotle may have made a key that never arrived: revoke it at {keys_url()}."
         )
     return (
-        "If you approved the login, Aristotle may have made a key that never arrived and retired the one stored here. "
-        "The new key's identity is unknown; do not revoke a key based on its name, creation time or a key-list difference."
+        "If you approved the login, Aristotle may have made a key that never arrived, and retired the one stored here: "
+        f"revoke the new one at {keys_url()}, then run `aristotle login` again."
     )
 
 
-def _made_key(issued_key: LoginIssued | None, replaces_key: bool) -> str:
-    if issued_key is None:
+def _made_key(key_name: str | None, replaces_key: bool, *, issued_key: LoginIssued | None = None) -> str:
+    if issued_key is not None:
+        if not replaces_key:
+            return f"Aristotle made key {issued_key.key_id} for this login: revoke exactly this key at {keys_url()}."
         return (
-            "Aristotle issued a key for this login, but this server does not report its identity. "
-            "Do not identify or revoke a key by its name, creation time or a key-list difference."
+            f"Aristotle made key {issued_key.key_id} for this login and may have retired the one stored here: "
+            f"revoke exactly this new key at {keys_url()}."
         )
+    made = "a key" if key_name is None else f'the key "{key_name}"'
     if not replaces_key:
-        return f"Aristotle made key {issued_key.key_id} for this login: revoke exactly this key at {keys_url()}."
+        return f"Aristotle made {made} for this login: revoke it at {keys_url()}."
     return (
-        f"Aristotle made key {issued_key.key_id} for this login and may have retired the one stored here: "
-        f"revoke exactly this new key at {keys_url()}."
+        f"Aristotle made {made} for this login, and may have retired the one stored here: revoke the new one at "
+        f"{keys_url()}, then run `aristotle login` again."
     )
 
 
@@ -427,11 +429,13 @@ async def _poll(
     denied or expires; the key and its name. ``progress`` shows the wait, and is cleared before each request.
     ``leftover`` notes a key that may have been made, from each request until an answer says Aristotle is waiting.
 
-    An answer lost after Aristotle may have handed the key out ends the login with exit 7; it is not requested again.
+    An answer lost after Aristotle may have handed the key out is asked again once: a pending answer then says it held
+    none, and anything but that or a denial ends the login with exit 7.
     """
     interval = device.interval
     without_code = _without(device.device_code, "<the device code>")
     deadline = time.monotonic() + device.pending.expires_in
+    lost: AristotleOutcomeUnknownError | None = None
     while True:
         await _wait(interval, deadline, progress)
         if progress is not None:
@@ -443,11 +447,18 @@ async def _poll(
                 DEVICE_TOKEN, json={"device_code": device.device_code}, authenticated=False, redact=without_code
             )
         except AristotleOutcomeUnknownError as e:
-            raise _maybe_lost(e, device.replaces_key) from e
+            if lost is not None:
+                raise _maybe_lost(e, device.replaces_key) from e
+            lost = e
+            logger.warning(f"An answer from Aristotle was lost ({_lost(e)}); asking for the key again in {interval} s.")
+            continue
         except AristotleAPIError as e:
             code = e.error_code if e.status_code == 400 else None
             if code not in ("authorization_pending", "slow_down"):
+                if lost is not None and code != "access_denied":
+                    raise _maybe_lost(lost, device.replaces_key) from e
                 raise _refused(e, code, without_code) from e
+            lost = None
             leftover.note = None
             if code == "slow_down":
                 interval += SLOW_DOWN_SECONDS
@@ -465,14 +476,12 @@ async def _poll(
             if issued is None:
                 raise LoginError(
                     "Aristotle's answer did not identify the issued key. The login may have made a key. "
-                    "Nothing was stored; do not identify or revoke a key by name.",
+                    "Nothing was stored.",
                     exit_code=EXIT_OUTCOME_UNKNOWN,
                 )
         leftover.issued_key = issued
-        leftover.note = _made_key(issued, device.replaces_key)
-        if issued is None:
-            logger.warning("This server does not report the issued key's identity. Key ownership remains unknown.")
-        else:
+        leftover.note = _made_key(None, device.replaces_key, issued_key=issued)
+        if issued is not None:
             logger.info(
                 "Aristotle issued key %s for user %s in organization %s.",
                 issued.key_id,
@@ -482,6 +491,7 @@ async def _poll(
             if on_issued is not None:
                 on_issued(issued)
         api_key, key_name = _approved_key(response)
+        leftover.note = _made_key(key_name, device.replaces_key, issued_key=issued)
         return api_key, key_name
 
 

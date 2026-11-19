@@ -77,7 +77,7 @@ async def test_legacy_server_stores_key_without_claiming_identity(device_server,
     assert result.issued_key is None
     assert credentials.read_device_api_key() == APPROVED_KEY
     assert _paths(requests) == ["/cli/device/start", "/cli/device/token", "/project", "/organization"]
-    assert "Key ownership remains unknown" in caplog.text
+    assert not any(record.levelno >= logging.WARNING for record in caplog.records)
 
 
 @pytest.mark.parametrize(
@@ -148,13 +148,15 @@ async def test_received_identity_survives_missing_credential(device_server, key,
 
 async def test_unknown_token_response_body_is_not_reported(device_server, caplog):
     caplog.set_level(logging.DEBUG)
-    requests = device_server(httpx.Response(502, json={"api_key": APPROVED_KEY, "device_code": DEVICE_CODE}))
+    requests = device_server(
+        httpx.Response(502, json={"api_key": APPROVED_KEY, "device_code": DEVICE_CODE}), token_error("expired_token")
+    )
     with _stdin(""), pytest.raises(login_flow.LoginError) as raised:
         await login_flow.login()
 
     assert raised.value.exit_code == 7
     assert raised.value.issued_key is None
-    assert _paths(requests) == ["/cli/device/start", "/cli/device/token"]
+    assert _paths(requests) == ["/cli/device/start", "/cli/device/token", "/cli/device/token"]
     shown = "".join(traceback.format_exception(raised.value)) + caplog.text
     assert APPROVED_KEY not in shown
     assert DEVICE_CODE not in shown
@@ -737,25 +739,61 @@ LOST_AS = ["ReadTimeout", "status 502", "something else answered"]
 def _maybe_lost(what: str) -> str:
     return (
         f"Could not finish the login: an answer from Aristotle was lost ({what}). If you approved the login, Aristotle "
-        "may have made a key that never arrived. Its identity is unknown; do not revoke a key based on its name, "
-        "creation time or a difference in the key list. Nothing was stored."
+        f"may have made a key that never arrived: revoke it at {WEB_URL}/keys. Nothing was stored."
     )
 
 
 @pytest.mark.parametrize(("failure", "what"), zip(LOST, LOST_AS), ids=LOST_IDS)
-async def test_unknown_token_outcome_is_not_polled_again(device_server, failure, what, caplog):
+@pytest.mark.parametrize("metadata", [{}, ISSUED_METADATA], ids=["legacy", "issued-receipt"])
+async def test_after_a_lost_answer_a_pending_one_says_it_held_no_key(device_server, failure, what, caplog, metadata):
+    pending = token_error("authorization_pending")
+    requests = device_server(pending, failure, pending, failure, approved(**metadata))
     issued: list[LoginIssued] = []
-    requests = device_server(token_error("authorization_pending"), failure, approved(**ISSUED_METADATA))
+    with _stdin(""):
+        result = await login_flow.login(on_issued=issued.append)
+
+    assert (result.issued_key is not None) == bool(metadata)
+    assert issued == ([] if not metadata else [result.issued_key])
+    assert len([request for request in requests if request.url.path.endswith("/start")]) == 1
+    assert all(
+        json.loads(request.content)["device_code"] == DEVICE_CODE
+        for request in requests
+        if request.url.path.endswith("/token")
+    )
+
+    assert result.key_name == KEY_NAME
+    assert _polled_at(requests) == [5, 10, 15, 20, 25]
+    assert caplog.text.count(f"An answer from Aristotle was lost ({what}); asking for the key again in 5 s.") == 2
+
+
+@pytest.mark.parametrize("failure", LOST, ids=LOST_IDS)
+@pytest.mark.parametrize(
+    "then",
+    [token_error("expired_token"), "lost again", httpx.ConnectError("unreachable"), token_error("invalid_grant")],
+    ids=["then expired", "then lost again", "then unreachable", "then refused"],
+)
+async def test_a_lost_answer_that_may_have_held_the_key_exits_7_and_says_where_to_revoke_it(
+    device_server, failure, then
+):
+    requests = device_server(failure, failure if then == "lost again" else then)
     with _stdin(""), pytest.raises(login_flow.LoginError) as raised:
-        await login_flow.login(on_issued=issued.append)
+        await login_flow.login()
 
     assert raised.value.exit_code == 7
-    assert raised.value.issued_key is None
-    assert issued == []
-    assert str(raised.value) == _maybe_lost(what)
-    assert _polled_at(requests) == [5, 10]
+    assert str(raised.value) == _maybe_lost(LOST_AS[LOST.index(failure)])
+    assert _polled_at(requests)[:2] == [5, 10]
     assert credentials.read_api_key() is None
-    assert "asking for the key again" not in caplog.text
+
+
+async def test_a_lost_answer_then_a_denial_is_a_denial(device_server):
+    device_server(httpx.Response(502), token_error("access_denied"))
+    with _stdin(""), pytest.raises(login_flow.LoginError) as raised:
+        await login_flow.login()
+
+    assert (str(raised.value), raised.value.exit_code) == (
+        "The login was denied in the browser. Nothing was stored.",
+        5,
+    )
 
 
 async def test_a_machine_without_a_hostname_starts_as_unknown(device_server):
@@ -1130,8 +1168,8 @@ def _interrupted(interrupt: type[BaseException]) -> Callable[[httpx.Request], ht
 
 
 MAY_HAVE_MADE_A_KEY = (
-    "\nCancelled. Nothing was stored. If you approved the login, Aristotle may have made a key that never arrived. "
-    "Its identity is unknown; do not revoke a key based on its name, creation time or a difference in the key list.\n"
+    "\nCancelled. Nothing was stored. If you approved the login, Aristotle may have made a key that never arrived: "
+    f"revoke it at {WEB_URL}/keys.\n"
 )
 
 
@@ -1271,10 +1309,7 @@ async def test_the_key_in_the_environment_isnt_sent_in_place_of_the_stored_one(d
     assert json.loads(requests[0].content)[login_flow.PREVIOUS_KEY] == KEY_FROM_BEFORE
 
 
-RETIRED = (
-    "and retired the one stored here. The new key's identity is unknown; do not revoke a key based on its name, "
-    "creation time or a key-list difference."
-)
+RETIRED = f"and retired the one stored here: revoke the new one at {WEB_URL}/keys, then run `aristotle login` again."
 
 
 async def test_a_lost_answer_that_may_have_retired_the_stored_key_holds_unknown_identity(device_server):
@@ -1286,7 +1321,7 @@ async def test_a_lost_answer_that_may_have_retired_the_stored_key_holds_unknown_
     assert raised.value.exit_code == 7
     assert str(raised.value) == (
         "Could not finish the login: an answer from Aristotle was lost (status 502). If you approved the login, "
-        f"Aristotle may have made a key that never arrived {RETIRED} Nothing was stored."
+        f"Aristotle may have made a key that never arrived, {RETIRED} Nothing was stored."
     )
     assert KEY_FROM_BEFORE not in str(raised.value)
 
@@ -1299,7 +1334,7 @@ def test_an_interrupt_while_asking_for_a_replacement_key_holds_unknown_identity(
 
     assert capsys.readouterr().err == (
         "\nCancelled. Nothing was stored. If you approved the login, Aristotle may have made a key that never "
-        f"arrived {RETIRED}\n"
+        f"arrived, {RETIRED}\n"
     )
 
 
@@ -1487,9 +1522,7 @@ async def test_a_login_leaves_the_billing_line_out_when_aristotle_names_no_payer
 
     assert credentials.read_api_key() == APPROVED_KEY
     assert _login_lines(caplog)[-1] == f'Logged in. Key "{KEY_NAME}" stored in {credentials.credentials_path()}.'
-    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == [
-        "This server does not report the issued key's identity. Key ownership remains unknown."
-    ]
+    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == []
 
 
 async def test_a_login_waits_for_who_pays_only_as_long_as_billed_to_seconds(caplog, monkeypatch):

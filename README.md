@@ -221,8 +221,7 @@ In a script, or with `--json` or `--non-interactive`, a command that has no key 
 in. `aristotle login --json` prints the link and the code for a person to approve as soon as it starts, then waits
 for them. If the server reports the issued key's identity, login prints its key, user and organization IDs before
 verification or storage. This receipt does not confirm that the key was stored. Older servers do not report these
-IDs; login still works, but key ownership remains unknown. A lost token response stops login without another token
-request. Do not identify or revoke a key by its name, creation time or a key-list difference.
+IDs; login still works and its `issued_key` is `null`. The issued receipt does not mean the key was verified or stored.
 `--prompt-file` reads a long prompt from a file, or from a pipe with `-`.
 
 On `submit`, `continue`, and `show`, `--non-interactive` waits without ever prompting. When Aristotle asks
