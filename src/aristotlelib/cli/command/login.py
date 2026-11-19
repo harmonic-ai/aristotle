@@ -48,7 +48,7 @@ class LoginAction(APIAction):
         self.parser.add_argument(
             "--json",
             action="store_true",
-            help="Print the page, the code and the key's path as JSON.",
+            help="Print the page, code, issued key identity and stored key path as JSON.",
         )
 
     async def run_action(self, args: argparse.Namespace) -> int | None:
@@ -58,6 +58,7 @@ class LoginAction(APIAction):
                 open_browser=not args.no_browser,
                 api_key=api_key,
                 on_pending=_print_now if args.json else None,
+                on_issued=_print_now if args.json else None,
                 on_stored=_print_now if args.json else None,
             )
         except (KeyboardInterrupt, asyncio.CancelledError):

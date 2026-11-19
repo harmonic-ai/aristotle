@@ -23,6 +23,7 @@ from typing import Any, TypeGuard
 from urllib.parse import urlsplit
 
 import httpx
+import pydantic
 
 from aristotlelib import api_request, credentials
 from aristotlelib.api_request import AristotleAPIError, AristotleOutcomeUnknownError, get_web_url
@@ -34,7 +35,7 @@ from aristotlelib.exit_codes import (
     EXIT_RATE_LIMITED,
 )
 from aristotlelib.printable import printable
-from aristotlelib.results import LoginPending, LoginResult
+from aristotlelib.results import LoginIssued, LoginPending, LoginResult
 
 logger = logging.getLogger(__name__)
 
@@ -58,11 +59,12 @@ EXPIRED = "The code expired before the login was approved. Nothing was stored. G
 
 
 class LoginError(Exception):
-    """No valid key was entered; ``exit_code`` is the process exit code to report it with."""
+    """Login failed; ``issued_key`` identifies a received issuance, not verification or storage."""
 
     def __init__(self, message: str, exit_code: int = EXIT_AUTH_ERROR) -> None:
         super().__init__(message)
         self.exit_code = exit_code
+        self.issued_key: LoginIssued | None = None
 
 
 class _NoDeviceLogin(Exception):
@@ -85,6 +87,7 @@ class _Leftover:
     """What an interrupt would leave on the server: a note on the key the login may have made, or None."""
 
     note: str | None = None
+    issued_key: LoginIssued | None = None
 
 
 def keys_url() -> str:
@@ -352,21 +355,26 @@ def _refused(error: AristotleAPIError, code: str | None, redact: Callable[[str],
 def _may_have_made_key(replaces_key: bool) -> str:
     if not replaces_key:
         return (
-            f"If you approved the login, Aristotle may have made a key that never arrived: revoke it at {keys_url()}."
+            "If you approved the login, Aristotle may have made a key that never arrived. Its identity is unknown; "
+            "do not revoke a key based on its name, creation time or a difference in the key list."
         )
     return (
-        "If you approved the login, Aristotle may have made a key that never arrived, and retired the one stored here: "
-        f"revoke the new one at {keys_url()}, then run `aristotle login` again."
+        "If you approved the login, Aristotle may have made a key that never arrived and retired the one stored here. "
+        "The new key's identity is unknown; do not revoke a key based on its name, creation time or a key-list difference."
     )
 
 
-def _made_key(key_name: str | None, replaces_key: bool) -> str:
-    made = "a key" if key_name is None else f'the key "{key_name}"'
+def _made_key(issued_key: LoginIssued | None, replaces_key: bool) -> str:
+    if issued_key is None:
+        return (
+            "Aristotle issued a key for this login, but this server does not report its identity. "
+            "Do not identify or revoke a key by its name, creation time or a key-list difference."
+        )
     if not replaces_key:
-        return f"Aristotle made {made} for this login: revoke it at {keys_url()}."
+        return f"Aristotle made key {issued_key.key_id} for this login: revoke exactly this key at {keys_url()}."
     return (
-        f"Aristotle made {made} for this login, and may have retired the one stored here: revoke the new one at "
-        f"{keys_url()}, then run `aristotle login` again."
+        f"Aristotle made key {issued_key.key_id} for this login and may have retired the one stored here: "
+        f"revoke exactly this new key at {keys_url()}."
     )
 
 
@@ -408,19 +416,22 @@ def _approved_key(response: httpx.Response) -> tuple[str, str | None]:
 
 
 async def _poll(
-    client: api_request.AristotleRequestClient, device: _Device, progress: _ProgressLine | None, leftover: _Leftover
+    client: api_request.AristotleRequestClient,
+    device: _Device,
+    progress: _ProgressLine | None,
+    leftover: _Leftover,
+    *,
+    on_issued: Callable[[LoginIssued], None] | None,
 ) -> tuple[str, str | None]:
     """Ask for the key each interval, longer by SLOW_DOWN_SECONDS after each ``slow_down``, until the login is approved,
     denied or expires; the key and its name. ``progress`` shows the wait, and is cleared before each request.
     ``leftover`` notes a key that may have been made, from each request until an answer says Aristotle is waiting.
 
-    An answer lost after Aristotle may have handed the key out is asked again once: a pending answer then says it held
-    none, and anything but that or a denial ends the login with exit 7.
+    An answer lost after Aristotle may have handed the key out ends the login with exit 7; it is not requested again.
     """
     interval = device.interval
     without_code = _without(device.device_code, "<the device code>")
     deadline = time.monotonic() + device.pending.expires_in
-    lost: AristotleOutcomeUnknownError | None = None
     while True:
         await _wait(interval, deadline, progress)
         if progress is not None:
@@ -432,31 +443,54 @@ async def _poll(
                 DEVICE_TOKEN, json={"device_code": device.device_code}, authenticated=False, redact=without_code
             )
         except AristotleOutcomeUnknownError as e:
-            if lost is not None:
-                raise _maybe_lost(e, device.replaces_key) from e
-            lost = e
-            logger.warning(f"An answer from Aristotle was lost ({_lost(e)}); asking for the key again in {interval} s.")
-            continue
+            raise _maybe_lost(e, device.replaces_key) from e
         except AristotleAPIError as e:
             code = e.error_code if e.status_code == 400 else None
             if code not in ("authorization_pending", "slow_down"):
-                if lost is not None and code != "access_denied":
-                    raise _maybe_lost(lost, device.replaces_key) from e
                 raise _refused(e, code, without_code) from e
-            lost = None
             leftover.note = None
             if code == "slow_down":
                 interval += SLOW_DOWN_SECONDS
             if time.monotonic() >= deadline:
                 raise LoginError(EXPIRED) from None
             continue
+        body = _json_object(response)
+        metadata = {name: body[name] for name in ("key_id", "user_id", "organization_id") if name in body}
+        issued: LoginIssued | None = None
+        if len(metadata) != 0:
+            try:
+                issued = LoginIssued.model_validate(metadata)
+            except pydantic.ValidationError:
+                issued = None
+            if issued is None:
+                raise LoginError(
+                    "Aristotle's answer did not identify the issued key. The login may have made a key. "
+                    "Nothing was stored; do not identify or revoke a key by name.",
+                    exit_code=EXIT_OUTCOME_UNKNOWN,
+                )
+        leftover.issued_key = issued
+        leftover.note = _made_key(issued, device.replaces_key)
+        if issued is None:
+            logger.warning("This server does not report the issued key's identity. Key ownership remains unknown.")
+        else:
+            logger.info(
+                "Aristotle issued key %s for user %s in organization %s.",
+                issued.key_id,
+                issued.user_id,
+                issued.organization_id,
+            )
+            if on_issued is not None:
+                on_issued(issued)
         api_key, key_name = _approved_key(response)
-        leftover.note = _made_key(key_name, device.replaces_key)
         return api_key, key_name
 
 
 async def _device_login(
-    open_browser: bool, on_pending: Callable[[LoginPending], None] | None, leftover: _Leftover
+    open_browser: bool,
+    on_pending: Callable[[LoginPending], None] | None,
+    leftover: _Leftover,
+    *,
+    on_issued: Callable[[LoginIssued], None] | None,
 ) -> tuple[str, str | None]:
     """The key the user approves in the browser, and its name, with ``leftover`` as _poll keeps it. Raises
     _NoDeviceLogin when the server has no device login."""
@@ -473,7 +507,7 @@ async def _device_login(
             _open(pending.verification_uri)
         isatty = getattr(sys.stderr, "isatty", None)
         progress = _ProgressLine() if on_pending is None and isatty is not None and isatty() else None
-        return await _poll(client, device, progress, leftover)
+        return await _poll(client, device, progress, leftover, on_issued=on_issued)
 
 
 async def billed_to(client: api_request.AristotleRequestClient) -> str | None:
@@ -532,12 +566,14 @@ async def login(
     open_browser: bool = True,
     api_key: str | None = None,
     on_pending: Callable[[LoginPending], None] | None = None,
+    on_issued: Callable[[LoginIssued], None] | None = None,
     on_stored: Callable[[LoginResult], None] | None = None,
 ) -> LoginResult:
     """Verify ``api_key``, or else a key piped to stdin, approved in the browser or, where the server can't do that,
     pasted; store it, and say where and who runs started with it are billed to.
 
     ``on_pending`` receives the code to approve while the login waits for it, in place of a progress line on stderr.
+    ``on_issued`` receives only the durable key identity, before verification or storage.
     ``on_stored`` receives the result as soon as the key is stored, before the login asks who pays.
 
     Raises:
@@ -558,7 +594,7 @@ async def login(
             api_key, where = _piped_key(), "from stdin"
         if api_key is None:
             try:
-                api_key, key_name = await _device_login(open_browser, on_pending, leftover)
+                api_key, key_name = await _device_login(open_browser, on_pending, leftover, on_issued=on_issued)
                 device_login, where = True, "that Aristotle sent"
             except _NoDeviceLogin:
                 api_key, where = _pasted_key(open_browser), "you pasted"
@@ -577,10 +613,13 @@ async def login(
                 raise
             raise LoginError(f"{e} {leftover.note}", e.exit_code) from e
         leftover.note = None
+    except LoginError as e:
+        e.issued_key = leftover.issued_key
+        raise
     except (KeyboardInterrupt, asyncio.CancelledError):
         _report_cancelled(leftover.note)
         raise
-    result = LoginResult(credentials_path=str(path), key_name=key_name)
+    result = LoginResult(credentials_path=str(path), key_name=key_name, issued_key=leftover.issued_key)
     stored = "Key" if key_name is None else f'Key "{key_name}"'
     logger.info(f"Logged in. {stored} stored in {path}.")
     if on_stored is not None:

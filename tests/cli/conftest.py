@@ -133,6 +133,11 @@ DEVICE_CODE = "device-code-only-the-cli-holds"
 """The secret the CLI polls with, which no output may show either."""
 USER_CODE = "WDJB-MJHT"
 KEY_NAME = "aristotle CLI on test-host"
+ISSUED_METADATA = {
+    "key_id": "70d96015-7b60-4fc4-92b6-e90abb3d8338",
+    "user_id": "abf8b1d5-b9f4-4a85-8724-d5d92de5f729",
+    "organization_id": "cad050c9-4243-4c1d-a366-a6c5c5b80f3c",
+}
 
 
 def device_started(**fields: object) -> httpx.Response:
@@ -154,9 +159,9 @@ def token_error(code: str) -> httpx.Response:
     return httpx.Response(400, json={"error": code})
 
 
-def approved(api_key: str = APPROVED_KEY, key_name: str | None = KEY_NAME) -> httpx.Response:
+def approved(api_key: str = APPROVED_KEY, key_name: str | None = KEY_NAME, **metadata: object) -> httpx.Response:
     """A token answer that hands out the key."""
-    return httpx.Response(200, json={"api_key": api_key, "key_name": key_name})
+    return httpx.Response(200, json={"api_key": api_key, "key_name": key_name, **metadata})
 
 
 @pytest.fixture
