@@ -37,7 +37,8 @@ from tests.conftest import FAKE_KEY, REFUSED_KEYS, shown_key_runs
 WEB_URL = "https://aristotle.example"
 
 
-async def test_received_identity_precedes_verification_and_storage(device_server, caplog):
+@pytest.mark.parametrize("user_id", [ISSUED_METADATA["user_id"], "Legacy.User+cli@example.com"])
+async def test_received_identity_precedes_verification_and_storage(device_server, caplog, user_id):
     caplog.set_level(logging.INFO)
     issued: list[LoginIssued] = []
     stored: list[LoginResult] = []
@@ -48,7 +49,8 @@ async def test_received_identity_precedes_verification_and_storage(device_server
         assert request.url.params["limit"] == "1"
         return httpx.Response(200, json={"results": []})
 
-    requests = device_server(approved(**ISSUED_METADATA), check=check)
+    metadata = {**ISSUED_METADATA, "user_id": user_id}
+    requests = device_server(approved(**metadata), check=check)
 
     def on_issued(receipt):
         assert requests[-1].url.path.endswith(login_flow.DEVICE_TOKEN)
@@ -61,7 +63,9 @@ async def test_received_identity_precedes_verification_and_storage(device_server
     assert result.issued_key is not None
     assert result.issued_key == issued[0]
     assert stored == [result]
-    assert result.issued_key.model_dump(mode="json") == {"phase": "issued", **ISSUED_METADATA}
+    assert result.issued_key.user_id == user_id
+    assert user_id in caplog.text
+    assert result.issued_key.model_dump(mode="json") == {"phase": "issued", **metadata}
     assert credentials.read_device_api_key() == APPROVED_KEY
     assert APPROVED_KEY not in result.model_dump_json() + caplog.text
     assert DEVICE_CODE not in result.model_dump_json() + caplog.text
@@ -88,6 +92,7 @@ async def test_legacy_server_stores_key_without_claiming_identity(device_server,
         {**ISSUED_METADATA, "key_id": "not-a-uuid"},
         {**ISSUED_METADATA, "organization_id": APPROVED_KEY},
         {**ISSUED_METADATA, "user_id": None},
+        {**ISSUED_METADATA, "user_id": 42},
         {**ISSUED_METADATA, "organization_id": 42},
         {"key_id": None, "user_id": None, "organization_id": None},
     ],
@@ -112,7 +117,10 @@ async def test_partial_metadata_has_no_issued_receipt_or_payload_error(device_se
 
 
 @pytest.mark.parametrize("failure", ["verification", "storage"])
-async def test_failed_post_issuance_step_retains_identity(device_server, tmp_path, monkeypatch, failure, caplog):
+@pytest.mark.parametrize("user_id", [ISSUED_METADATA["user_id"], "Legacy.User+cli@example.com"])
+async def test_failed_post_issuance_step_retains_identity(
+    device_server, tmp_path, monkeypatch, failure, caplog, user_id
+):
     issued: list[LoginIssued] = []
     stored: list[LoginResult] = []
     if failure == "storage":
@@ -120,12 +128,14 @@ async def test_failed_post_issuance_step_retains_identity(device_server, tmp_pat
         blocker.write_text("")
         monkeypatch.setenv("XDG_CONFIG_HOME", str(blocker))
         monkeypatch.setenv("APPDATA", str(blocker))
-    device_server(approved(**ISSUED_METADATA), check=httpx.Response(401) if failure == "verification" else None)
+    metadata = {**ISSUED_METADATA, "user_id": user_id}
+    device_server(approved(**metadata), check=httpx.Response(401) if failure == "verification" else None)
     with _stdin(""), pytest.raises(login_flow.LoginError) as raised:
         await login_flow.login(on_issued=issued.append, on_stored=stored.append)
 
     assert len(issued) == 1
     assert raised.value.issued_key == issued[0]
+    assert issued[0].user_id == user_id
     assert stored == []
     assert credentials.read_api_key() is None
     assert ISSUED_METADATA["key_id"] in str(raised.value)

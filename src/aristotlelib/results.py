@@ -353,7 +353,7 @@ class LoginPending(pydantic.BaseModel):
 class LoginIssued(pydantic.BaseModel):
     phase: Literal["issued"] = "issued"
     key_id: UUID
-    user_id: UUID
+    user_id: str
     organization_id: UUID
 
 

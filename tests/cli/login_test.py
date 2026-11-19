@@ -465,23 +465,25 @@ def test_login_json_prints_the_code_to_approve_and_then_where_the_key_went(monke
 
 
 @pytest.mark.parametrize("accepted", [True, False], ids=["stored", "verification-failed"])
-def test_login_json_emits_identity_before_verification(monkeypatch, capsys, caplog, device_server, accepted):
+@pytest.mark.parametrize("user_id", [ISSUED_METADATA["user_id"], "Legacy.User+cli@example.com"])
+def test_login_json_emits_identity_before_verification(monkeypatch, capsys, caplog, device_server, accepted, user_id):
     caplog.set_level(logging.DEBUG)
     observed: list[dict] = []
+    metadata = {**ISSUED_METADATA, "user_id": user_id}
 
     def check(request):
         out, err = capsys.readouterr()
         pending, end = json.JSONDecoder().raw_decode(out)
         assert pending["user_code"] == USER_CODE
         receipt = json.loads(out[end:])
-        assert receipt == {"phase": "issued", **ISSUED_METADATA}
+        assert receipt == {"phase": "issued", **metadata}
         assert credentials.read_api_key() is None
         assert request.url.params["limit"] == "1"
         assert APPROVED_KEY not in out + err
         observed.append(receipt)
         return httpx.Response(200 if accepted else 401, json={"results": []})
 
-    device_server(approved(**ISSUED_METADATA), check=check)
+    device_server(approved(**metadata), check=check)
     _login_as_an_agent(monkeypatch, "--json", "--no-browser")
     if accepted:
         assert main() == 0
