@@ -2,6 +2,7 @@
 
 from collections.abc import Sequence
 from typing import Literal, NamedTuple
+from uuid import UUID
 
 import pydantic
 
@@ -349,12 +350,20 @@ class LoginPending(pydantic.BaseModel):
     """Seconds until the code expires."""
 
 
+class LoginIssued(pydantic.BaseModel):
+    phase: Literal["issued"] = "issued"
+    key_id: UUID
+    user_id: str
+    organization_id: UUID
+
+
 class LoginResult(pydantic.BaseModel):
     """``aristotle login --json``, last: where the key was stored."""
 
     credentials_path: str
     key_name: str | None
     """The key's name on the API keys page, for a key approved in the browser; null for one given, piped or pasted."""
+    issued_key: LoginIssued | None = None
 
 
 class ProjectPage(pydantic.BaseModel):

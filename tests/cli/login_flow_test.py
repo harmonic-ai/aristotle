@@ -20,10 +20,11 @@ import pytest
 from aristotlelib import api_request, credentials
 from aristotlelib.api_request import AristotleAPIError
 from aristotlelib.cli import login_flow
-from aristotlelib.results import LoginPending
+from aristotlelib.results import LoginIssued, LoginPending, LoginResult
 from tests.cli.conftest import (
     APPROVED_KEY,
     DEVICE_CODE,
+    ISSUED_METADATA,
     KEY_NAME,
     USER_CODE,
     approved,
@@ -34,6 +35,141 @@ from tests.cli.conftest import (
 from tests.conftest import FAKE_KEY, REFUSED_KEYS, shown_key_runs
 
 WEB_URL = "https://aristotle.example"
+
+
+@pytest.mark.parametrize("user_id", [ISSUED_METADATA["user_id"], "Legacy.User+cli@example.com"])
+async def test_received_identity_precedes_verification_and_storage(device_server, caplog, user_id):
+    caplog.set_level(logging.INFO)
+    issued: list[LoginIssued] = []
+    stored: list[LoginResult] = []
+
+    def check(request):
+        assert len(issued) == 1
+        assert credentials.read_api_key() is None
+        assert request.url.params["limit"] == "1"
+        return httpx.Response(200, json={"results": []})
+
+    metadata = {**ISSUED_METADATA, "user_id": user_id}
+    requests = device_server(approved(**metadata), check=check)
+
+    def on_issued(receipt):
+        assert requests[-1].url.path.endswith(login_flow.DEVICE_TOKEN)
+        assert credentials.read_api_key() is None
+        issued.append(receipt)
+
+    with _stdin(""):
+        result = await login_flow.login(on_issued=on_issued, on_stored=stored.append)
+
+    assert result.issued_key is not None
+    assert result.issued_key == issued[0]
+    assert stored == [result]
+    assert result.issued_key.user_id == user_id
+    assert user_id in caplog.text
+    assert result.issued_key.model_dump(mode="json") == {"phase": "issued", **metadata}
+    assert credentials.read_device_api_key() == APPROVED_KEY
+    assert APPROVED_KEY not in result.model_dump_json() + caplog.text
+    assert DEVICE_CODE not in result.model_dump_json() + caplog.text
+
+
+async def test_legacy_server_stores_key_without_claiming_identity(device_server, caplog):
+    issued: list[LoginIssued] = []
+    requests = device_server(approved())
+    with _stdin(""):
+        result = await login_flow.login(on_issued=issued.append)
+
+    assert issued == []
+    assert result.issued_key is None
+    assert credentials.read_device_api_key() == APPROVED_KEY
+    assert _paths(requests) == ["/cli/device/start", "/cli/device/token", "/project", "/organization"]
+    assert not any(record.levelno >= logging.WARNING for record in caplog.records)
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"key_id": ISSUED_METADATA["key_id"]},
+        {"user_id": ISSUED_METADATA["user_id"], "organization_id": ISSUED_METADATA["organization_id"]},
+        {**ISSUED_METADATA, "key_id": "not-a-uuid"},
+        {**ISSUED_METADATA, "organization_id": APPROVED_KEY},
+        {**ISSUED_METADATA, "user_id": None},
+        {**ISSUED_METADATA, "user_id": 42},
+        {**ISSUED_METADATA, "organization_id": 42},
+        {"key_id": None, "user_id": None, "organization_id": None},
+    ],
+)
+async def test_partial_metadata_has_no_issued_receipt_or_payload_error(device_server, metadata, caplog):
+    issued: list[LoginIssued] = []
+    requests = device_server(approved(**metadata))
+    with _stdin(""), pytest.raises(login_flow.LoginError) as raised:
+        await login_flow.login(on_issued=issued.append)
+
+    assert raised.value.exit_code == 7
+    assert raised.value.issued_key is None
+    assert raised.value.__context__ is None
+    assert raised.value.__cause__ is None
+    assert issued == []
+    assert credentials.read_api_key() is None
+    assert _paths(requests) == ["/cli/device/start", "/cli/device/token"]
+    shown = "".join(traceback.format_exception(raised.value)) + caplog.text
+    assert APPROVED_KEY not in shown
+    assert DEVICE_CODE not in shown
+    assert "api_key" not in str(raised.value)
+
+
+@pytest.mark.parametrize("failure", ["verification", "storage"])
+@pytest.mark.parametrize("user_id", [ISSUED_METADATA["user_id"], "Legacy.User+cli@example.com"])
+async def test_failed_post_issuance_step_retains_identity(
+    device_server, tmp_path, monkeypatch, failure, caplog, user_id
+):
+    issued: list[LoginIssued] = []
+    stored: list[LoginResult] = []
+    if failure == "storage":
+        blocker = tmp_path / "blocker"
+        blocker.write_text("")
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(blocker))
+        monkeypatch.setenv("APPDATA", str(blocker))
+    metadata = {**ISSUED_METADATA, "user_id": user_id}
+    device_server(approved(**metadata), check=httpx.Response(401) if failure == "verification" else None)
+    with _stdin(""), pytest.raises(login_flow.LoginError) as raised:
+        await login_flow.login(on_issued=issued.append, on_stored=stored.append)
+
+    assert len(issued) == 1
+    assert raised.value.issued_key == issued[0]
+    assert issued[0].user_id == user_id
+    assert stored == []
+    assert credentials.read_api_key() is None
+    assert ISSUED_METADATA["key_id"] in str(raised.value)
+    assert APPROVED_KEY not in str(raised.value) + caplog.text
+    assert DEVICE_CODE not in str(raised.value) + caplog.text
+
+
+@pytest.mark.parametrize("key", [None, {"api_key": APPROVED_KEY}], ids=["missing", "malformed"])
+async def test_received_identity_survives_missing_credential(device_server, key, caplog):
+    issued: list[LoginIssued] = []
+    device_server(httpx.Response(200, json={"api_key": key, **ISSUED_METADATA}))
+    with _stdin(""), pytest.raises(login_flow.LoginError) as raised:
+        await login_flow.login(on_issued=issued.append)
+
+    assert len(issued) == 1
+    assert raised.value.issued_key == issued[0]
+    assert credentials.read_api_key() is None
+    assert APPROVED_KEY not in "".join(traceback.format_exception(raised.value)) + caplog.text
+
+
+async def test_unknown_token_response_body_is_not_reported(device_server, caplog):
+    caplog.set_level(logging.DEBUG)
+    requests = device_server(
+        httpx.Response(502, json={"api_key": APPROVED_KEY, "device_code": DEVICE_CODE}), token_error("expired_token")
+    )
+    with _stdin(""), pytest.raises(login_flow.LoginError) as raised:
+        await login_flow.login()
+
+    assert raised.value.exit_code == 7
+    assert raised.value.issued_key is None
+    assert _paths(requests) == ["/cli/device/start", "/cli/device/token", "/cli/device/token"]
+    shown = "".join(traceback.format_exception(raised.value)) + caplog.text
+    assert APPROVED_KEY not in shown
+    assert DEVICE_CODE not in shown
 
 
 @pytest.fixture(autouse=True)
@@ -618,11 +754,22 @@ def _maybe_lost(what: str) -> str:
 
 
 @pytest.mark.parametrize(("failure", "what"), zip(LOST, LOST_AS), ids=LOST_IDS)
-async def test_after_a_lost_answer_a_pending_one_says_it_held_no_key(device_server, failure, what, caplog):
+@pytest.mark.parametrize("metadata", [{}, ISSUED_METADATA], ids=["legacy", "issued-receipt"])
+async def test_after_a_lost_answer_a_pending_one_says_it_held_no_key(device_server, failure, what, caplog, metadata):
     pending = token_error("authorization_pending")
-    requests = device_server(pending, failure, pending, failure, approved())
+    requests = device_server(pending, failure, pending, failure, approved(**metadata))
+    issued: list[LoginIssued] = []
     with _stdin(""):
-        result = await login_flow.login()
+        result = await login_flow.login(on_issued=issued.append)
+
+    assert (result.issued_key is not None) == bool(metadata)
+    assert issued == ([] if not metadata else [result.issued_key])
+    assert len([request for request in requests if request.url.path.endswith("/start")]) == 1
+    assert all(
+        json.loads(request.content)["device_code"] == DEVICE_CODE
+        for request in requests
+        if request.url.path.endswith("/token")
+    )
 
     assert result.key_name == KEY_NAME
     assert _polled_at(requests) == [5, 10, 15, 20, 25]
@@ -885,33 +1032,32 @@ async def test_a_key_approved_without_a_name_to_show_is_stored_without_one(devic
     ],
     ids=["rejected", "unreachable", "page"],
 )
-async def test_an_approved_key_that_fails_its_check_is_not_stored_and_is_named_to_revoke(
-    device_server, check, message, exit_code
-):
-    device_server(approved(), check=check)
+async def test_an_approved_key_that_fails_its_check_retains_exact_identity(device_server, check, message, exit_code):
+    device_server(approved(**ISSUED_METADATA), check=check)
     with _stdin(""), pytest.raises(login_flow.LoginError) as raised:
         await login_flow.login()
 
     assert str(raised.value).startswith(message)
     assert str(raised.value).endswith(
-        f' Aristotle made the key "{KEY_NAME}" for this login: revoke it at {WEB_URL}/keys.'
+        f" Aristotle made key {ISSUED_METADATA['key_id']} for this login: revoke exactly this key at {WEB_URL}/keys."
     )
     assert raised.value.exit_code == exit_code
     assert credentials.read_api_key() is None
 
 
-async def test_an_approved_key_that_cannot_be_stored_is_named_to_revoke(device_server, tmp_path, monkeypatch):
+async def test_an_approved_key_that_cannot_be_stored_retains_exact_identity(device_server, tmp_path, monkeypatch):
     blocker = tmp_path / "blocker"
     blocker.write_text("")
     monkeypatch.setenv("XDG_CONFIG_HOME", str(blocker))
     monkeypatch.setenv("APPDATA", str(blocker))
-    device_server(approved(key_name=None))
+    device_server(approved(key_name=None, **ISSUED_METADATA))
     with _stdin(""), pytest.raises(login_flow.LoginError) as raised:
         await login_flow.login()
 
     assert str(raised.value).startswith(f"Could not store the key in {credentials.credentials_path()}: ")
     assert str(raised.value).endswith(
-        f"Nothing was stored. Aristotle made a key for this login: revoke it at {WEB_URL}/keys."
+        f"Nothing was stored. Aristotle made key {ISSUED_METADATA['key_id']} for this login: "
+        f"revoke exactly this key at {WEB_URL}/keys."
     )
     assert raised.value.exit_code == 3
 
@@ -930,13 +1076,13 @@ async def test_a_piped_key_is_checked_without_a_device_login(device_server):
 async def test_a_key_the_device_login_hands_out_that_cannot_be_sent_is_not_stored_and_its_revocation_asked(
     device_server,
 ):
-    requests = device_server(approved(api_key="fake-Q7zP\u00a03wK9vX2m"))
+    requests = device_server(approved(api_key="fake-Q7zP\u00a03wK9vX2m", **ISSUED_METADATA))
     with _stdin(""), pytest.raises(login_flow.LoginError) as raised:
         await login_flow.login()
 
     assert str(raised.value) == (
         "The API key that Aristotle sent contains a non-ASCII character. Nothing was stored. "
-        f'Aristotle made the key "{KEY_NAME}" for this login: revoke it at {WEB_URL}/keys.'
+        f"Aristotle made key {ISSUED_METADATA['key_id']} for this login: revoke exactly this key at {WEB_URL}/keys."
     )
     assert raised.value.exit_code == 3
     assert credentials.read_api_key() is None
@@ -1047,34 +1193,15 @@ def test_an_interrupt_while_asking_for_the_key_says_a_key_may_have_been_made(dev
     assert credentials.read_api_key() is None
 
 
-def test_an_interrupt_while_waiting_after_a_lost_answer_says_a_key_may_have_been_made(
-    device_server, poll_clock, capsys, monkeypatch
-):
-    requests = device_server(httpx.Response(502), token_error("authorization_pending"))
-    real_sleep = login_flow.asyncio.sleep
-
-    async def sleep(seconds: float) -> None:
-        if _polled_at(requests):  # the lost answer is in: interrupt the wait for the next poll
-            raise KeyboardInterrupt
-        await real_sleep(seconds)
-
-    monkeypatch.setattr(login_flow.asyncio, "sleep", sleep)
-    with _stdin(""), pytest.raises(KeyboardInterrupt):
-        asyncio.run(login_flow.login())
-
-    assert _paths(requests) == ["/cli/device/start", "/cli/device/token"]
-    assert capsys.readouterr().err == MAY_HAVE_MADE_A_KEY
-
-
 @pytest.mark.parametrize("interrupt", [KeyboardInterrupt, asyncio.CancelledError])
-def test_an_interrupt_while_checking_the_key_names_the_key_to_revoke(device_server, capsys, interrupt):
-    device_server(approved(), check=_interrupted(interrupt))
+def test_an_interrupt_while_checking_the_key_reports_exact_identity(device_server, capsys, interrupt):
+    device_server(approved(**ISSUED_METADATA), check=_interrupted(interrupt))
     with _stdin(""), pytest.raises(interrupt):
         asyncio.run(login_flow.login())
 
     assert capsys.readouterr().err == (
-        f'\nCancelled. Nothing was stored. Aristotle made the key "{KEY_NAME}" for this login: revoke it at '
-        f"{WEB_URL}/keys.\n"
+        f"\nCancelled. Nothing was stored. Aristotle made key {ISSUED_METADATA['key_id']} for this login: "
+        f"revoke exactly this key at {WEB_URL}/keys.\n"
     )
     assert credentials.read_api_key() is None
 
@@ -1195,7 +1322,7 @@ async def test_the_key_in_the_environment_isnt_sent_in_place_of_the_stored_one(d
 RETIRED = f"and retired the one stored here: revoke the new one at {WEB_URL}/keys, then run `aristotle login` again."
 
 
-async def test_a_lost_answer_that_may_have_retired_the_stored_key_says_to_log_in_again(device_server):
+async def test_a_lost_answer_that_may_have_retired_the_stored_key_holds_unknown_identity(device_server):
     credentials.write_api_key(KEY_FROM_BEFORE, device_login=True)
     device_server(httpx.Response(502), token_error("expired_token"))
     with _stdin(""), pytest.raises(login_flow.LoginError) as raised:
@@ -1209,7 +1336,7 @@ async def test_a_lost_answer_that_may_have_retired_the_stored_key_says_to_log_in
     assert KEY_FROM_BEFORE not in str(raised.value)
 
 
-def test_an_interrupt_while_asking_for_a_key_that_retires_the_stored_one_says_to_log_in_again(device_server, capsys):
+def test_an_interrupt_while_asking_for_a_replacement_key_holds_unknown_identity(device_server, capsys):
     credentials.write_api_key(KEY_FROM_BEFORE, device_login=True)
     device_server(_interrupted(KeyboardInterrupt))
     with _stdin(""), pytest.raises(KeyboardInterrupt):
@@ -1221,15 +1348,15 @@ def test_an_interrupt_while_asking_for_a_key_that_retires_the_stored_one_says_to
     )
 
 
-async def test_a_new_key_that_fails_its_check_after_retiring_the_stored_one_says_to_log_in_again(device_server):
+async def test_a_new_key_that_fails_its_check_after_retirement_reports_exact_identity(device_server):
     credentials.write_api_key(KEY_FROM_BEFORE, device_login=True)
-    device_server(approved(), check=httpx.Response(401))
+    device_server(approved(**ISSUED_METADATA), check=httpx.Response(401))
     with _stdin(""), pytest.raises(login_flow.LoginError) as raised:
         await login_flow.login()
 
     assert str(raised.value).endswith(
-        f' Aristotle made the key "{KEY_NAME}" for this login, and may have retired the one stored here: revoke the new '
-        f"one at {WEB_URL}/keys, then run `aristotle login` again."
+        f" Aristotle made key {ISSUED_METADATA['key_id']} for this login and may have retired the one stored here: "
+        f"revoke exactly this new key at {WEB_URL}/keys."
     )
     assert credentials.read_api_key() == KEY_FROM_BEFORE
 

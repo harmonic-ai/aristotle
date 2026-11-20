@@ -398,7 +398,7 @@ warnings and errors go to stderr.
 | `archive`, `unarchive` | a project |
 | `download` | `{"project_id", "result_path"}` |
 | `download --artifact` | `{"project_id", "files", "missing"}` |
-| `login` | `{"verification_uri", "user_code", "expires_in"}` while it waits for approval in the browser, then `{"credentials_path", "key_name"}` |
+| `login` | `{"verification_uri", "user_code", "expires_in"}` while it waits for approval; `{"phase": "issued", "key_id", "user_id", "organization_id"}` when the server reports the issued identity; then `{"credentials_path", "key_name", "issued_key"}` after storage |
 | any `--non-interactive` wait that stops for questions (exit 10) | `{"project_id", "task", "questions"}` |
 | `submit` or `continue` whose request may have gone through (exit 7) | `{"outcome": "unknown", "error"}` |
 | `submit` or `continue` whose request didn't get through or was refused for too many runs or by billing, or `continue` or `questions --answer` whose lookup failed before anything was sent (exit 3, or 6 when rate limited or out of credits) | `{"outcome": "not_processed", "error"}` |
@@ -423,7 +423,7 @@ read, otherwise it is null. Missing or rejected credentials leave stdout empty, 
 | `show`, `continue` | `project`: as it stands when printed, after any wait (`null` for `show --task` if it couldn't be fetched). `web_url`: its page in the web app, as in `submit`'s. If an interrupt cut the result short, or the project couldn't be refreshed, its `status` and `latest_run_status` are the latest task's, which the wait kept fresher, unless `show --task` names a finished task, which may be older. |
 | `properties` | Reads every page itself, so its `pagination_key` is always `null`, and it prints every match unless `--limit` is given. |
 | `download --artifact` | `files`: each file saved, in the order given, with its `artifact_path` in the project and its `saved_path`, where it went. `missing`: the paths with no file, which exit 4. |
-| `login` | The first object as soon as it waits for approval, so a program can give a person the page to open (`verification_uri`) and the code to enter there (`user_code`); `expires_in`: the code's life in seconds. The second once the key is stored: `credentials_path`, the file; `key_name`, the key's name on API keys, or `null` for a key given with `--api-key`, piped or pasted, which prints only the second. |
+| `login` | The pending object gives the approval page, user code and code lifetime. When the server reports the complete issued identity, the issued object gives the durable key, user and organization IDs before verification or storage. The stored object gives `credentials_path`, `key_name` and the same metadata in `issued_key`. `issued_key` is `null` for older servers and for a provided, piped or pasted key. An issued object alone does not prove storage. No object contains the API key. |
 | `questions` | `task` is `null` when the project has none. |
 
 **Properties and counts.** `show`, `submit` and `continue` give the properties as they stand when the result is

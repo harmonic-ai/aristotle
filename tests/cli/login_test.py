@@ -27,6 +27,7 @@ from aristotlelib.results import LoginResult
 from tests.cli.conftest import (
     APPROVED_KEY,
     DEVICE_CODE,
+    ISSUED_METADATA,
     KEY_NAME,
     USER_CODE,
     approved,
@@ -453,8 +454,55 @@ def test_login_json_prints_the_code_to_approve_and_then_where_the_key_went(monke
         "user_code": USER_CODE,
         "expires_in": 600,
     }
-    assert json.loads(out[end:]) == {"credentials_path": str(credentials.credentials_path()), "key_name": KEY_NAME}
+    assert json.loads(out[end:]) == {
+        "credentials_path": str(credentials.credentials_path()),
+        "key_name": KEY_NAME,
+        "issued_key": None,
+    }
     assert credentials.read_api_key() == APPROVED_KEY
+    for secret in (APPROVED_KEY, DEVICE_CODE):
+        assert secret not in out + err + caplog.text
+
+
+@pytest.mark.parametrize("accepted", [True, False], ids=["stored", "verification-failed"])
+@pytest.mark.parametrize("user_id", [ISSUED_METADATA["user_id"], "Legacy.User+cli@example.com"])
+def test_login_json_emits_identity_before_verification(monkeypatch, capsys, caplog, device_server, accepted, user_id):
+    caplog.set_level(logging.DEBUG)
+    observed: list[dict] = []
+    metadata = {**ISSUED_METADATA, "user_id": user_id}
+
+    def check(request):
+        out, err = capsys.readouterr()
+        pending, end = json.JSONDecoder().raw_decode(out)
+        assert pending["user_code"] == USER_CODE
+        receipt = json.loads(out[end:])
+        assert receipt == {"phase": "issued", **metadata}
+        assert credentials.read_api_key() is None
+        assert request.url.params["limit"] == "1"
+        assert APPROVED_KEY not in out + err
+        observed.append(receipt)
+        return httpx.Response(200 if accepted else 401, json={"results": []})
+
+    device_server(approved(**metadata), check=check)
+    _login_as_an_agent(monkeypatch, "--json", "--no-browser")
+    if accepted:
+        assert main() == 0
+    else:
+        with pytest.raises(SystemExit) as exited:
+            main()
+        assert exited.value.code == 5
+
+    assert len(observed) == 1
+    out, err = capsys.readouterr()
+    if accepted:
+        stored = json.loads(out)
+        assert stored["issued_key"] == observed[0]
+        assert stored["credentials_path"] == str(credentials.credentials_path())
+        assert credentials.read_api_key() == APPROVED_KEY
+    else:
+        assert out == ""
+        assert credentials.read_api_key() is None
+        assert ISSUED_METADATA["key_id"] in err
     for secret in (APPROVED_KEY, DEVICE_CODE):
         assert secret not in out + err + caplog.text
 
@@ -483,7 +531,11 @@ def test_login_json_with_a_given_key_prints_only_where_it_went(monkeypatch, caps
     assert main() == 0
 
     out, err = capsys.readouterr()
-    assert json.loads(out) == {"credentials_path": str(credentials.credentials_path()), "key_name": None}
+    assert json.loads(out) == {
+        "credentials_path": str(credentials.credentials_path()),
+        "key_name": None,
+        "issued_key": None,
+    }
     assert [request.url.path for request in requests] == ["/api/v3/project", "/api/v3/organization"]
     assert APPROVED_KEY not in out + err + caplog.text
 
@@ -497,7 +549,11 @@ def test_ctrl_c_while_asking_who_pays_keeps_the_key_and_says_so(monkeypatch, cap
     gc.collect()
     assert "never retrieved" not in caplog.text
     out, err = capsys.readouterr()
-    assert json.loads(out) == {"credentials_path": str(credentials.credentials_path()), "key_name": None}
+    assert json.loads(out) == {
+        "credentials_path": str(credentials.credentials_path()),
+        "key_name": None,
+        "issued_key": None,
+    }
     assert err == "\nInterrupted. The key stays stored.\n"
     assert f"Logged in. Key stored in {credentials.credentials_path()}." in caplog.messages
     assert credentials.read_api_key() == APPROVED_KEY
