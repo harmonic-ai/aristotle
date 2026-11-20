@@ -4,6 +4,14 @@ All notable changes to `aristotlelib`, the Aristotle Python SDK and `aristotle` 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.4.1]
+
+### Fixed
+
+- Device login reports the committed key UUID, canonical user ID, and organization UUID before verification or storage.
+  Legacy user IDs remain strings. Servers without receipt metadata retain normal login behavior.
+  A lost consumed-token response still cannot identify the issued key.
+
 ## [3.4.0] - 2026-11-18
 
 ### Added
